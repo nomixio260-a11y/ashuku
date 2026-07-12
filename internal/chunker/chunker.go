@@ -10,13 +10,10 @@ import (
 	fastcdc "github.com/jotfs/fastcdc-go"
 )
 
-const (
-	// AverageSize は平均チャンクサイズ(1MiB)。
-	AverageSize = 1 << 20
-	// MinSize / MaxSize はチャンクサイズの下限・上限。
-	MinSize = AverageSize / 4
-	MaxSize = AverageSize * 4
-)
+// DefaultAverageSize はデフォルトの平均チャンクサイズ(1MiB)。
+// 小さくすると重複排除の粒度が細かくなり dedup 率が上がるが、
+// チャンク数(メタデータ量)が増える。
+const DefaultAverageSize = 1 << 20
 
 // Chunk は分割された1チャンク。Data は次の Next 呼び出しまで有効。
 type Chunk struct {
@@ -28,12 +25,16 @@ type Chunker struct {
 	cdc *fastcdc.Chunker
 }
 
-// New は r を読み取るチャンカーを作る。
-func New(r io.Reader) (*Chunker, error) {
+// New は r を平均 avgSize バイトのチャンクに分割するチャンカーを作る。
+// 下限は avgSize/4、上限は avgSize*4。
+func New(r io.Reader, avgSize int) (*Chunker, error) {
+	if avgSize <= 0 {
+		avgSize = DefaultAverageSize
+	}
 	cdc, err := fastcdc.NewChunker(r, fastcdc.Options{
-		MinSize:     MinSize,
-		AverageSize: AverageSize,
-		MaxSize:     MaxSize,
+		MinSize:     avgSize / 4,
+		AverageSize: avgSize,
+		MaxSize:     avgSize * 4,
 	})
 	if err != nil {
 		return nil, err

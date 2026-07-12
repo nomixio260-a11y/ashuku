@@ -11,7 +11,7 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(t.TempDir())
+	s, err := Open(t.TempDir(), Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,9 +30,13 @@ func repetitiveData(size int) []byte {
 }
 
 func randomData(t *testing.T, size int) []byte {
+	return randomDataSeed(t, size, 42)
+}
+
+func randomDataSeed(t *testing.T, size int, seed int64) []byte {
 	t.Helper()
 	buf := make([]byte, size)
-	rng := rand.New(rand.NewSource(42))
+	rng := rand.New(rand.NewSource(seed))
 	if _, err := rng.Read(buf); err != nil {
 		t.Fatal(err)
 	}

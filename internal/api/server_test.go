@@ -14,7 +14,7 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	st, err := store.Open(t.TempDir())
+	st, err := store.Open(t.TempDir(), store.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

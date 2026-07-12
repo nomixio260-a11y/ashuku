@@ -13,9 +13,18 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "待ち受けアドレス")
 	dataDir := flag.String("data", "./data", "データディレクトリ")
+	compression := flag.String("compression", "balanced", "圧縮レベル: fast | balanced | max")
+	delta := flag.Bool("delta", true, "類似チャンクへのデルタ圧縮を有効にする")
+	chunkAvg := flag.Int("chunk-avg", 0, "平均チャンクサイズ(バイト, 0=デフォルト1MiB)。初回起動時のみ有効")
+	deltaDepth := flag.Int("delta-depth", 0, "デルタチェーンの深さ上限(0=デフォルト16)。深いほど多世代バックアップが縮むが読み出しが遅くなる")
 	flag.Parse()
 
-	st, err := store.Open(*dataDir)
+	st, err := store.Open(*dataDir, store.Config{
+		Compression:   *compression,
+		DisableDelta:  !*delta,
+		AvgChunkSize:  *chunkAvg,
+		MaxDeltaDepth: *deltaDepth,
+	})
 	if err != nil {
 		log.Fatalf("ストアを開けません: %v", err)
 	}

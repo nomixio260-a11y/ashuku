@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,7 +12,14 @@ import (
 var (
 	bucketFiles  = []byte("files")
 	bucketChunks = []byte("chunks")
+	// bucketSketches は類似チャンク検索用の索引: 特徴値(8バイト) → チャンクハッシュ。
+	// デルタ圧縮のベース候補(非デルタチャンク)だけが登録される。
+	bucketSketches = []byte("sketches")
+	// bucketSettings はストア作成時に確定する設定(チャンクサイズ等)。
+	bucketSettings = []byte("settings")
 )
+
+var keyAvgChunkSize = []byte("avg_chunk_size")
 
 // FileManifest は保存済みファイル1件のメタデータ。
 type FileManifest struct {
@@ -25,11 +33,18 @@ type FileManifest struct {
 
 // ChunkMeta はユニークチャンク1件のメタデータ。
 type ChunkMeta struct {
-	// Compression は "zstd" または "raw"。
+	// Compression は "zstd"、"raw"、"zstd-delta" のいずれか。
 	Compression string `json:"compression"`
 	RawSize     int64  `json:"raw_size"`
 	StoredSize  int64  `json:"stored_size"`
 	RefCount    int64  `json:"ref_count"`
+	// BaseHash は zstd-delta のとき、デルタの基準となるチャンクのハッシュ。
+	BaseHash string `json:"base_hash,omitempty"`
+	// Depth はデルタチェーンの深さ(0 = plain/raw、1 = plainへのデルタ、…)。
+	// 深さは maxDeltaDepth で制限され、読み出しコストの上限を保証する。
+	Depth int `json:"depth,omitempty"`
+	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
+	Features []uint64 `json:"features,omitempty"`
 }
 
 func openMetaDB(path string) (*bolt.DB, error) {
@@ -38,7 +53,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -90,4 +105,65 @@ func putChunkMeta(tx *bolt.Tx, hash string, c *ChunkMeta) error {
 		return err
 	}
 	return tx.Bucket(bucketChunks).Put([]byte(hash), raw)
+}
+
+// resolveAvgChunkSize はストアの平均チャンクサイズを確定する。
+// 初回はリクエスト値(0ならデフォルト)を保存し、以降は保存値を優先する。
+// チャンクサイズが途中で変わると既存データとの重複排除が効かなくなるため、
+// ストアの生涯で一貫させる必要がある。
+func resolveAvgChunkSize(tx *bolt.Tx, requested int) (int, error) {
+	b := tx.Bucket(bucketSettings)
+	if raw := b.Get(keyAvgChunkSize); raw != nil && len(raw) == 8 {
+		return int(binary.BigEndian.Uint64(raw)), nil
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(requested))
+	if err := b.Put(keyAvgChunkSize, buf[:]); err != nil {
+		return 0, err
+	}
+	return requested, nil
+}
+
+func featureKey(f uint64) []byte {
+	var k [8]byte
+	binary.BigEndian.PutUint64(k[:], f)
+	return k[:]
+}
+
+// registerSketches は特徴値→ハッシュを索引に登録する。既存エントリは上書きする
+// (最新のチャンクをベース候補にした方が、世代ドリフトでデルタが肥大しない)。
+func registerSketches(tx *bolt.Tx, hash string, features []uint64) error {
+	b := tx.Bucket(bucketSketches)
+	for _, f := range features {
+		if err := b.Put(featureKey(f), []byte(hash)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lookupSketch は特徴値のどれかに一致する既存チャンクのハッシュを返す。
+func lookupSketch(tx *bolt.Tx, features []uint64) string {
+	b := tx.Bucket(bucketSketches)
+	for _, f := range features {
+		if hash := b.Get(featureKey(f)); hash != nil {
+			return string(hash)
+		}
+	}
+	return ""
+}
+
+// dropSketches は削除されるチャンクが登録した索引エントリを掃除する。
+func dropSketches(tx *bolt.Tx, hash string, features []uint64) error {
+	b := tx.Bucket(bucketSketches)
+	for _, f := range features {
+		key := featureKey(f)
+		if string(b.Get(key)) != hash {
+			continue // 別チャンクのエントリは残す
+		}
+		if err := b.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
