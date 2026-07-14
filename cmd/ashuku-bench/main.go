@@ -40,6 +40,8 @@ func main() {
 	gens := flag.Int("gens", 20, "バックアップ世代数")
 	size := flag.Int("size", 32<<20, "各合成データセットの基準サイズ(バイト)")
 	only := flag.String("only", "", "名前にこの部分文字列を含むデータセットだけ実行")
+	chunk := flag.Int("chunk", 0, "平均チャンクサイズ(バイト, 0=デフォルト1MiB)")
+	depth := flag.Int("depth", 0, "デルタチェーン深さ上限(0=デフォルト)")
 	flag.Parse()
 
 	var sets []dataset
@@ -65,6 +67,10 @@ func main() {
 		{"balanced", store.Config{Compression: "balanced"}},
 		{"max", store.Config{Compression: "max"}},
 		{"balanced+delta無効", store.Config{Compression: "balanced", DisableDelta: true}},
+	}
+	for i := range configs {
+		configs[i].cfg.AvgChunkSize = *chunk
+		configs[i].cfg.MaxDeltaDepth = *depth
 	}
 
 	fmt.Println("| データセット | 設定 | 論理サイズ | 物理サイズ | 削減倍率 | スループット |")

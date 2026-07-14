@@ -142,15 +142,28 @@ func registerSketches(tx *bolt.Tx, hash string, features []uint64) error {
 	return nil
 }
 
-// lookupSketch は特徴値のどれかに一致する既存チャンクのハッシュを返す。
-func lookupSketch(tx *bolt.Tx, features []uint64) string {
+// lookupSketches は特徴値に一致する既存チャンクのハッシュを重複なしで返す。
+func lookupSketches(tx *bolt.Tx, features []uint64) []string {
 	b := tx.Bucket(bucketSketches)
+	var hashes []string
 	for _, f := range features {
-		if hash := b.Get(featureKey(f)); hash != nil {
-			return string(hash)
+		hash := b.Get(featureKey(f))
+		if hash == nil {
+			continue
+		}
+		h := string(hash)
+		dup := false
+		for _, e := range hashes {
+			if e == h {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			hashes = append(hashes, h)
 		}
 	}
-	return ""
+	return hashes
 }
 
 // dropSketches は削除されるチャンクが登録した索引エントリを掃除する。

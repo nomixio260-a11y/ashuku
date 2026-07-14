@@ -16,7 +16,8 @@ func main() {
 	compression := flag.String("compression", "balanced", "圧縮レベル: fast | balanced | max")
 	delta := flag.Bool("delta", true, "類似チャンクへのデルタ圧縮を有効にする")
 	chunkAvg := flag.Int("chunk-avg", 0, "平均チャンクサイズ(バイト, 0=デフォルト1MiB)。初回起動時のみ有効")
-	deltaDepth := flag.Int("delta-depth", 0, "デルタチェーンの深さ上限(0=デフォルト16)。深いほど多世代バックアップが縮むが読み出しが遅くなる")
+	deltaDepth := flag.Int("delta-depth", 0, "デルタチェーンの深さ上限(0=デフォルト32)。深いほど多世代バックアップが縮む")
+	cacheMB := flag.Int64("cache-mb", 0, "伸長済みチャンクキャッシュ容量 MiB(0=デフォルト128)")
 	flag.Parse()
 
 	st, err := store.Open(*dataDir, store.Config{
@@ -24,6 +25,7 @@ func main() {
 		DisableDelta:  !*delta,
 		AvgChunkSize:  *chunkAvg,
 		MaxDeltaDepth: *deltaDepth,
+		CacheBytes:    *cacheMB << 20,
 	})
 	if err != nil {
 		log.Fatalf("ストアを開けません: %v", err)

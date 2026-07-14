@@ -49,10 +49,14 @@ const deltaDictID = 1
 // 差分が取れて、世代ドリフトによるデルタ肥大を防ぐ)。上限に達すると
 // 次は plain 保存(再アンカー)になる。深いほど削減率は上がるが、
 // 読み出し時に最大この段数のチェーン復元が必要になる。
-// 実測(100世代バックアップ): 深さ8=31.6x, 32=82.7x(RESEARCH.md 参照)。
+// 実測(100世代バックアップ): 深さ8=31.6x, 16=39.0x, 32=82.7x(RESEARCH.md
+// 参照)。深いチェーンの読み出しコストは chunkCache が吸収する。
 // キーフレーム方式(深さ1+効率閾値での再アンカー)も実測したが、
 // ドリフト蓄積でデルタが肥大しチェーン方式に大きく劣った。
-const DefaultMaxDeltaDepth = 16
+const DefaultMaxDeltaDepth = 32
+
+// DefaultCacheBytes は伸長済みチャンクキャッシュの容量デフォルト(128MiB)。
+const DefaultCacheBytes = 128 << 20
 
 // deltaAcceptRatio: デルタサイズが通常圧縮の何割未満なら採用するか。
 const deltaAcceptRatio = 0.9
@@ -67,9 +71,12 @@ type Config struct {
 	// 初回オープン時にストアへ永続化され、以降の指定は無視される
 	// (途中で変えると既存データとの重複排除が効かなくなるため)。
 	AvgChunkSize int
-	// MaxDeltaDepth はデルタチェーンの深さ上限。0 ならデフォルト(16)。
-	// 深いほど多世代バックアップの削減率が上がるが読み出しが遅くなる。
+	// MaxDeltaDepth はデルタチェーンの深さ上限。0 ならデフォルト(32)。
+	// 深いほど多世代バックアップの削減率が上がるが読み出しが遅くなる
+	// (チェーン読み出しはキャッシュで大部分吸収される)。
 	MaxDeltaDepth int
+	// CacheBytes は伸長済みチャンクキャッシュの容量。0 ならデフォルト(128MiB)。
+	CacheBytes int64
 }
 
 func (c Config) encoderLevel() (zstd.EncoderLevel, error) {
@@ -96,6 +103,7 @@ type Store struct {
 	delta     bool
 	chunkSize int
 	maxDepth  int
+	cache     *chunkCache
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。
@@ -142,6 +150,10 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 	if maxDepth <= 0 {
 		maxDepth = DefaultMaxDeltaDepth
 	}
+	cacheBytes := cfg.CacheBytes
+	if cacheBytes <= 0 {
+		cacheBytes = DefaultCacheBytes
+	}
 	return &Store{
 		dir:       dataDir,
 		db:        db,
@@ -151,6 +163,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		delta:     !cfg.DisableDelta,
 		chunkSize: chunkSize,
 		maxDepth:  maxDepth,
+		cache:     newChunkCache(cacheBytes),
 	}, nil
 }
 
@@ -299,35 +312,48 @@ func (s *Store) storeChunk(hash string, data []byte) error {
 	})
 }
 
-// tryDelta は類似チャンクをベースとしたデルタ圧縮を試す。
+// tryDelta は類似チャンクをベースとしたデルタ圧縮を試す。特徴ごとの候補
+// (最大 numFeatures 個)をすべて評価し、最小のデルタを採用する(best-of-N)。
 // 通常圧縮より十分小さくなる場合のみ (baseHash, delta) を返す。
 func (s *Store) tryDelta(features []uint64, data []byte, plainSize int) (string, []byte) {
-	var baseHash string
+	var candidates []string
 	s.db.View(func(tx *bolt.Tx) error {
-		if h := lookupSketch(tx, features); h != "" {
+		for _, h := range lookupSketches(tx, features) {
 			meta, err := getChunkMeta(tx, h)
 			if err == nil && meta != nil && meta.Depth < s.maxDepth {
-				baseHash = h
+				candidates = append(candidates, h)
 			}
 		}
 		return nil
 	})
-	if baseHash == "" {
-		return "", nil
+
+	var bestHash string
+	var bestDelta []byte
+	for _, h := range candidates {
+		base, err := s.readChunk(h)
+		if err != nil {
+			continue // ベースを読めない候補はスキップ
+		}
+		delta, err := s.deltaCompress(base, data)
+		if err != nil {
+			continue
+		}
+		if bestDelta == nil || len(delta) < len(bestDelta) {
+			bestHash, bestDelta = h, delta
+			// 十分小さいデルタが得られたら残り候補の評価は省略。
+			if len(bestDelta) < plainSize/5 {
+				break
+			}
+		}
 	}
-	base, err := s.readChunk(baseHash)
-	if err != nil {
-		return "", nil // ベースを読めなければ諦めて通常圧縮
-	}
-	delta, err := s.deltaCompress(base, data)
-	if err != nil {
+	if bestDelta == nil {
 		return "", nil
 	}
 	// 効果が deltaAcceptRatio 未満なら不採用(→ plain 保存 = 新キーフレーム)。
-	if float64(len(delta)) >= float64(plainSize)*deltaAcceptRatio {
+	if float64(len(bestDelta)) >= float64(plainSize)*deltaAcceptRatio {
 		return "", nil
 	}
-	return baseHash, delta
+	return bestHash, bestDelta
 }
 
 // deltaCompress は base を zstd 辞書として data を圧縮する。
@@ -418,7 +444,11 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 }
 
 // readChunk はチャンクを読み出して伸長し、ハッシュを検証して返す。
+// 返り値のスライスはキャッシュと共有されるため変更してはならない。
 func (s *Store) readChunk(hash string) ([]byte, error) {
+	if data, ok := s.cache.get(hash); ok {
+		return data, nil
+	}
 	var meta *ChunkMeta
 	err := s.db.View(func(tx *bolt.Tx) error {
 		var err error
@@ -459,6 +489,7 @@ func (s *Store) readChunk(hash string) ([]byte, error) {
 	if hex.EncodeToString(sum[:]) != hash {
 		return nil, fmt.Errorf("チャンクが破損しています")
 	}
+	s.cache.put(hash, data)
 	return data, nil
 }
 
