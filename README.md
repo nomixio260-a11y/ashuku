@@ -77,6 +77,7 @@ go build -o ashuku ./cmd/ashuku
 | `-chunk-avg` | `0`(=1MiB) | 平均チャンクサイズ(バイト)。初回起動時のみ有効。小さくすると重複排除が細かく効くがメタデータが増える |
 | `-delta-depth` | `0`(=32) | デルタチェーンの深さ上限。深いほど多世代バックアップが縮む(読み出しコストはキャッシュが吸収) |
 | `-cache-mb` | `0`(=128) | 伸長済みチャンクキャッシュ容量(MiB)。デルタチェーンの読み出しを高速化(実測: 深さ32チェーンの読み出しが771ms→30ms) |
+| `-optimize-every` | `1h` | chain repack(チェーン再編成)の自動実行間隔。長期世代保持のドリフト蓄積を回収(100世代実測: 82.7x→142.1x)。`0` で無効 |
 
 ### API
 
@@ -87,6 +88,7 @@ go build -o ashuku ./cmd/ashuku
 | `GET` | `/api/v1/files/{id}` | ダウンロード |
 | `DELETE` | `/api/v1/files/{id}` | 削除(不要チャンクは自動GC) |
 | `GET` | `/api/v1/stats` | 容量統計 |
+| `POST` | `/api/v1/optimize` | chain repack を即時実行(通常は `-optimize-every` の自動実行で十分) |
 
 ### 例
 
@@ -134,8 +136,8 @@ go vet ./...               # 静的チェック
 go run ./cmd/ashuku-bench  # 削減率ベンチマーク(合成データセット × 全設定)
 ```
 
-削減率の実測データ・設計判断の根拠・今後のロードマップは [RESEARCH.md](RESEARCH.md) を
-参照してください。
+プロジェクト全体の総括は [REPORT.md](REPORT.md)、削減率の実測データ・設計判断の
+根拠・文献調査・今後のロードマップは [RESEARCH.md](RESEARCH.md) を参照してください。
 
 ### 構成
 
