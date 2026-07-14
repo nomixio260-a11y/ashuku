@@ -17,6 +17,8 @@ var (
 	bucketSketches = []byte("sketches")
 	// bucketSettings はストア作成時に確定する設定(チャンクサイズ等)。
 	bucketSettings = []byte("settings")
+	// bucketPacks はパックファイルごとの使用量(total/live バイト)。
+	bucketPacks = []byte("packs")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
@@ -48,6 +50,10 @@ type ChunkMeta struct {
 	// メタデータが常に実在するファイルを指すことを保証する(クラッシュ安全)。
 	// 空文字は初期表現(サフィックスなし)。
 	Rep string `json:"rep,omitempty"`
+	// PackID / PackOff は表現がパックファイル内に格納されている場合の位置
+	// (長さは StoredSize)。PackID が空ならファイル表現(hash+Rep 名)。
+	PackID  string `json:"pack,omitempty"`
+	PackOff int64  `json:"poff,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
 }
@@ -58,7 +64,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -106,6 +112,18 @@ func getChunkMeta(tx *bolt.Tx, hash string) (*ChunkMeta, error) {
 
 func unmarshalChunkMeta(raw []byte, c *ChunkMeta) error {
 	return json.Unmarshal(raw, c)
+}
+
+func putPackMeta(tx *bolt.Tx, packID string, pm *packMeta) error {
+	raw, err := json.Marshal(pm)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(bucketPacks).Put([]byte(packID), raw)
+}
+
+func unmarshalPackMeta(raw []byte, pm *packMeta) error {
+	return json.Unmarshal(raw, pm)
 }
 
 func putChunkMeta(tx *bolt.Tx, hash string, c *ChunkMeta) error {

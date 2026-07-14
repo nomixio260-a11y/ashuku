@@ -15,10 +15,12 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io/fs"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nomixio260-a11y/ashuku/internal/store"
@@ -78,8 +80,8 @@ func main() {
 		configs[i].cfg.MaxDeltaDepth = *depth
 	}
 
-	fmt.Println("| データセット | 設定 | 論理サイズ | 物理サイズ | 削減倍率 | スループット |")
-	fmt.Println("|---|---|---:|---:|---:|---:|")
+	fmt.Println("| データセット | 設定 | 論理サイズ | 物理サイズ | 実ディスク | 削減倍率 | スループット |")
+	fmt.Println("|---|---|---:|---:|---:|---:|---:|")
 	for _, ds := range sets {
 		if *only != "" && !strings.Contains(ds.name, *only) {
 			continue
@@ -119,9 +121,9 @@ func run(ds dataset, c config) error {
 		return err
 	}
 	mbps := float64(stats.LogicalBytes) / (1 << 20) / elapsed.Seconds()
-	fmt.Printf("| %s | %s | %s | %s | **%.1fx** | %.0f MB/s |\n",
+	fmt.Printf("| %s | %s | %s | %s | %s | **%.1fx** | %.0f MB/s |\n",
 		ds.name, c.name, human(stats.LogicalBytes), human(stats.PhysicalBytes),
-		stats.TotalRatio, mbps)
+		human(diskUsage(dir)), stats.TotalRatio, mbps)
 
 	if runOptimize {
 		optStart := time.Now()
@@ -133,11 +135,32 @@ func run(ds dataset, c config) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("| %s | %s +optimize | %s | %s | **%.1fx** | (repack %s) |\n",
+		fmt.Printf("| %s | %s +optimize | %s | %s | %s | **%.1fx** | (repack %s) |\n",
 			ds.name, c.name, human(stats.LogicalBytes), human(stats.PhysicalBytes),
-			stats.TotalRatio, optElapsed.Round(time.Second))
+			human(diskUsage(dir)), stats.TotalRatio, optElapsed.Round(time.Second))
 	}
 	return nil
+}
+
+// diskUsage はデータディレクトリの実ディスク使用量(ブロック単位)を返す。
+func diskUsage(dir string) int64 {
+	var total int64
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			total += st.Blocks * 512
+		} else {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }
 
 func human(b int64) string {

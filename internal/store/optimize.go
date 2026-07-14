@@ -42,6 +42,8 @@ type OptimizeResult struct {
 	// BytesBefore / BytesAfter は書き換えたチャンクの保存サイズ合計(前後)。
 	BytesBefore int64 `json:"bytes_before"`
 	BytesAfter  int64 `json:"bytes_after"`
+	// PacksCompacted はコンパクション(copy-forward)で削除したパック数。
+	PacksCompacted int `json:"packs_compacted"`
 }
 
 // minStarSize はこの数以上の子を持つベースだけを再編成対象にする。
@@ -63,6 +65,10 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 		if err := s.repackStar(base, children, res); err != nil {
 			return res, err
 		}
+	}
+	// repack で解放された領域を含め、live 率の低いパックを回収する。
+	if err := s.compactPacks(res); err != nil {
+		return res, err
 	}
 	return res, nil
 }
@@ -172,8 +178,9 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 		return false, nil
 	}
 
-	// 新表現を別名ファイルとして先に書く(rep = 新ベースの先頭8桁)。
-	if err := s.writeChunkFile(hash, newRep, delta); err != nil {
+	// 新表現を先に書く(小さければパックへ、大きければ別名ファイルへ)。
+	loc, err := s.writeRep(hash, newRep, delta)
+	if err != nil {
 		return false, err
 	}
 
@@ -186,7 +193,7 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 			return err // 並行削除 → スキップ
 		}
 		// 改善保証を再確認(事前チェックとの間の並行変更に備える)。
-		if int64(len(delta)) >= meta.StoredSize || meta.Rep == newRep {
+		if int64(len(delta)) >= meta.StoredSize || (meta.Rep == newRep && meta.PackID == "") {
 			return nil
 		}
 		newBaseMeta, err := getChunkMeta(tx, newBase)
@@ -207,7 +214,13 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 
 		oldBase := meta.BaseHash
 		oldSize := meta.StoredSize
-		oldPath = s.chunkPath(hash, meta.Rep)
+
+		// 旧表現の解放を先に計上する(meta の場所フィールドを使うため、
+		// 新しい場所で上書きする前に行う)。
+		oldPath, err = s.releaseRep(tx, hash, meta)
+		if err != nil {
+			return err
+		}
 
 		newBaseMeta.RefCount++
 		if err := putChunkMeta(tx, newBase, newBaseMeta); err != nil {
@@ -217,7 +230,9 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 		meta.BaseHash = newBase
 		meta.Depth = newBaseDepth + 1
 		meta.StoredSize = int64(len(delta))
-		meta.Rep = newRep
+		if err := applyRepLocation(tx, meta, newRep, loc, int64(len(delta))); err != nil {
+			return err
+		}
 		if err := putChunkMeta(tx, hash, meta); err != nil {
 			return err
 		}
@@ -238,11 +253,13 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 		return false, err
 	}
 	if repacked {
-		os.Remove(oldPath)
+		if oldPath != "" {
+			os.Remove(oldPath)
+		}
 		s.removeChunkFiles(orphans)
 	} else {
-		// 切り替えなかった場合は新表現ファイルを掃除する。
-		os.Remove(s.chunkPath(hash, newRep))
+		// 切り替えなかった場合は新表現を破棄する。
+		s.discardNewRep(hash, newRep, loc)
 	}
 	return repacked, nil
 }

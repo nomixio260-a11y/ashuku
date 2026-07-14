@@ -105,6 +105,7 @@ type Store struct {
 	chunkSize int
 	maxDepth  int
 	cache     *chunkCache
+	pw        *packWriter
 	optMu     sync.Mutex // Optimize の同時実行を直列化
 }
 
@@ -166,11 +167,13 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		chunkSize: chunkSize,
 		maxDepth:  maxDepth,
 		cache:     newChunkCache(cacheBytes),
+		pw:        newPackWriter(filepath.Join(dataDir, "packs")),
 	}, nil
 }
 
 // Close はストアを閉じる。
 func (s *Store) Close() error {
+	s.pw.close()
 	s.enc.Close()
 	s.dec.Close()
 	return s.db.Close()
@@ -306,7 +309,11 @@ func (s *Store) storeChunk(hash string, data []byte) error {
 		}
 		newMeta.StoredSize = int64(len(stored))
 
-		if err := s.writeChunkFile(hash, "", stored); err != nil {
+		loc, err := s.writeRep(hash, "", stored)
+		if err != nil {
+			return err
+		}
+		if err := applyRepLocation(tx, newMeta, "", loc, int64(len(stored))); err != nil {
 			return err
 		}
 		// 深さ上限に達したチャンクはベースにできないので索引を汚さない。
@@ -494,7 +501,12 @@ func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("チャンクメタデータがありません")
 	}
 
-	stored, err := os.ReadFile(s.chunkPath(hash, meta.Rep))
+	var stored []byte
+	if meta.PackID != "" {
+		stored, err = s.readFromPack(meta.PackID, meta.PackOff, meta.StoredSize)
+	} else {
+		stored, err = os.ReadFile(s.chunkPath(hash, meta.Rep))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +613,13 @@ func (s *Store) releaseChunksTx(tx *bolt.Tx, hashes []string) ([]string, error) 
 		if meta.BaseHash != "" {
 			queue = append(queue, meta.BaseHash)
 		}
-		orphans = append(orphans, s.chunkPath(hash, meta.Rep))
+		path, err := s.releaseRep(tx, hash, meta)
+		if err != nil {
+			return orphans, err
+		}
+		if path != "" {
+			orphans = append(orphans, path)
+		}
 	}
 	return orphans, nil
 }
@@ -655,6 +673,11 @@ type Stats struct {
 	TotalRatio float64 `json:"total_ratio"`
 	// SavedBytes = Logical - Physical(節約できた容量)
 	SavedBytes int64 `json:"saved_bytes"`
+	// PackCount はパックファイル数。小さな表現(デルタ等)はパックに
+	// 集約され、ファイルシステムのブロック浪費を防ぐ。
+	PackCount int `json:"pack_count"`
+	// PackGarbageBytes はパック内の解放済み領域(次のコンパクションで回収)。
+	PackGarbageBytes int64 `json:"pack_garbage_bytes"`
 }
 
 // Stats は現在の容量統計を集計して返す。
@@ -672,7 +695,7 @@ func (s *Store) Stats() (*Stats, error) {
 		}); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
+		if err := tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
 			var c ChunkMeta
 			if err := json.Unmarshal(v, &c); err != nil {
 				return err
@@ -683,6 +706,17 @@ func (s *Store) Stats() (*Stats, error) {
 			}
 			st.UniqueBytes += c.RawSize
 			st.PhysicalBytes += c.StoredSize
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketPacks).ForEach(func(_, v []byte) error {
+			var pm packMeta
+			if err := unmarshalPackMeta(v, &pm); err != nil {
+				return err
+			}
+			st.PackCount++
+			st.PackGarbageBytes += pm.TotalBytes - pm.LiveBytes
 			return nil
 		})
 	})
