@@ -29,6 +29,7 @@ func New(st *store.Store) *Server {
 	s.mux.HandleFunc("GET /api/v1/files/{id}", s.handleDownload)
 	s.mux.HandleFunc("DELETE /api/v1/files/{id}", s.handleDelete)
 	s.mux.HandleFunc("GET /api/v1/stats", s.handleStats)
+	s.mux.HandleFunc("POST /api/v1/optimize", s.handleOptimize)
 	return s
 }
 
@@ -101,6 +102,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleOptimize は chain repack(デルタチェーン再編成)を実行し、
+// 削減結果を返す。長期の世代保持でドリフトが蓄積したストアの物理容量を
+// 回収する。実行中も読み書きは可能。
+func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request) {
+	res, err := s.store.Optimize()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {

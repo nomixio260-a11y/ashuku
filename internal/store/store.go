@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -104,6 +105,7 @@ type Store struct {
 	chunkSize int
 	maxDepth  int
 	cache     *chunkCache
+	optMu     sync.Mutex // Optimize の同時実行を直列化
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。
@@ -174,8 +176,13 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) chunkPath(hash string) string {
-	return filepath.Join(s.dir, "chunks", hash[:2], hash)
+// chunkPath は保存表現ファイルのパス。rep は表現ID(空=初期表現)。
+func (s *Store) chunkPath(hash, rep string) string {
+	name := hash
+	if rep != "" {
+		name = hash + "-" + rep
+	}
+	return filepath.Join(s.dir, "chunks", hash[:2], name)
 }
 
 // Put は r の内容を name として保存し、マニフェストを返す。
@@ -299,7 +306,7 @@ func (s *Store) storeChunk(hash string, data []byte) error {
 		}
 		newMeta.StoredSize = int64(len(stored))
 
-		if err := s.writeChunkFile(hash, stored); err != nil {
+		if err := s.writeChunkFile(hash, "", stored); err != nil {
 			return err
 		}
 		// 深さ上限に達したチャンクはベースにできないので索引を汚さない。
@@ -397,8 +404,8 @@ func deltaWindowSize(total int) int {
 }
 
 // writeChunkFile は temp ファイル + rename でアトミックに書き込む。
-func (s *Store) writeChunkFile(hash string, data []byte) error {
-	path := s.chunkPath(hash)
+func (s *Store) writeChunkFile(hash, rep string, data []byte) error {
+	path := s.chunkPath(hash, rep)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -460,7 +467,17 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 
 // readChunk はチャンクを読み出して伸長し、ハッシュを検証して返す。
 // 返り値のスライスはキャッシュと共有されるため変更してはならない。
+// chain repack との競合(メタ読み後に旧表現ファイルが消える)は
+// 一度だけのリトライで回復する。
 func (s *Store) readChunk(hash string) ([]byte, error) {
+	data, err := s.readChunkOnce(hash)
+	if err != nil {
+		data, err = s.readChunkOnce(hash)
+	}
+	return data, err
+}
+
+func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 	if data, ok := s.cache.get(hash); ok {
 		return data, nil
 	}
@@ -477,7 +494,7 @@ func (s *Store) readChunk(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("チャンクメタデータがありません")
 	}
 
-	stored, err := os.ReadFile(s.chunkPath(hash))
+	stored, err := os.ReadFile(s.chunkPath(hash, meta.Rep))
 	if err != nil {
 		return nil, err
 	}
@@ -542,49 +559,56 @@ func (s *Store) Delete(id string) error {
 }
 
 // releaseChunks は各ハッシュの参照カウントを1減らし、0になった
-// (=物理削除してよい)ハッシュ列を返す。デルタチャンクが消える場合は
-// そのベースへの参照もカスケードして解放する。
+// (=物理削除してよい)チャンクのファイルパス列を返す。
 func (s *Store) releaseChunks(hashes []string) ([]string, error) {
 	var orphans []string
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		orphans = orphans[:0]
-		queue := append([]string(nil), hashes...)
-		for len(queue) > 0 {
-			hash := queue[0]
-			queue = queue[1:]
-			meta, err := getChunkMeta(tx, hash)
-			if err != nil {
-				return err
-			}
-			if meta == nil {
-				continue
-			}
-			meta.RefCount--
-			if meta.RefCount > 0 {
-				if err := putChunkMeta(tx, hash, meta); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := tx.Bucket(bucketChunks).Delete([]byte(hash)); err != nil {
-				return err
-			}
-			if err := dropSketches(tx, hash, meta.Features); err != nil {
-				return err
-			}
-			if meta.BaseHash != "" {
-				queue = append(queue, meta.BaseHash)
-			}
-			orphans = append(orphans, hash)
-		}
-		return nil
+		var err error
+		orphans, err = s.releaseChunksTx(tx, hashes)
+		return err
 	})
 	return orphans, err
 }
 
-func (s *Store) removeChunkFiles(hashes []string) {
-	for _, hash := range hashes {
-		os.Remove(s.chunkPath(hash))
+// releaseChunksTx は releaseChunks の本体(トランザクション内版)。
+// デルタチャンクが消える場合はそのベースへの参照もカスケードして解放する。
+func (s *Store) releaseChunksTx(tx *bolt.Tx, hashes []string) ([]string, error) {
+	var orphans []string
+	queue := append([]string(nil), hashes...)
+	for len(queue) > 0 {
+		hash := queue[0]
+		queue = queue[1:]
+		meta, err := getChunkMeta(tx, hash)
+		if err != nil {
+			return orphans, err
+		}
+		if meta == nil {
+			continue
+		}
+		meta.RefCount--
+		if meta.RefCount > 0 {
+			if err := putChunkMeta(tx, hash, meta); err != nil {
+				return orphans, err
+			}
+			continue
+		}
+		if err := tx.Bucket(bucketChunks).Delete([]byte(hash)); err != nil {
+			return orphans, err
+		}
+		if err := dropSketches(tx, hash, meta.Features); err != nil {
+			return orphans, err
+		}
+		if meta.BaseHash != "" {
+			queue = append(queue, meta.BaseHash)
+		}
+		orphans = append(orphans, s.chunkPath(hash, meta.Rep))
+	}
+	return orphans, nil
+}
+
+func (s *Store) removeChunkFiles(paths []string) {
+	for _, path := range paths {
+		os.Remove(path)
 	}
 }
 

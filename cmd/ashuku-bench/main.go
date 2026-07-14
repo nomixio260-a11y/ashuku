@@ -35,6 +35,9 @@ type config struct {
 	cfg   store.Config
 }
 
+// runOptimize は -optimize フラグの値(投入後に chain repack を実行)。
+var runOptimize bool
+
 func main() {
 	input := flag.String("input", "", "実データファイルでベンチする(省略時は合成データセット)")
 	gens := flag.Int("gens", 20, "バックアップ世代数")
@@ -42,7 +45,9 @@ func main() {
 	only := flag.String("only", "", "名前にこの部分文字列を含むデータセットだけ実行")
 	chunk := flag.Int("chunk", 0, "平均チャンクサイズ(バイト, 0=デフォルト1MiB)")
 	depth := flag.Int("depth", 0, "デルタチェーン深さ上限(0=デフォルト)")
+	optimize := flag.Bool("optimize", false, "投入後に chain repack(Optimize)を実行して結果も表示")
 	flag.Parse()
+	runOptimize = *optimize
 
 	var sets []dataset
 	if *input != "" {
@@ -117,6 +122,21 @@ func run(ds dataset, c config) error {
 	fmt.Printf("| %s | %s | %s | %s | **%.1fx** | %.0f MB/s |\n",
 		ds.name, c.name, human(stats.LogicalBytes), human(stats.PhysicalBytes),
 		stats.TotalRatio, mbps)
+
+	if runOptimize {
+		optStart := time.Now()
+		if _, err := st.Optimize(); err != nil {
+			return err
+		}
+		optElapsed := time.Since(optStart)
+		stats, err = st.Stats()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("| %s | %s +optimize | %s | %s | **%.1fx** | (repack %s) |\n",
+			ds.name, c.name, human(stats.LogicalBytes), human(stats.PhysicalBytes),
+			stats.TotalRatio, optElapsed.Round(time.Second))
+	}
 	return nil
 }
 

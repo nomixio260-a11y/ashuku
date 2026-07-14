@@ -43,6 +43,11 @@ type ChunkMeta struct {
 	// Depth はデルタチェーンの深さ(0 = plain/raw、1 = plainへのデルタ、…)。
 	// 深さは maxDeltaDepth で制限され、読み出しコストの上限を保証する。
 	Depth int `json:"depth,omitempty"`
+	// Rep は保存表現のID(ファイル名サフィックス)。chain repack でチャンクの
+	// 保存表現を差し替えるとき、新旧の表現を別ファイルとして共存させ、
+	// メタデータが常に実在するファイルを指すことを保証する(クラッシュ安全)。
+	// 空文字は初期表現(サフィックスなし)。
+	Rep string `json:"rep,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
 }
@@ -93,10 +98,14 @@ func getChunkMeta(tx *bolt.Tx, hash string) (*ChunkMeta, error) {
 		return nil, nil
 	}
 	var c ChunkMeta
-	if err := json.Unmarshal(raw, &c); err != nil {
+	if err := unmarshalChunkMeta(raw, &c); err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+func unmarshalChunkMeta(raw []byte, c *ChunkMeta) error {
+	return json.Unmarshal(raw, c)
 }
 
 func putChunkMeta(tx *bolt.Tx, hash string, c *ChunkMeta) error {
