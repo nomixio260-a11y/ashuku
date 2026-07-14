@@ -318,9 +318,24 @@ func (s *Store) storeChunk(hash string, data []byte) error {
 func (s *Store) tryDelta(features []uint64, data []byte, plainSize int) (string, []byte) {
 	var candidates []string
 	s.db.View(func(tx *bolt.Tx) error {
+		seen := map[string]bool{}
 		for _, h := range lookupSketches(tx, features) {
-			meta, err := getChunkMeta(tx, h)
-			if err == nil && meta != nil && meta.Depth < s.maxDepth {
+			// 深さ上限に達した候補は、チェーンの浅い祖先へ張り替える
+			// (git の rebase 流。完全コピーの再アンカーより物理コストが
+			// はるかに小さく、長期世代保持の削減率頭打ちを防ぐ)。
+			for i := 0; h != "" && i <= s.maxDepth+1; i++ {
+				meta, err := getChunkMeta(tx, h)
+				if err != nil || meta == nil {
+					h = ""
+					break
+				}
+				if meta.Depth < s.maxDepth {
+					break
+				}
+				h = meta.BaseHash
+			}
+			if h != "" && !seen[h] {
+				seen[h] = true
 				candidates = append(candidates, h)
 			}
 		}

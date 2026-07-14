@@ -193,6 +193,48 @@ func TestDeltaChainManyGenerations(t *testing.T) {
 	}
 }
 
+// 深さ上限が小さくても、上限到達時は完全コピーではなく浅い祖先への
+// 張り替え(rebase)でデルタが継続することを確認する。
+func TestDeltaRebaseAtDepthLimit(t *testing.T) {
+	s, err := Open(t.TempDir(), Config{MaxDeltaDepth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const gens = 20
+	cur := randomData(t, 1<<20)
+	var ids []string
+	var contents [][]byte
+	for g := 0; g < gens; g++ {
+		m, err := s.Put("gen", bytes.NewReader(cur))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, m.ID)
+		contents = append(contents, cur)
+		cur = mutate(cur, (g*7919)%(len(cur)-32))
+	}
+
+	for i, id := range ids {
+		got := getBytes(t, s, id)
+		if sha256.Sum256(got) != sha256.Sum256(contents[i]) {
+			t.Fatalf("世代 %d の復元が一致しません", i)
+		}
+	}
+
+	st, _ := s.Stats()
+	// 張り替えが機能していれば、深さ3でも大半の世代はデルタで保存される
+	// (完全コピー再アンカーなら 20/(3+1)=5 個の plain ができる)。
+	if st.DeltaChunkCount < gens-3 {
+		t.Fatalf("delta_chunk_count = %d / %d 世代, rebase が機能していません",
+			st.DeltaChunkCount, gens)
+	}
+	if st.TotalRatio < 10 {
+		t.Fatalf("削減倍率 = %.1fx, rebase 後のデルタ効率が不足", st.TotalRatio)
+	}
+}
+
 func TestDeltaRoundTripLargeShared(t *testing.T) {
 	s := newTestStore(t)
 	// 複数チャンクにまたがるサイズで、部分編集+復元一致を確認
