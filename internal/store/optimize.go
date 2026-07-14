@@ -44,6 +44,10 @@ type OptimizeResult struct {
 	BytesAfter  int64 `json:"bytes_after"`
 	// PacksCompacted はコンパクション(copy-forward)で削除したパック数。
 	PacksCompacted int `json:"packs_compacted"`
+	// ZombiesFreed は「ゾンビ救出」で解放されたチャンク数。ゾンビとは、
+	// ファイルからは削除済みだが子デルタのベースとしてのみ生き残っている
+	// チャンク(保持期限削除後にディスクを占有し続ける主因)。
+	ZombiesFreed int `json:"zombies_freed"`
 }
 
 // minStarSize はこの数以上の子を持つベースだけを再編成対象にする。
@@ -66,11 +70,221 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 			return res, err
 		}
 	}
-	// repack で解放された領域を含め、live 率の低いパックを回収する。
+	// ゾンビ救出: 削除済みファイルのチャンクがベース参照だけで生き残って
+	// いる場合、子を祖父へ張り替えてチェーンから外す。チェーンは1パスで
+	// 1リンクずつ縮むため、進展がなくなるまで繰り返す。
+	for i := 0; i <= s.maxDepth*2; i++ {
+		freed, err := s.rescueZombies(res)
+		if err != nil {
+			return res, err
+		}
+		if freed == 0 {
+			break
+		}
+	}
+	// repack・救出で解放された領域を含め、live 率の低いパックを回収する。
 	if err := s.compactPacks(res); err != nil {
 		return res, err
 	}
 	return res, nil
+}
+
+// rescueZombies は1パスのゾンビ救出を行い、解放できたゾンビ数を返す。
+//
+// ゾンビ = デルタチャンクのうち、参照カウントの全てが「子デルタからの
+// ベース参照」で占められているもの(どのファイルマニフェストからも
+// 到達されない…わけではない点に注意: マニフェスト参照はチャンク列に
+// 含まれるので RefCount に計上される。子参照数 == RefCount なら
+// マニフェスト参照ゼロと判定できる)。
+//
+// 子をゾンビの親(祖父)に張り替えるとゾンビの参照がゼロになり解放される。
+// 子のデルタは世代距離が1つ増えるぶん大きくなりうるので、
+// 「子の増分合計 < ゾンビの保存サイズ」の場合のみ実行する(純減の保証)。
+func (s *Store) rescueZombies(res *OptimizeResult) (int, error) {
+	type zombie struct {
+		hash     string
+		base     string // 祖父(子の張り替え先)
+		stored   int64
+		children []string
+	}
+
+	// スナップショット収集: 子参照数と候補ゾンビ
+	childrenOf := make(map[string][]string)
+	metas := make(map[string]*ChunkMeta)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
+			m := *meta
+			metas[hash] = &m
+			if meta.Compression == compressionDelta {
+				childrenOf[meta.BaseHash] = append(childrenOf[meta.BaseHash], hash)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	var zombies []zombie
+	for hash, meta := range metas {
+		kids := childrenOf[hash]
+		if meta.Compression != compressionDelta || len(kids) == 0 {
+			continue // 救出対象はデルタゾンビのみ(plain アンカーは残す)
+		}
+		if meta.RefCount != int64(len(kids)) {
+			continue // マニフェストから参照されている(生きている)
+		}
+		zombies = append(zombies, zombie{
+			hash: hash, base: meta.BaseHash, stored: meta.StoredSize, children: kids,
+		})
+	}
+
+	freed := 0
+	for _, z := range zombies {
+		// 祖父の現況確認(このパス中の先行救出で消えている可能性がある)
+		baseMeta := metas[z.base]
+		if baseMeta == nil {
+			continue
+		}
+		// 子ごとの張り替えデルタを試作し、純減になる場合のみ適用する。
+		type plan struct {
+			hash  string
+			delta []byte
+		}
+		var plans []plan
+		var oldSum, newSum int64
+		ok := true
+		for _, child := range z.children {
+			cm := metas[child]
+			if cm == nil || cm.BaseHash != z.hash {
+				ok = false // 状況が変わった(別パスで張り替え済み等)
+				break
+			}
+			data, err := s.readChunk(child)
+			if err != nil {
+				ok = false
+				break
+			}
+			baseData, err := s.readChunk(z.base)
+			if err != nil {
+				ok = false
+				break
+			}
+			delta, err := s.deltaCompress(baseData, data)
+			if err != nil {
+				ok = false
+				break
+			}
+			oldSum += cm.StoredSize
+			newSum += int64(len(delta))
+			plans = append(plans, plan{hash: child, delta: delta})
+		}
+		if !ok || newSum-oldSum >= z.stored {
+			continue // 純減にならないので現状維持
+		}
+		applied := 0
+		for _, p := range plans {
+			done, err := s.applyRebase(p.hash, z.base, p.delta, res, false)
+			if err != nil {
+				return freed, err
+			}
+			if done {
+				applied++
+			}
+		}
+		if applied == len(z.children) {
+			freed++
+			res.ZombiesFreed++
+		}
+	}
+	return freed, nil
+}
+
+// applyRebase は hash の保存表現を「newBase へのデルタ」に張り替える。
+// requireImprovement が真なら「新表現が現表現より小さい」場合のみ適用する
+// (chain repack 用)。偽なら サイズ増も許容する(ゾンビ救出用 —
+// 呼び出し側がゾンビ解放との純減判定を済ませている)。
+func (s *Store) applyRebase(hash, newBase string, delta []byte, res *OptimizeResult, requireImprovement bool) (bool, error) {
+	newRep := newBase[:8]
+	loc, err := s.writeRep(hash, newRep, delta)
+	if err != nil {
+		return false, err
+	}
+
+	done := false
+	var oldPath string
+	var orphans []string
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		meta, err := getChunkMeta(tx, hash)
+		if err != nil || meta == nil {
+			return err
+		}
+		if requireImprovement && int64(len(delta)) >= meta.StoredSize {
+			return nil // 改善保証を再確認(並行変更に備える)
+		}
+		if meta.Rep == newRep && meta.PackID == "" {
+			return nil // 既に同名ファイル表現 → 上書き危険なのでスキップ
+		}
+		newBaseMeta, err := getChunkMeta(tx, newBase)
+		if err != nil || newBaseMeta == nil {
+			return err
+		}
+		// 循環防止
+		for h, i := newBase, 0; h != "" && i < 4*s.maxDepth; i++ {
+			if h == hash {
+				return nil
+			}
+			m, err := getChunkMeta(tx, h)
+			if err != nil || m == nil {
+				break
+			}
+			h = m.BaseHash
+		}
+
+		oldBase := meta.BaseHash
+		oldSize := meta.StoredSize
+		oldPath, err = s.releaseRep(tx, hash, meta)
+		if err != nil {
+			return err
+		}
+		newBaseMeta.RefCount++
+		if err := putChunkMeta(tx, newBase, newBaseMeta); err != nil {
+			return err
+		}
+		meta.Compression = compressionDelta
+		meta.BaseHash = newBase
+		meta.Depth = newBaseMeta.Depth + 1
+		meta.StoredSize = int64(len(delta))
+		if err := applyRepLocation(tx, meta, newRep, loc, int64(len(delta))); err != nil {
+			return err
+		}
+		if err := putChunkMeta(tx, hash, meta); err != nil {
+			return err
+		}
+		if oldBase != "" {
+			orphans, err = s.releaseChunksTx(tx, []string{oldBase})
+			if err != nil {
+				return err
+			}
+		}
+		res.ChunksRepacked++
+		res.BytesBefore += oldSize
+		res.BytesAfter += int64(len(delta))
+		done = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if done {
+		if oldPath != "" {
+			os.Remove(oldPath)
+		}
+		s.removeChunkFiles(orphans)
+	} else {
+		s.discardNewRep(hash, newRep, loc)
+	}
+	return done, nil
 }
 
 // collectStars は「minStarSize 個以上のデルタ子を持つベース」ごとに
@@ -125,7 +339,7 @@ func (s *Store) repackStar(base string, children []starChild, res *OptimizeResul
 			prevHash = child.hash
 			prevDepth = baseDepth + 1
 		} else {
-			repacked, err := s.repackChunk(child.hash, prevHash, prevDepth, res)
+			repacked, err := s.repackChunk(child.hash, prevHash, res)
 			if err != nil {
 				return err
 			}
@@ -147,7 +361,7 @@ func (s *Store) repackStar(base string, children []starChild, res *OptimizeResul
 
 // repackChunk は hash の保存表現を「newBase へのデルタ」に取り直し、
 // 現表現より小さい場合のみ切り替える。
-func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *OptimizeResult) (bool, error) {
+func (s *Store) repackChunk(hash, newBase string, res *OptimizeResult) (bool, error) {
 	// 重い処理(データ読み出し・デルタ圧縮)は bbolt のロック外で行う。
 	data, err := s.readChunk(hash)
 	if err != nil {
@@ -178,90 +392,8 @@ func (s *Store) repackChunk(hash, newBase string, newBaseDepth int, res *Optimiz
 		return false, nil
 	}
 
-	// 新表現を先に書く(小さければパックへ、大きければ別名ファイルへ)。
-	loc, err := s.writeRep(hash, newRep, delta)
-	if err != nil {
-		return false, err
-	}
-
-	repacked := false
-	var oldPath string
-	var orphans []string
-	err = s.db.Update(func(tx *bolt.Tx) error {
-		meta, err := getChunkMeta(tx, hash)
-		if err != nil || meta == nil {
-			return err // 並行削除 → スキップ
-		}
-		// 改善保証を再確認(事前チェックとの間の並行変更に備える)。
-		if int64(len(delta)) >= meta.StoredSize || (meta.Rep == newRep && meta.PackID == "") {
-			return nil
-		}
-		newBaseMeta, err := getChunkMeta(tx, newBase)
-		if err != nil || newBaseMeta == nil {
-			return err // 新ベースが消えていたらスキップ
-		}
-		// 循環防止: 新ベースの祖先チェーンに自分がいないことを確認。
-		for h, i := newBase, 0; h != "" && i < 4*s.maxDepth; i++ {
-			if h == hash {
-				return nil
-			}
-			m, err := getChunkMeta(tx, h)
-			if err != nil || m == nil {
-				break
-			}
-			h = m.BaseHash
-		}
-
-		oldBase := meta.BaseHash
-		oldSize := meta.StoredSize
-
-		// 旧表現の解放を先に計上する(meta の場所フィールドを使うため、
-		// 新しい場所で上書きする前に行う)。
-		oldPath, err = s.releaseRep(tx, hash, meta)
-		if err != nil {
-			return err
-		}
-
-		newBaseMeta.RefCount++
-		if err := putChunkMeta(tx, newBase, newBaseMeta); err != nil {
-			return err
-		}
-		meta.Compression = compressionDelta
-		meta.BaseHash = newBase
-		meta.Depth = newBaseDepth + 1
-		meta.StoredSize = int64(len(delta))
-		if err := applyRepLocation(tx, meta, newRep, loc, int64(len(delta))); err != nil {
-			return err
-		}
-		if err := putChunkMeta(tx, hash, meta); err != nil {
-			return err
-		}
-		if oldBase != "" {
-			orphans, err = s.releaseChunksTx(tx, []string{oldBase})
-			if err != nil {
-				return err
-			}
-		}
-
-		res.ChunksRepacked++
-		res.BytesBefore += oldSize
-		res.BytesAfter += int64(len(delta))
-		repacked = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	if repacked {
-		if oldPath != "" {
-			os.Remove(oldPath)
-		}
-		s.removeChunkFiles(orphans)
-	} else {
-		// 切り替えなかった場合は新表現を破棄する。
-		s.discardNewRep(hash, newRep, loc)
-	}
-	return repacked, nil
+	// 適用は applyRebase に委譲(改善保証つき)。
+	return s.applyRebase(hash, newBase, delta, res, true)
 }
 
 func (s *Store) chunkDepth(hash string) (int, bool, error) {
