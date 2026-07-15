@@ -152,7 +152,7 @@ ashukuはそのための機構を全て備えた。一方、一度きりのユ�
 
 ## 8. 今後のロードマップ(優先度順)
 
-1. **preflate-rs 統合**(gzip/PNG/PDF内部ストリームの可逆再圧縮、+43%級)— 調査済み、cgo経路
+1. ~~gzip precompression~~ — **実装済み**(zlibパラメータ探索方式。zlib産gzip=実世界の最大勢力を展開してdedup/デルタの対象に。ビット一致検証+復元時SHA-256検証付き)。残る拡張: 生zlib/PNG IDAT対応、preflate-rs統合(zlib-ng/libdeflate等のカバー、外部コードビルド許可が必要)
 2. **chain repack のオンライン強化**(GCのcopy-forwardとの統合、virtual synthetic化)— 設計済み
 3. **JPEG可逆再圧縮**(lepton_jpeg_rust、平均22%)— 画像主体の場合
 4. ~~パックファイル化~~ — **実装済み**(小デルタを追記専用パックに集約、実ディスクオーバーヘッド+8〜9%。解放領域はコンパクションで回収)
