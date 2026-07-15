@@ -12,6 +12,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -31,6 +32,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/nomixio260-a11y/ashuku/internal/chunker"
+	"github.com/nomixio260-a11y/ashuku/internal/precomp"
 )
 
 // ErrNotFound は指定IDのファイルが存在しないことを示す。
@@ -78,7 +80,14 @@ type Config struct {
 	MaxDeltaDepth int
 	// CacheBytes は伸長済みチャンクキャッシュの容量。0 ならデフォルト(128MiB)。
 	CacheBytes int64
+	// DisablePrecomp は gzip precompression(zlib産gzipを展開して保存)を
+	// 無効化する。CGO 無効ビルドでは常に無効。
+	DisablePrecomp bool
 }
+
+// precompMaxSize を超える gzip は precompression を試みない
+// (分解・再構成をメモリ上で行うため)。
+const precompMaxSize = 256 << 20
 
 func (c Config) encoderLevel() (zstd.EncoderLevel, error) {
 	switch c.Compression {
@@ -106,6 +115,7 @@ type Store struct {
 	maxDepth  int
 	cache     *chunkCache
 	pw        *packWriter
+	precomp   bool
 	optMu     sync.Mutex // Optimize の同時実行を直列化
 }
 
@@ -168,6 +178,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		maxDepth:  maxDepth,
 		cache:     newChunkCache(cacheBytes),
 		pw:        newPackWriter(filepath.Join(dataDir, "packs")),
+		precomp:   !cfg.DisablePrecomp && precomp.Supported(),
 	}, nil
 }
 
@@ -190,17 +201,82 @@ func (s *Store) chunkPath(hash, rep string) string {
 
 // Put は r の内容を name として保存し、マニフェストを返す。
 func (s *Store) Put(name string, r io.Reader) (*FileManifest, error) {
-	ck, err := chunker.New(r, s.chunkSize)
-	if err != nil {
-		return nil, err
-	}
-
 	m := &FileManifest{
 		ID:        newID(),
 		Name:      name,
 		CreatedAt: time.Now().UTC(),
 	}
 
+	// gzip precompression: zlib産 gzip なら「展開データ+レシピ」に分解し、
+	// 展開データを dedup/デルタ/zstd の対象にする(ビット一致検証済みの
+	// 場合のみ)。該当しないストリームはそのまま通常経路へ。
+	if s.precomp {
+		head := make([]byte, 3)
+		n, _ := io.ReadFull(r, head)
+		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
+		if n == 3 && precomp.IsGzip(head) {
+			buf, overflow, err := readUpTo(rest, precompMaxSize)
+			if err != nil {
+				return nil, err
+			}
+			if overflow == nil {
+				if u, ok := precomp.TryUnwrap(buf); ok {
+					sum := sha256.Sum256(buf)
+					m.Encoding = EncodingGzipZlibV1
+					m.PrecompHeader = u.Header
+					m.PrecompLevel = u.Level
+					m.OrigSHA256 = hex.EncodeToString(sum[:])
+					if err := s.putStream(m, bytes.NewReader(u.Plain)); err != nil {
+						return nil, err
+					}
+					// GET が返すのは元の gzip なので Size は元サイズに合わせ、
+					// チャンク化視点のサイズ(展開データ)は別に記録する。
+					m.ChunkedSize = m.Size
+					m.Size = int64(len(buf))
+					return m, s.commitManifest(m)
+				}
+				rest = bytes.NewReader(buf)
+			} else {
+				rest = io.MultiReader(bytes.NewReader(buf), overflow)
+			}
+		}
+		r = rest
+	}
+
+	if err := s.putStream(m, r); err != nil {
+		return nil, err
+	}
+	return m, s.commitManifest(m)
+}
+
+// readUpTo は最大 max バイトまで読む。入力がそれ以下で終われば
+// (全データ, nil) を、超えれば (先頭 max バイト, 残りのリーダ) を返す。
+func readUpTo(r io.Reader, max int) ([]byte, io.Reader, error) {
+	buf, err := io.ReadAll(io.LimitReader(r, int64(max)))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(buf) < max {
+		return buf, nil, nil
+	}
+	// 続きがあるか1バイト先読み
+	var probe [1]byte
+	n, err := r.Read(probe[:])
+	if n == 0 && (err == io.EOF || err == nil) {
+		return buf, nil, nil
+	}
+	if err != nil && err != io.EOF {
+		return nil, nil, err
+	}
+	return buf, io.MultiReader(bytes.NewReader(probe[:n]), r), nil
+}
+
+// putStream は r をチャンク化して保存し、m にチャンク列とサイズを記録する。
+func (s *Store) putStream(m *FileManifest, r io.Reader) error {
+	ck, err := chunker.New(r, s.chunkSize)
+	if err != nil {
+		return err
+	}
 	for {
 		chunk, err := ck.Next()
 		if err == io.EOF {
@@ -208,26 +284,30 @@ func (s *Store) Put(name string, r io.Reader) (*FileManifest, error) {
 		}
 		if err != nil {
 			s.rollbackChunks(m.Chunks)
-			return nil, fmt.Errorf("チャンク分割に失敗: %w", err)
+			return fmt.Errorf("チャンク分割に失敗: %w", err)
 		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
 		if err := s.storeChunk(hexHash, chunk.Data); err != nil {
 			s.rollbackChunks(m.Chunks)
-			return nil, err
+			return err
 		}
 		m.Chunks = append(m.Chunks, hexHash)
 		m.Size += int64(len(chunk.Data))
 	}
+	return nil
+}
 
-	err = s.db.Update(func(tx *bolt.Tx) error {
+// commitManifest はマニフェストを保存する(失敗時はチャンク参照を戻す)。
+func (s *Store) commitManifest(m *FileManifest) error {
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		return putFileManifest(tx, m)
 	})
 	if err != nil {
 		s.rollbackChunks(m.Chunks)
-		return nil, err
+		return err
 	}
-	return m, nil
+	return nil
 }
 
 // storeChunk はチャンクを重複排除しつつ保存する。
@@ -455,6 +535,29 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 		return nil, nil, err
 	}
 
+	// precompression されたファイルはチャンク列(展開データ)からレシピで
+	// 元の gzip をビット単位に再構成し、SHA-256 で検証してから返す。
+	if m.Encoding == EncodingGzipZlibV1 {
+		var plain bytes.Buffer
+		plain.Grow(int(m.Size))
+		for _, hash := range m.Chunks {
+			data, err := s.readChunk(hash)
+			if err != nil {
+				return nil, nil, fmt.Errorf("チャンク %s の読み出しに失敗: %w", hash[:12], err)
+			}
+			plain.Write(data)
+		}
+		orig, err := precomp.Reconstruct(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+		if err != nil {
+			return nil, nil, fmt.Errorf("gzip 再構成に失敗: %w", err)
+		}
+		sum := sha256.Sum256(orig)
+		if hex.EncodeToString(sum[:]) != m.OrigSHA256 {
+			return nil, nil, fmt.Errorf("gzip 再構成の検証に失敗しました(保存時と異なる zlib 実装の可能性)")
+		}
+		return m, io.NopCloser(bytes.NewReader(orig)), nil
+	}
+
 	pr, pw := io.Pipe()
 	go func() {
 		for _, hash := range m.Chunks {
@@ -678,12 +781,16 @@ type Stats struct {
 	PackCount int `json:"pack_count"`
 	// PackGarbageBytes はパック内の解放済み領域(次のコンパクションで回収)。
 	PackGarbageBytes int64 `json:"pack_garbage_bytes"`
+	// chunkedLogical はチャンク化視点の論理サイズ合計(precompression 適用
+	// ファイルは展開データのサイズ)。DedupRatio の分子に使う内部値。
+	chunkedLogical int64
 }
 
 // Stats は現在の容量統計を集計して返す。
 func (s *Store) Stats() (*Stats, error) {
 	st := &Stats{}
 	err := s.db.View(func(tx *bolt.Tx) error {
+		var chunkedLogical int64
 		if err := tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
 			var m FileManifest
 			if err := json.Unmarshal(v, &m); err != nil {
@@ -691,10 +798,16 @@ func (s *Store) Stats() (*Stats, error) {
 			}
 			st.FileCount++
 			st.LogicalBytes += m.Size
+			if m.ChunkedSize > 0 {
+				chunkedLogical += m.ChunkedSize
+			} else {
+				chunkedLogical += m.Size
+			}
 			return nil
 		}); err != nil {
 			return err
 		}
+		st.chunkedLogical = chunkedLogical
 		if err := tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
 			var c ChunkMeta
 			if err := json.Unmarshal(v, &c); err != nil {
@@ -723,7 +836,7 @@ func (s *Store) Stats() (*Stats, error) {
 	if err != nil {
 		return nil, err
 	}
-	st.DedupRatio = ratio(st.LogicalBytes, st.UniqueBytes)
+	st.DedupRatio = ratio(st.chunkedLogical, st.UniqueBytes)
 	st.CompressionRatio = ratio(st.UniqueBytes, st.PhysicalBytes)
 	st.TotalRatio = ratio(st.LogicalBytes, st.PhysicalBytes)
 	st.SavedBytes = st.LogicalBytes - st.PhysicalBytes

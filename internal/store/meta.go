@@ -31,7 +31,22 @@ type FileManifest struct {
 	CreatedAt time.Time `json:"created_at"`
 	// Chunks は復元順に並んだチャンクハッシュ(hex)の列。
 	Chunks []string `json:"chunks"`
+	// Encoding は保存時に適用した可逆変換。"" = なし。
+	// "gzip-zlib-v1" = zlib産gzipを展開して保存(チャンク列は展開データ)。
+	Encoding string `json:"encoding,omitempty"`
+	// PrecompHeader / PrecompLevel は gzip 再構成レシピ
+	// (ヘッダ原文と zlib 圧縮レベル)。
+	PrecompHeader []byte `json:"precomp_header,omitempty"`
+	PrecompLevel  int    `json:"precomp_level,omitempty"`
+	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
+	OrigSHA256 string `json:"orig_sha256,omitempty"`
+	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
+	// 展開データのサイズになり Size(元ストリーム)と異なる。0 なら Size と同じ。
+	ChunkedSize int64 `json:"chunked_size,omitempty"`
 }
+
+// EncodingGzipZlibV1 は zlib産 gzip の precompression エンコーディング名。
+const EncodingGzipZlibV1 = "gzip-zlib-v1"
 
 // ChunkMeta はユニークチャンク1件のメタデータ。
 type ChunkMeta struct {

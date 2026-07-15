@@ -21,14 +21,17 @@ func main() {
 	cacheMB := flag.Int64("cache-mb", 0, "伸長済みチャンクキャッシュ容量 MiB(0=デフォルト128)")
 	optimizeEvery := flag.Duration("optimize-every", time.Hour,
 		"chain repack(デルタチェーン再編成)の自動実行間隔。0 で無効")
+	precompFlag := flag.Bool("precomp", true,
+		"gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ")
 	flag.Parse()
 
 	st, err := store.Open(*dataDir, store.Config{
-		Compression:   *compression,
-		DisableDelta:  !*delta,
-		AvgChunkSize:  *chunkAvg,
-		MaxDeltaDepth: *deltaDepth,
-		CacheBytes:    *cacheMB << 20,
+		Compression:    *compression,
+		DisableDelta:   !*delta,
+		AvgChunkSize:   *chunkAvg,
+		MaxDeltaDepth:  *deltaDepth,
+		CacheBytes:     *cacheMB << 20,
+		DisablePrecomp: !*precompFlag,
 	})
 	if err != nil {
 		log.Fatalf("ストアを開けません: %v", err)
