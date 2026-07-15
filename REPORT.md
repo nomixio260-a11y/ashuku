@@ -58,6 +58,16 @@ go build -o ashuku ./cmd/ashuku
 `-cache-mb`(チャンクキャッシュ、既定128MiB)、`-chunk-avg`(チャンクサイズ、既定1MiB)、
 `-optimize-every`(自動再編成間隔、既定1h)。
 
+### 柔軟性(シナリオ対応)
+
+- **適応圧縮 `auto`(デフォルト)**: チャンクごとに fast で探査し、縮むものだけ
+  最高レベルで再圧縮(ZFS zstd early-abort と同型)。実測: 圧縮可能データは
+  max と同等の削減率、圧縮不能データは fast 並みの速度(max の約2倍)
+- **アップロード単位の圧縮指定**: `X-Compression` ヘッダ / `?compression=` で
+  auto/fast/balanced/max を上書き
+- **precompression 3形式**: 単一 gzip・連結 gzip(ローテートログ)・生 zlib
+  (git loose object 等)。いずれもビット一致検証つき
+
 ### 削減パイプライン
 
 ```

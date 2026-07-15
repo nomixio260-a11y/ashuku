@@ -64,9 +64,14 @@ const DefaultCacheBytes = 128 << 20
 // deltaAcceptRatio: デルタサイズが通常圧縮の何割未満なら採用するか。
 const deltaAcceptRatio = 0.9
 
-// Config はストアの動作設定。ゼロ値はデフォルト(balanced, デルタ有効, 1MiB)。
+// Config はストアの動作設定。ゼロ値はデフォルト(auto, デルタ有効, 1MiB)。
 type Config struct {
-	// Compression は zstd 圧縮レベル: "fast" | "balanced"(デフォルト) | "max"
+	// Compression は zstd 圧縮モード:
+	//   "auto"(デフォルト) = チャンクごとに fast で探査し、十分縮む場合のみ
+	//                        最高レベルで再圧縮(テキストは最高圧縮率、
+	//                        圧縮不能データは高速のまま)
+	//   "fast" | "balanced" | "max" = 固定レベル
+	// アップロード単位で PutOptions により上書きできる。
 	Compression string
 	// DisableDelta は類似チャンクへのデルタ圧縮を無効化する。
 	DisableDelta bool
@@ -89,41 +94,52 @@ type Config struct {
 // (分解・再構成をメモリ上で行うため)。
 const precompMaxSize = 256 << 20
 
-func (c Config) encoderLevel() (zstd.EncoderLevel, error) {
-	switch c.Compression {
-	case "fast":
-		return zstd.SpeedFastest, nil
-	case "", "balanced":
-		return zstd.SpeedBetterCompression, nil
-	case "max":
-		return zstd.SpeedBestCompression, nil
-	default:
-		return 0, fmt.Errorf("不明な圧縮レベル %q (fast | balanced | max)", c.Compression)
+// ValidCompression は圧縮モード名の妥当性を検査する(""はデフォルト=auto)。
+func ValidCompression(mode string) bool {
+	switch mode {
+	case "", "auto", "fast", "balanced", "max":
+		return true
 	}
+	return false
+}
+
+// deltaLevel はデルタ圧縮に使うレベル。max モードのみ最高レベル、
+// それ以外は balanced(デルタは小さいので速度優先で十分)。
+func deltaLevelFor(mode string) zstd.EncoderLevel {
+	if mode == "max" {
+		return zstd.SpeedBestCompression
+	}
+	return zstd.SpeedBetterCompression
 }
 
 // Store はストレージエンジン本体。メソッドは並行呼び出し安全
 // (書き込みは bbolt の単一ライタで直列化される)。
 type Store struct {
-	dir       string
-	db        *bolt.DB
-	enc       *zstd.Encoder
-	dec       *zstd.Decoder
-	level     zstd.EncoderLevel
-	delta     bool
-	chunkSize int
-	maxDepth  int
-	cache     *chunkCache
-	pw        *packWriter
-	precomp   bool
-	optMu     sync.Mutex // Optimize の同時実行を直列化
+	dir         string
+	db          *bolt.DB
+	encFast     *zstd.Encoder
+	encBalanced *zstd.Encoder
+	encBest     *zstd.Encoder
+	dec         *zstd.Decoder
+	mode        string // デフォルト圧縮モード(auto/fast/balanced/max)
+	level       zstd.EncoderLevel // デルタ圧縮のレベル
+	delta       bool
+	chunkSize   int
+	maxDepth    int
+	cache       *chunkCache
+	pw          *packWriter
+	precomp     bool
+	optMu       sync.Mutex // Optimize の同時実行を直列化
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。
 func Open(dataDir string, cfg Config) (*Store, error) {
-	level, err := cfg.encoderLevel()
-	if err != nil {
-		return nil, err
+	if !ValidCompression(cfg.Compression) {
+		return nil, fmt.Errorf("不明な圧縮モード %q (auto | fast | balanced | max)", cfg.Compression)
+	}
+	mode := cfg.Compression
+	if mode == "" {
+		mode = "auto"
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "chunks"), 0o700); err != nil {
 		return nil, err
@@ -149,7 +165,20 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		log.Printf("ashuku: 平均チャンクサイズは初回設定 %d bytes を使用します(指定 %d は無視)",
 			chunkSize, requested)
 	}
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
+	newEnc := func(level zstd.EncoderLevel) (*zstd.Encoder, error) {
+		return zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
+	}
+	encFast, err := newEnc(zstd.SpeedFastest)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	encBalanced, err := newEnc(zstd.SpeedBetterCompression)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	encBest, err := newEnc(zstd.SpeedBestCompression)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -168,24 +197,63 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		cacheBytes = DefaultCacheBytes
 	}
 	return &Store{
-		dir:       dataDir,
-		db:        db,
-		enc:       enc,
-		dec:       dec,
-		level:     level,
-		delta:     !cfg.DisableDelta,
-		chunkSize: chunkSize,
-		maxDepth:  maxDepth,
-		cache:     newChunkCache(cacheBytes),
-		pw:        newPackWriter(filepath.Join(dataDir, "packs")),
-		precomp:   !cfg.DisablePrecomp && precomp.Supported(),
+		dir:         dataDir,
+		db:          db,
+		encFast:     encFast,
+		encBalanced: encBalanced,
+		encBest:     encBest,
+		dec:         dec,
+		mode:        mode,
+		level:       deltaLevelFor(mode),
+		delta:       !cfg.DisableDelta,
+		chunkSize:   chunkSize,
+		maxDepth:    maxDepth,
+		cache:       newChunkCache(cacheBytes),
+		pw:          newPackWriter(filepath.Join(dataDir, "packs")),
+		precomp:     !cfg.DisablePrecomp && precomp.Supported(),
 	}, nil
+}
+
+// compressChunk はモードに応じてチャンクを圧縮する。
+//
+// auto は fast で探査し、十分縮む(1.11倍以上)データだけ最高レベルで
+// 再圧縮する2段階方式(ZFS の zstd early-abort と同型。あちらは
+// 圧縮不能データで4.5倍のスループット改善・容量コスト0.3%未満を実証)。
+// 「fast では縮まないが高レベルなら縮む」病理ケースの偽陰性は、判定コスト
+// との釣り合いから ZFS 同様に許容する(RESEARCH.md 参照)。
+// 小チャンクは判定コスト比率が高く高レベルの利得も小さいため、
+// ZFS(128KB未満は対象外)に倣い探査せず balanced 一発で圧縮する。
+func (s *Store) compressChunk(data []byte, mode string) []byte {
+	out := make([]byte, 0, len(data)/2)
+	switch mode {
+	case "fast":
+		return s.encFast.EncodeAll(data, out)
+	case "balanced":
+		return s.encBalanced.EncodeAll(data, out)
+	case "max":
+		return s.encBest.EncodeAll(data, out)
+	default: // auto
+		if len(data) < 128<<10 {
+			return s.encBalanced.EncodeAll(data, out)
+		}
+		quick := s.encFast.EncodeAll(data, out)
+		if len(quick)*10 >= len(data)*9 {
+			return quick // ほぼ縮まない → 重い再圧縮は無駄
+		}
+		best := s.encBest.EncodeAll(data, make([]byte, 0, len(quick)))
+		if len(best) < len(quick) {
+			return best
+		}
+		return quick
+	}
 }
 
 // Close はストアを閉じる。
 func (s *Store) Close() error {
 	s.pw.close()
-	s.enc.Close()
+	s.encFast.Close()
+	s.encBalanced.Close()
+	s.encBest.Close()
 	s.dec.Close()
 	return s.db.Close()
 }
@@ -199,42 +267,58 @@ func (s *Store) chunkPath(hash, rep string) string {
 	return filepath.Join(s.dir, "chunks", hash[:2], name)
 }
 
+// PutOptions はアップロード単位の動作指定。
+type PutOptions struct {
+	// Compression は圧縮モードの上書き("" ならストアのデフォルト)。
+	// "auto" | "fast" | "balanced" | "max"
+	Compression string
+}
+
 // Put は r の内容を name として保存し、マニフェストを返す。
 func (s *Store) Put(name string, r io.Reader) (*FileManifest, error) {
+	return s.PutWithOptions(name, r, PutOptions{})
+}
+
+// PutWithOptions はアップロード単位のオプション付きで保存する。
+func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*FileManifest, error) {
+	if !ValidCompression(opts.Compression) {
+		return nil, fmt.Errorf("不明な圧縮モード %q", opts.Compression)
+	}
+	mode := opts.Compression
+	if mode == "" {
+		mode = s.mode
+	}
 	m := &FileManifest{
 		ID:        newID(),
 		Name:      name,
 		CreatedAt: time.Now().UTC(),
 	}
 
-	// gzip precompression: zlib産 gzip なら「展開データ+レシピ」に分解し、
-	// 展開データを dedup/デルタ/zstd の対象にする(ビット一致検証済みの
-	// 場合のみ)。該当しないストリームはそのまま通常経路へ。
+	// precompression: zlib産の deflate 系ストリーム(gzip 単一/マルチメンバー・
+	// 生 zlib)なら「展開データ+レシピ」に分解し、展開データを dedup/デルタ/
+	// zstd の対象にする(ビット一致検証済みの場合のみ)。
+	// 該当しないストリームはそのまま通常経路へ。
 	if s.precomp {
 		head := make([]byte, 3)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
-		if n == 3 && precomp.IsGzip(head) {
+		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head)) {
 			buf, overflow, err := readUpTo(rest, precompMaxSize)
 			if err != nil {
 				return nil, err
 			}
-			if overflow == nil {
-				if u, ok := precomp.TryUnwrap(buf); ok {
-					sum := sha256.Sum256(buf)
-					m.Encoding = EncodingGzipZlibV1
-					m.PrecompHeader = u.Header
-					m.PrecompLevel = u.Level
-					m.OrigSHA256 = hex.EncodeToString(sum[:])
-					if err := s.putStream(m, bytes.NewReader(u.Plain)); err != nil {
-						return nil, err
-					}
-					// GET が返すのは元の gzip なので Size は元サイズに合わせ、
-					// チャンク化視点のサイズ(展開データ)は別に記録する。
-					m.ChunkedSize = m.Size
-					m.Size = int64(len(buf))
-					return m, s.commitManifest(m)
+			if overflow == nil && s.tryPrecomp(m, buf) {
+				if err := s.putStream(m, bytes.NewReader(m.precompPlain), mode); err != nil {
+					return nil, err
 				}
+				// GET が返すのは元のストリームなので Size は元サイズに合わせ、
+				// チャンク化視点のサイズ(展開データ)は別に記録する。
+				m.ChunkedSize = m.Size
+				m.Size = int64(len(buf))
+				m.precompPlain = nil
+				return m, s.commitManifest(m)
+			}
+			if overflow == nil {
 				rest = bytes.NewReader(buf)
 			} else {
 				rest = io.MultiReader(bytes.NewReader(buf), overflow)
@@ -243,10 +327,47 @@ func (s *Store) Put(name string, r io.Reader) (*FileManifest, error) {
 		r = rest
 	}
 
-	if err := s.putStream(m, r); err != nil {
+	if err := s.putStream(m, r, mode); err != nil {
 		return nil, err
 	}
 	return m, s.commitManifest(m)
+}
+
+// tryPrecomp は buf を gzip(単一/マルチ)または生 zlib として分解を試み、
+// 成功したらマニフェストにレシピを記録して真を返す。
+// 展開データは m.precompPlain に一時保持される。
+func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
+	sum := sha256.Sum256(buf)
+	switch {
+	case precomp.IsGzip(buf):
+		// まず単一メンバーとして試し(既存フォーマット互換)、
+		// だめならマルチメンバーとして試す。
+		if u, ok := precomp.TryUnwrap(buf); ok {
+			m.Encoding = EncodingGzipZlibV1
+			m.PrecompHeader = u.Header
+			m.PrecompLevel = u.Level
+			m.precompPlain = u.Plain
+		} else if plain, members, ok := precomp.TryUnwrapGzipMulti(buf); ok {
+			m.Encoding = EncodingGzipMultiV1
+			m.PrecompMembers = members
+			m.precompPlain = plain
+		} else {
+			return false
+		}
+	case precomp.IsZlib(buf):
+		u, ok := precomp.TryUnwrapZlib(buf)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingZlibV1
+		m.PrecompHeader = u.Header
+		m.PrecompLevel = u.Level
+		m.precompPlain = u.Plain
+	default:
+		return false
+	}
+	m.OrigSHA256 = hex.EncodeToString(sum[:])
+	return true
 }
 
 // readUpTo は最大 max バイトまで読む。入力がそれ以下で終われば
@@ -272,7 +393,7 @@ func readUpTo(r io.Reader, max int) ([]byte, io.Reader, error) {
 }
 
 // putStream は r をチャンク化して保存し、m にチャンク列とサイズを記録する。
-func (s *Store) putStream(m *FileManifest, r io.Reader) error {
+func (s *Store) putStream(m *FileManifest, r io.Reader, mode string) error {
 	ck, err := chunker.New(r, s.chunkSize)
 	if err != nil {
 		return err
@@ -288,7 +409,7 @@ func (s *Store) putStream(m *FileManifest, r io.Reader) error {
 		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
-		if err := s.storeChunk(hexHash, chunk.Data); err != nil {
+		if err := s.storeChunk(hexHash, chunk.Data, mode); err != nil {
 			s.rollbackChunks(m.Chunks)
 			return err
 		}
@@ -316,7 +437,7 @@ func (s *Store) commitManifest(m *FileManifest) error {
 //  2. 新規なら類似チャンクを索引から探し、見つかればそれをベースに
 //     デルタ圧縮(zstd 辞書圧縮)を試す。十分縮めばデルタで保存
 //  3. それ以外は zstd 圧縮(縮まなければ raw)で保存
-func (s *Store) storeChunk(hash string, data []byte) error {
+func (s *Store) storeChunk(hash string, data []byte, mode string) error {
 	// 高速パス: 完全一致の既存チャンクは圧縮せずに参照カウントだけ増やす。
 	existed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -333,7 +454,7 @@ func (s *Store) storeChunk(hash string, data []byte) error {
 	}
 
 	// 圧縮・類似検索は CPU/IO コストが高いので bbolt の書き込みロック外で行う。
-	compressed := s.enc.EncodeAll(data, make([]byte, 0, len(data)/2))
+	compressed := s.compressChunk(data, mode)
 
 	var features []uint64
 	var baseHash string
@@ -536,10 +657,10 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 	}
 
 	// precompression されたファイルはチャンク列(展開データ)からレシピで
-	// 元の gzip をビット単位に再構成し、SHA-256 で検証してから返す。
-	if m.Encoding == EncodingGzipZlibV1 {
+	// 元のストリームをビット単位に再構成し、SHA-256 で検証してから返す。
+	if m.Encoding != "" {
 		var plain bytes.Buffer
-		plain.Grow(int(m.Size))
+		plain.Grow(int(m.ChunkedSize))
 		for _, hash := range m.Chunks {
 			data, err := s.readChunk(hash)
 			if err != nil {
@@ -547,13 +668,24 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 			}
 			plain.Write(data)
 		}
-		orig, err := precomp.Reconstruct(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+		var orig []byte
+		var err error
+		switch m.Encoding {
+		case EncodingGzipZlibV1:
+			orig, err = precomp.Reconstruct(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+		case EncodingZlibV1:
+			orig, err = precomp.ReconstructZlib(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+		case EncodingGzipMultiV1:
+			orig, err = precomp.ReconstructGzipMulti(m.PrecompMembers, plain.Bytes())
+		default:
+			err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
+		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("gzip 再構成に失敗: %w", err)
+			return nil, nil, fmt.Errorf("precompression の再構成に失敗: %w", err)
 		}
 		sum := sha256.Sum256(orig)
 		if hex.EncodeToString(sum[:]) != m.OrigSHA256 {
-			return nil, nil, fmt.Errorf("gzip 再構成の検証に失敗しました(保存時と異なる zlib 実装の可能性)")
+			return nil, nil, fmt.Errorf("再構成の検証に失敗しました(保存時と異なる zlib 実装の可能性)")
 		}
 		return m, io.NopCloser(bytes.NewReader(orig)), nil
 	}

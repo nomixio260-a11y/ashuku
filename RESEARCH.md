@@ -310,8 +310,11 @@ LRUキャッシュ(実測: 最終世代8MiBの読み出し 771ms→30ms)が吸�
 3. **[P1] zstd 辞書学習** — データ種別ごとに学習した辞書で小チャンクの圧縮率を改善。
 4. **[P2→一部実装済み] Deflate 系 precompression** — zlib パラメータ探索方式
    (precomp/AntiZ 流)を実装済み(§3.1 項目9)。zlib 産 gzip をカバーする。
-   残る拡張: (a) zlib ストリーム(gzip でない生 zlib / PNG IDAT)対応、
-   (b) preflate-rs 統合による zlib-ng / libdeflate / 未認識エンコーダ対応
+   残る拡張: (a) 生 zlib ストリーム(0x78 マジック、主対象 git loose object)+
+   マルチメンバー gzip(logrotate 連結 / BGZF)対応 — 既存の zlib パラメータ探索を流用でき
+   低コスト、設計と DoS 対策は §4.1 参照、
+   (b) コンテナ内部ストリーム(PNG IDAT / PDF FlateDecode / JAR)は署名ベース個別パーサが必要、
+   (c) preflate-rs 統合による zlib-ng / libdeflate / 未認識エンコーダ対応
    (外部コードのビルド許可が必要、工数 6〜9人週)。
 5. **[P2] JPEG 可逆再圧縮(lepton_jpeg_rust, 平均22%)** — 画像が支配的な場合のみ。
    preflate-rs と同型の FFI で追加可能(+2〜3人週)。
@@ -323,6 +326,189 @@ LRUキャッシュ(実測: 最終世代8MiBの読み出し 771ms→30ms)が吸�
    virtual synthetic 化)は §3.6 の調査済み設計に従う。
 8. **[運用] 期待値の可視化** — `/api/v1/stats` の削減率をワークロード判断に使う。
    削減率はアルゴリズムではなくデータで決まるため、公称値は必ず前提条件付きで示す。
+
+## 4.1 追加研究(2026-07-15): precompression の生 zlib / マルチメンバー gzip 拡張
+
+背景: 当実装は「zlib 産 gzip を展開データ+レシピに分解し、ビット一致検証付きで保存する」
+precompression(zlib パラメータ探索方式、precomp/AntiZ 流)を実装済み(§3.1 項目9)。
+本節は拡張候補 (a) 生 zlib ストリーム(0x78 マジック)、(b) マルチメンバー gzip
+(連結 gzip)の安全性・実用性を Web 調査した記録である。
+
+### 4.1.1 zlib マジックの誤検出率と対策
+
+- **zlib ヘッダ構造(RFC 1950)**: 先頭 2 バイトは CMF(Compression Method and Flags)と
+  FLG。CMF の下位 4 ビットが圧縮法(8=deflate)、上位 4 ビットが LZ77 窓サイズ(CINFO)。
+  FLG は 5 ビットのチェックサム・プリセット辞書ビット(FDICT)・2 ビットの圧縮レベル。
+  **検査式は (CMF*256 + FLG) mod 31 == 0**(FLG の下位 5 ビットが CMF/FLG の残りを
+  31 の倍数に合わせる巡回チェック)。実用上よく見る先頭は **0x78 0x01 / 0x78 0x9C /
+  0x78 0xDA**(いずれも 32KB 窓 = CINFO 7)。
+  出典: [RFC 1950](https://www.rfc-editor.org/rfc/rfc1950),
+  [SANS ISC: Recognizing ZLIB Compression](https://isc.sans.edu/diary/25182),
+  [zlib header 解説](https://www.codestudy.net/blog/what-does-a-zlib-header-look-like/)
+
+- **誤検出確率(先頭 2 バイトのみ・任意オフセットなしの場合)**:
+  当方は先頭バイトを **0x78 固定**で判定する。CMF=0x78 のとき
+  30720 mod 31 = 30 なので FLG ≡ 1 (mod 31)、すなわち FLG ∈ {1,32,63,94,125,156,187,218,249}
+  の **9 値のみ**が有効。よってランダム 2 バイトが「0x78 + 有効 FLG」になる確率は
+  (1/256)×(9/256) ≈ **1.37×10⁻⁴(約 1/7300)**。全 CINFO(0x08〜0x78 の 8 種)を許すと
+  約 8 倍(≈1/900)。**2 バイトの一致だけでは高頻度に誤検出する**——precomp の brute/intense
+  モードが不安定になる根本原因はこれ。
+  出典: [RFC 1950](https://www.rfc-editor.org/rfc/rfc1950)(mod 31 規定),
+  上記 FLG 値の算術は本式から導出。
+
+- **実プロジェクトの誤検出対策**: precomp-cpp は「zLib ヘッダは 2 バイトしかないので
+  誤検出ストリームが多発し、遅く・不安定になる」と明記し、対策として
+  **(1) 候補の先頭数バイトを実際に inflate してみて非 zlib を弾く**、
+  **(2) 最小サイズ閾値 `-s`(既定 4 バイト)**、**(3) 誤検出位置を `-i` で除外**、
+  **(4) 展開→再圧縮でビット一致するストリームのみ採用**、を使う。intense モードでは
+  「誤検出が先頭に来ると後続の真ストリームを隠す」危険が文書化されている。
+  出典: [precomp-cpp readme](https://github.com/schnaader/precomp-cpp/blob/master/readme.txt),
+  [precomp-cpp issue #93 (Misdetection of streams)](https://github.com/schnaader/precomp-cpp/issues/93),
+  [encode.su precomp スレッド](https://encode.su/threads/3223-precomp-further-compress-already-compressed-files/page3)
+
+  → **当方の設計(先頭マジック判定のみ・最小 64B・adler32 検証・ビット一致検証)は
+  precomp の (1)(2)(4) を全て内包し、さらに厳しい**。adler32 末尾検証を通った時点で
+  偶然一致確率は事実上ゼロ、ビット一致検証を最終ゲートに置くので**誤り「保存」は原理的に
+  発生しない**(最悪でも「precompression を諦めて素通し」に劣化するだけ)。
+
+### 4.1.2 生 zlib が現れる実世界フォーマットと効果見込み
+
+- **git loose object / pack**: loose object は **生 zlib ストリーム**(gzip ラッパなし)。
+  既定圧縮レベルは `core.loosecompression`→`core.compression`→**既定 1(0x78 0x01)**。
+  pack 内オブジェクトは型/サイズをパック側に持ち、ペイロードは deflate/生 zlib。
+  → **.git を丸ごとバックアップするワークロードでは生 zlib 対応の効果が大きい**
+  (loose object は zlib 産である割合がほぼ 100%)。
+  出典: [gitformat-pack(5)](https://git-scm.com/docs/gitformat-pack),
+  [Git Internals - Packfiles](https://git-scm.com/book/en/v2/Git-Internals-Packfiles),
+  [git-config core.loosecompression](https://git-scm.com/docs/git-config)
+
+- **PNG IDAT**: 全 IDAT チャンクの連結が **1 本の zlib ストリーム**(method=8、窓 ≤32KB)。
+  PDF **FlateDecode** ストリームも zlib(`/Filter /FlateDecode`)。いずれも zlib 産が
+  支配的で、precompression の主要ターゲット。ただし PNG/PDF は**ファイル先頭が 0x78 でない**
+  (PNG は `\x89PNG`、PDF は `%PDF`)ため、これらの内部ストリームを拾うには**コンテナ構造の
+  パース(チャンク/オブジェクト境界の解釈)が必要**で、先頭マジック判定だけでは拾えない。
+  出典: [PNG Compression spec](http://www.libpng.org/pub/png/spec/1.2/PNG-Compression.html),
+  [FlateDecode 解説](https://pdflyst.com/glossary-of-pdf-terms/flate-compression)
+
+- **Java JAR / class / SQLite**: JAR は ZIP(各エントリが raw deflate、zlib ラッパなし)。
+  class ファイルは非圧縮。SQLite 本体は非圧縮(拡張で zlib を使う場合あり)。
+  → **これらは「生 zlib(0x78)先頭判定」では拾えない**。JAR を狙うなら ZIP local file
+  header のパースが必要。当面の生 zlib 拡張の主対象は **git loose object** と割り切るのが妥当。
+
+### 4.1.3 マルチメンバー gzip の出現頻度とメンバー数
+
+- **連結 gzip は仕様準拠**(RFC 1952: gzip ファイルは複数メンバーの連結でよい)。実世界での出所:
+  - **pigz / 並列 gzip**: 入力を 128KB チャンクに分割し部分 raw deflate を連結。出力は
+    単一メンバーだが、`--rsyncable` で入力依存のブロック境界を挿入。
+  - **ログローテーション**: logrotate + gzip/pigz。追記のたびに個別 gzip して連結される
+    運用があり、その場合マルチメンバーになる。
+  - **BGZF(genomics: BAM/VCF.gz)**: **各ブロックが独立した完全準拠 gzip メンバー**で、
+    圧縮前・圧縮後とも **最大 64KiB**。数 GB の BAM は**数万〜数十万メンバー**に達する。
+    末尾に 28 バイトの空 BGZF ブロック(EOF マーカ)。
+  出典: [RFC 1952](https://www.ietf.org/rfc/rfc1952.txt),
+  [pigz(1)](https://linux.die.net/man/1/pigz),
+  [BGZF (Wikipedia)](https://en.wikipedia.org/wiki/BGZF),
+  [SAM/BAM spec (hts-specs)](https://samtools.github.io/hts-specs/SAMv1.pdf)
+
+- **メンバー数が極端に多いケースの扱い**: BGZF のように**メンバーあたり ≤64KB × 数十万個**だと、
+  レシピに全メンバーのヘッダ原文+zlib パラメータを保存するとメタデータが肥大化する。対策案:
+  - メンバー単位でなく**「同一パラメータの連続メンバーを RLE 的にまとめる」**(BGZF は
+    全ブロックが同一 zlib 設定で生成されるため、1 レシピを全メンバーに適用できることが多い)。
+  - **メンバー数の上限**を設け、超過時は precompression を諦めて素通し(安全側)。
+  - EOF マーカ(既知 28 バイト)は定数として特別扱いし探索対象外にする。
+
+### 4.1.4 gzip の FTEXT/FHCRC/OS/XFL バリエーション
+
+- **OS バイト**: 0=FAT, 3=Unix, 7=Macintosh, 11=NTFS, **255=unknown** など(RFC 1952)。
+  近年は「再現性のため 255 固定」が増加(例: Python 3.11+ は `mtime=0` 指定時に OS=255)。
+- **XFL**: deflate では 2=最大圧縮/最遅、4=最速。**不明・非該当なら 0**。デコーダは XFL 値を
+  無視して受理する義務がある。
+- **FLG のオプションビット**(FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT)や MTIME も実装ごとに多様。
+  BGZF は FEXTRA(`BC` サブフィールド)を必ず持つ。
+  出典: [RFC 1952](https://www.ietf.org/rfc/rfc1952.txt),
+  [gzip (Wikipedia)](https://en.wikipedia.org/wiki/Gzip),
+  [CPython issue #112346 (OS byte)](https://github.com/python/cpython/issues/112346)
+
+  → **当方の設計はレシピにヘッダ原文(MTIME/OS/XFL/FLG/FEXTRA/FNAME 等)をバイト列として
+  そのまま保存する方式なので、これらのバリエーションは一切問題にならない**。ヘッダを解釈して
+  再構成するのではなく原文を退避するため、未知のフィールド値・ベンダ独自拡張・FEXTRA の
+  中身にも無条件で可逆。deflate 本体のみを展開→パラメータ探索の対象にすればよい。
+
+### 4.1.5 precomp のストリーム開始位置探索戦略と CPU コスト
+
+- precomp-cpp は**任意オフセット探索**を行う。既知コンテナ(PDF/PNG/ZIP/gzip)は署名ベースで
+  内部ストリーム位置を特定するが、**intense モードは「生 zlib ヘッダ」をファイル全体で走査**、
+  **brute モードは「ヘッダなし zlib があらゆる位置に在り得る」と仮定して全オフセットを試す**。
+  brute は **10KB のファイルでも 1 分超**かかると明記され、任意オフセット探索の CPU コストが
+  実用上の最大のボトルネックであることが示されている。
+  出典: [precomp-cpp readme](https://github.com/schnaader/precomp-cpp/blob/master/readme.txt),
+  [schnaader.info/precomp](http://schnaader.info/precomp.php)
+
+  → **当方の「先頭マジック判定のみ・任意オフセット探索なし」は、この CPU コストと
+  誤検出不安定性を構造的に回避する正しい選択**。チャンク先頭が 0x78 かつ有効 FLG の場合だけ
+  1 回試行するので、候補判定は O(1)/チャンク。git loose object(ファイル=チャンク先頭が
+  生 zlib)には完全に噛み合う。PNG/PDF/JAR の**内部**ストリームは拾えないが、それは
+  「任意オフセット探索を持たない」ことの必然的トレードオフであり、拾いたければ
+  **コンテナ個別パーサ(署名ベースの安価な位置特定)を足す**のが precomp と同じ正攻法。
+
+### 4.1.6 当方設計への総合評価と追加対策の提案
+
+**評価: 設計は安全側に正しく倒れており、precomp の既知の不安定要因(2 バイト誤検出・
+任意オフセット探索の CPU 爆発)を最初から避けている。** ビット一致検証が最終ゲートなので、
+誤検出があっても「誤ってデータを壊す」ことは起こらず、最悪ケースは「圧縮機会の取りこぼし」。
+
+**追加対策の提案:**
+
+1. **誤検出(CPU 空振り)対策**: 先頭マジック一致後、**adler32 末尾検証の前に「先頭 512B〜1KB
+   だけ inflate してエラーなら即棄却」**(precomp と同じ早期棄却)。1/7300 の偶然一致でも
+   ほとんどはここで数百バイト inflate しただけで落ちる。
+2. **zip bomb / DoS 対策(最重要)**: precompression は**必ず展開を伴う**ため展開爆弾が正面の脅威。
+   deflate の理論上限は約 **1032:1**、悪意ある多重コンテナ入りでは **28,000,000:1** の報告。
+   対策は業界標準の**多層防御**:
+   - **ストリーミング展開+出力バイトカウンタで上限到達時に即中断**(全展開しない)。
+   - **絶対上限**(例: 展開後 ≤ チャンク上限の数倍、あるいは固定 N MB)と
+     **圧縮比上限**(例: 出力/入力 > 1000 で中断)の二段。
+   - precompression は「展開データを保存し直す」性質上、**展開後サイズがバックアップ元の
+     実サイズを超えることは通常ない**ので、上限は元チャンク長×小定数で十分。
+   - 展開はサンドボックス化された goroutine で行い、**メモリ・時間クォータ**を課す。
+   出典: [David Fifield "A better zip bomb" (USENIX WOOT'19)](https://www.usenix.org/system/files/woot19-paper_fifield_0.pdf),
+   [zip bomb defenses (file-type GHSA-j47w-4g3g-c36v)](https://github.com/sindresorhus/file-type/security/advisories/GHSA-j47w-4g3g-c36v)
+3. **マルチメンバー gzip のメタデータ肥大対策**: §4.1.3 の通り、連続同一パラメータメンバーの
+   RLE 集約とメンバー数上限を実装。BGZF は全メンバー同一設定なので 1 レシピで畳める。
+4. **段階導入の順序**: (a) 生 zlib 先頭判定 →主対象 **git loose object**、
+   (b) マルチメンバー gzip(まず logrotate 連結 gzip、次に BGZF の RLE 最適化)、
+   (c) 余力があればコンテナ内部ストリーム(PNG IDAT / PDF FlateDecode)を署名ベースで追加。
+   (a)(b) は既存の zlib パラメータ探索を流用でき低コスト、(c) は個別パーサが要る。
+5. **最小サイズ閾値 64B の妥当性**: precomp 既定 4B より保守的で、短命な偶然一致と
+   「展開しても得しない極小ストリーム」を排除できる。git loose object のヘッダ+微小 blob は
+   64B 未満もあり得るが、そうした極小オブジェクトは precompression の利得自体が小さいので
+   閾値 64B で取りこぼしても実害はない(必要なら 16〜32B へ緩めても安全性は不変)。
+
+## 4.2 追加研究(2026-07-15): 適応圧縮ポリシーの実運用事例と auto モード
+
+「auto」モード(fastで探査→縮むチャンクのみ最高レベルで再圧縮)の設計検証として
+実運用事例を調査した。要点:
+
+- **ZFS zstd early-abort(OpenZFS 2.2)**: 本実装と同型の2段階方式
+  (LZ4/zstd-1でプリテスト→失敗なら高レベルをスキップ)。実測で圧縮不能データの
+  スループット **4.5倍改善、容量コスト0.3%未満**。128KB未満のブロックは
+  プローブ対象外(判定コスト比率が高いため)→ 本実装も踏襲した。
+  出典: [openzfs/zfs#13244](https://github.com/openzfs/zfs/pull/13244)
+- **btrfs**: エントロピー推定ヒューリスティック(kernel 4.15+)。エントロピー単独では
+  LZ反復を捉えられず精度に限界 → 実圧縮プローブ(本方式)の方が判定精度が高い。
+- **Harnik et al. (FAST'13)**: プレフィックス試験圧縮 vs ヒューリスティックの定量比較。
+  圧縮可能データ主体ならトライアル方式有利、圧縮不能データ主体(>20〜30%)なら
+  ヒューリスティック有利。本実装は raw フォールバックがあるため誤判定しても
+  膨張しない。出典: [To Zip or Not to Zip](https://www.usenix.org/system/files/conference/fast13/fast13-final38.pdf)
+- **zstdレベル別の利得**(klauspost実測): 構造化テキスト(JSON/ログ)は
+  fastest→best で **25〜33%** 縮み、混合バイナリは ~19%。auto の再圧縮は
+  テキスト系で特に効く。klauspost の SpeedBestCompression ≈ zstd level 11
+  (libzstd の 19 とは別物)である点に注意。
+- **チャンクごとのレベル混在は安全**: zstd フレームは自己記述的(RFC 8878)で
+  伸長にレベル情報は不要。ZFS が踏んだ「再圧縮時にレベル不明で壊れる」罠は、
+  本実装では表現の書き換えが常にビット一致検証つきなので該当しない。
+- **既知の限界(許容)**: 「fast では縮まないが高レベルなら縮む」病理データが実在
+  する(ZFS でも確認)。判定コストとの釣り合いから ZFS 同様に許容する。
 
 ## 5. 再現方法
 

@@ -138,6 +138,20 @@ func deflateExact(plain []byte, level int) ([]byte, error) {
 // 探索順: zlib デフォルト6と最高9が実世界の大半を占めるので先に試す。
 var levelOrder = []int{6, 9, 1, 2, 3, 4, 5, 7, 8}
 
+// findLevel は deflate ストリームをビット一致再現できる zlib レベルを探す。
+func findLevel(plain, deflateStream []byte) (int, bool) {
+	for _, level := range levelOrder {
+		candidate, err := deflateExact(plain, level)
+		if err != nil {
+			return 0, false
+		}
+		if bytes.Equal(candidate, deflateStream) {
+			return level, true
+		}
+	}
+	return 0, false
+}
+
 // TryUnwrap は gzip ストリームを「展開データ+レシピ」に分解する。
 // ビット一致で再構成できる場合のみ結果を返す(それ以外は ok=false)。
 func TryUnwrap(orig []byte) (*Unwrapped, bool) {
@@ -168,15 +182,9 @@ func TryUnwrap(orig []byte) (*Unwrapped, bool) {
 	}
 
 	// レベル探索: zlib で再圧縮してビット一致するレベルを探す
-	for _, level := range levelOrder {
-		candidate, err := deflateExact(plain, level)
-		if err != nil {
-			return nil, false
-		}
-		if bytes.Equal(candidate, deflateStream) {
-			header := append([]byte(nil), orig[:headerLen]...)
-			return &Unwrapped{Header: header, Plain: plain, Level: level}, true
-		}
+	if level, ok := findLevel(plain, deflateStream); ok {
+		header := append([]byte(nil), orig[:headerLen]...)
+		return &Unwrapped{Header: header, Plain: plain, Level: level}, true
 	}
 	return nil, false // zlib 産ではない(GNU gzip / zopfli / Go 等)
 }

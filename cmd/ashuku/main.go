@@ -14,7 +14,8 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "待ち受けアドレス")
 	dataDir := flag.String("data", "./data", "データディレクトリ")
-	compression := flag.String("compression", "balanced", "圧縮レベル: fast | balanced | max")
+	compression := flag.String("compression", "auto",
+		"圧縮モード: auto(探査して縮むものだけ最高レベル) | fast | balanced | max")
 	delta := flag.Bool("delta", true, "類似チャンクへのデルタ圧縮を有効にする")
 	chunkAvg := flag.Int("chunk-avg", 0, "平均チャンクサイズ(バイト, 0=デフォルト1MiB)。初回起動時のみ有効")
 	deltaDepth := flag.Int("delta-depth", 0, "デルタチェーンの深さ上限(0=デフォルト32)。深いほど多世代バックアップが縮む")

@@ -39,6 +39,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleUpload はリクエストボディをそのまま保存する。
 // ファイル名は X-File-Name ヘッダまたは ?name= で指定(省略可)。
+// 圧縮モードは X-Compression ヘッダまたは ?compression= でアップロード単位に
+// 上書きできる(auto | fast | balanced | max)。
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	name := r.Header.Get("X-File-Name")
 	if name == "" {
@@ -49,7 +51,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	name = path.Base(name) // パス区切りは受け付けない
 
-	m, err := s.store.Put(name, r.Body)
+	mode := r.Header.Get("X-Compression")
+	if mode == "" {
+		mode = r.URL.Query().Get("compression")
+	}
+	if !store.ValidCompression(mode) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("不明な圧縮モード %q (auto | fast | balanced | max)", mode))
+		return
+	}
+
+	m, err := s.store.PutWithOptions(name, r.Body, store.PutOptions{Compression: mode})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存に失敗しました: %v", err))
 		return

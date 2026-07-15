@@ -70,6 +70,7 @@ func main() {
 	}
 
 	configs := []config{
+		{"auto", store.Config{Compression: "auto"}},
 		{"fast", store.Config{Compression: "fast"}},
 		{"balanced", store.Config{Compression: "balanced"}},
 		{"max", store.Config{Compression: "max"}},
