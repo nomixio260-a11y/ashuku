@@ -37,7 +37,15 @@ func main() {
 		"APIキーファイル(1行: <キー> [クォータ 例:10G] [名前])。未指定なら認証なし")
 	maxUpload := flag.String("max-upload", "0",
 		"1アップロードのサイズ上限(例: 50G)。0 で無制限")
+	serverSide := flag.String("server-side-uploads", "full",
+		"サーバー側圧縮経路(/api/v1/files)の扱い: full | fast(軽量圧縮のみ) | off(ashuku-cli専用)")
 	flag.Parse()
+
+	switch *serverSide {
+	case "full", "fast", "off":
+	default:
+		log.Fatalf("-server-side-uploads は full | fast | off のいずれかです")
+	}
 
 	precompMaxBytes, err := parseBytes(*precompMax)
 	if err != nil {
@@ -92,8 +100,9 @@ func main() {
 	}
 
 	handler := api.New(st, api.Options{
-		Users:          users,
-		MaxUploadBytes: maxUploadBytes,
+		Users:             users,
+		MaxUploadBytes:    maxUploadBytes,
+		ServerSideUploads: *serverSide,
 	})
 	// タイムアウト: 大容量のアップロード/ダウンロードは何分もかかりうるので
 	// Read/WriteTimeout は設定せず、ヘッダ読取とアイドル接続だけを制限する

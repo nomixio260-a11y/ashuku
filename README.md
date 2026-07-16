@@ -109,6 +109,7 @@ go build -o ashuku ./cmd/ashuku
 | `-precomp-parallel` | `2` | precompression の同時実行数。超過分は素通し(多人数同時アップロードでのメモリ爆発防止) |
 | `-auth-keys` | (なし) | APIキーファイル(1行: `<キー> [クォータ 例:10G] [名前]`)。未指定なら認証なし(開発用)。**公開運用では必須** |
 | `-max-upload` | `0` | 1アップロードのサイズ上限(例: `50G`)。超過は 413 |
+| `-server-side-uploads` | `full` | サーバー側圧縮経路(`/api/v1/files`)の扱い: `full` \| `fast`(軽量圧縮のみ) \| `off`(ashuku-cli 専用。圧縮・展開を完全にクライアント側へ) |
 
 ### API
 
@@ -203,6 +204,23 @@ curl http://localhost:8080/api/v1/stats
   "pack_garbage_bytes": 1048576  // パック内の解放済み領域(コンパクション待ち)
 }
 ```
+
+## 技術保護(流出防止)
+
+本リポジトリの実装・研究成果は専有です([LICENSE](LICENSE): All rights reserved)。
+運用時の流出防止は次の分担で設計されています:
+
+- **独自技術はサーバー側だけに存在**: ユーザーに配布する `ashuku-cli` に
+  含まれるのは公知技術(FastCDC・SHA-256・zstd)のみ。デルタチェーン・
+  chain repack・ゾンビ救出・precompression 等の独自実装はサーバーバイナリに
+  しか入っておらず、クライアント配布では流出しません
+- **配布ビルド**: `make release` / `make release-cli` は `-trimpath -ldflags "-s -w"`
+  でビルド環境のパス・シンボル・デバッグ情報を除去します
+- **サーバー側処理の無効化**: `-server-side-uploads off` で従来経路
+  (POST/GET `/api/v1/files`)を403にし、圧縮・展開を完全にユーザーデバイス側へ
+  寄せられます(`fast` なら軽量圧縮のみ受付)
+- ⚠️ **リポジトリの可視性**: ソース自体の流出防止には GitHub リポジトリを
+  **Private** にしてください(Settings → General → Danger Zone → Change visibility)
 
 ## 開発
 

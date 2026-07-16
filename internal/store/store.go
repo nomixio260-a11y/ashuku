@@ -310,6 +310,9 @@ type PutOptions struct {
 	// MaxBytes は1アップロードのサイズ上限。0 なら無制限。
 	// 超えると ErrTooLarge で失敗する。
 	MaxBytes int64
+	// DisablePrecomp はこのアップロードで precompression を行わない
+	// (サーバーCPU最小化モード用)。
+	DisablePrecomp bool
 }
 
 // Put は r の内容を name として保存し、マニフェストを返す。
@@ -339,7 +342,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 	// zstd の対象にする(ビット一致検証済みの場合のみ)。
 	// 該当しないストリーム・上限超過・同時実行枠の超過は通常経路へ素通し
 	// (多人数同時アップロードでのメモリ爆発を防ぐ)。
-	if s.precomp {
+	if s.precomp && !opts.DisablePrecomp {
 		head := make([]byte, 3)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)

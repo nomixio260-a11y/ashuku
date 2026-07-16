@@ -174,6 +174,46 @@ func TestClientAuthAndQuota(t *testing.T) {
 	}
 }
 
+// server-side-uploads=off ではサーバー側圧縮経路が拒否され、
+// クライアント経路だけが機能する。
+func TestServerSideUploadsOff(t *testing.T) {
+	_, c := newServerAndClient(t, api.Options{ServerSideUploads: "off"})
+	data := mixedData(t, 1<<20)
+
+	// クライアント経路は動く
+	res, err := c.Put("ok.bin", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := c.Get(res.ID, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Fatal("クライアント経路の復元が一致しません")
+	}
+
+	// 従来経路(サーバー側圧縮・展開)は 403
+	req, _ := c.req("POST", "/api/v1/files?name=x", bytes.NewReader(data))
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("サーバー側アップロード: status = %d, want 403", resp.StatusCode)
+	}
+	req, _ = c.req("GET", "/api/v1/files/"+res.ID, nil)
+	resp, err = c.HTTP.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("サーバー側ダウンロード: status = %d, want 403", resp.StatusCode)
+	}
+}
+
 // クライアント経路のチャンクはオフラインデルタパスで後追い圧縮される。
 func TestOfflineDeltaUpgradesClientChunks(t *testing.T) {
 	st, c := newServerAndClient(t, api.Options{})

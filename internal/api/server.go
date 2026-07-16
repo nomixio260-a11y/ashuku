@@ -40,6 +40,13 @@ type Options struct {
 	// 統計はチャンク全走査 O(N) なので、大規模ストアで /stats を叩かれ
 	// 続けても集計は TTL ごとに1回で済む。
 	StatsTTL time.Duration
+	// ServerSideUploads はサーバー側で圧縮・展開を行う従来経路
+	// (POST/GET /api/v1/files)の扱い:
+	//   "full"(デフォルト) = 従来どおり(auto圧縮・precomp あり)
+	//   "fast" = 受け付けるが fast 圧縮固定・precomp なし(CPU軽量)
+	//   "off"  = 拒否(403)。クライアント支援プロトコル(ashuku-cli)専用にし、
+	//            圧縮・展開を完全にユーザーデバイス側へ寄せる
+	ServerSideUploads string
 }
 
 // Server は REST API サーバー。
@@ -114,6 +121,11 @@ func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) htt
 // 圧縮モードは X-Compression ヘッダまたは ?compression= でアップロード単位に
 // 上書きできる(auto | fast | balanced | max)。
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) {
+	if s.opts.ServerSideUploads == "off" {
+		writeError(w, http.StatusForbidden,
+			"このサーバーはサーバー側圧縮を無効化しています。ashuku-cli(クライアント側圧縮)を使ってください")
+		return
+	}
 	name := r.Header.Get("X-File-Name")
 	if name == "" {
 		name = r.URL.Query().Get("name")
@@ -133,15 +145,23 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		return
 	}
 
+	disablePrecomp := false
+	if s.opts.ServerSideUploads == "fast" {
+		// CPU軽量モード: fast 圧縮固定・precomp なし
+		mode = "fast"
+		disablePrecomp = true
+	}
+
 	body := r.Body
 	if s.opts.MaxUploadBytes > 0 {
 		body = http.MaxBytesReader(w, body, s.opts.MaxUploadBytes)
 	}
 	m, err := s.store.PutWithOptions(name, body, store.PutOptions{
-		Compression: mode,
-		Owner:       a.owner,
-		Quota:       a.user.Quota,
-		MaxBytes:    s.opts.MaxUploadBytes,
+		Compression:    mode,
+		Owner:          a.owner,
+		Quota:          a.user.Quota,
+		MaxBytes:       s.opts.MaxUploadBytes,
+		DisablePrecomp: disablePrecomp,
 	})
 	if err != nil {
 		var maxErr *http.MaxBytesError
@@ -174,6 +194,11 @@ func (s *Server) checkOwner(id string, a authed) error {
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, a authed) {
+	if s.opts.ServerSideUploads == "off" {
+		writeError(w, http.StatusForbidden,
+			"このサーバーはサーバー側展開を無効化しています。ashuku-cli get(クライアント側展開)を使ってください")
+		return
+	}
 	id := r.PathValue("id")
 	if err := s.checkOwner(id, a); err != nil {
 		writeStoreError(w, err)
