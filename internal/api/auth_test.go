@@ -173,7 +173,64 @@ func TestMaxUploadLimit(t *testing.T) {
 	}
 }
 
+// スクラブエンドポイントは健全なストアで破損なしを返す。
+func TestScrubEndpoint(t *testing.T) {
+	srv := newAuthServer(t, Options{})
+	req(t, "POST", srv.URL+"/api/v1/files?name=a", "", bytes.Repeat([]byte("x"), 1<<20)).Body.Close()
+
+	resp := req(t, "POST", srv.URL+"/api/v1/scrub", "", nil)
+	var res struct {
+		ChunksChecked int      `json:"chunks_checked"`
+		Corrupt       []string `json:"corrupt"`
+	}
+	json.NewDecoder(resp.Body).Decode(&res)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scrub status = %d", resp.StatusCode)
+	}
+	if len(res.Corrupt) != 0 {
+		t.Fatalf("健全なストアで破損 %d 件", len(res.Corrupt))
+	}
+}
+
+// パニックする内部ハンドラでもサーバーは 500 を返して生き続ける
+// (ServeHTTP のパニック分離)。
+func TestPanicRecovery(t *testing.T) {
+	panicSrv := &Server{mux: newMuxThatPanics()}
+	rec := &recordingWriter{header: make(map[string][]string)}
+	r, _ := http.NewRequest("GET", "/boom", nil)
+	// パニックが伝播せず(テストが落ちず)500 になることを確認
+	panicSrv.ServeHTTP(rec, r)
+	if rec.status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.status)
+	}
+}
+
 // Authorization: Bearer 形式でも認証できる。
+// newMuxThatPanics は必ずパニックする ServeMux を返す(テスト用)。
+func newMuxThatPanics() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/boom", func(http.ResponseWriter, *http.Request) {
+		panic("test panic")
+	})
+	return mux
+}
+
+// recordingWriter は http.ResponseWriter の最小実装(ステータス記録用)。
+type recordingWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *recordingWriter) Header() http.Header { return w.header }
+func (w *recordingWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return len(b), nil
+}
+func (w *recordingWriter) WriteHeader(s int) { w.status = s }
+
 func TestBearerToken(t *testing.T) {
 	srv := newAuthServer(t, Options{Users: map[string]User{"tok": {}}})
 	r, _ := http.NewRequest("GET", srv.URL+"/api/v1/files", nil)

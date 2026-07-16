@@ -447,6 +447,30 @@ func (c *Client) Stats() (map[string]any, error) {
 	return out, nil
 }
 
+// Scrub は全チャンクの完全性検証をサーバーに実行させ、結果を返す。
+func (c *Client) Scrub() (map[string]any, error) {
+	if err := c.init(); err != nil {
+		return nil, err
+	}
+	req, err := c.req("POST", "/api/v1/scrub", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, httpError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Me は呼び出しユーザーの使用量とクォータを取得する。
 func (c *Client) Me() (map[string]any, error) {
 	if err := c.init(); err != nil {

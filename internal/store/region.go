@@ -302,23 +302,7 @@ func (s *Store) packRegion(run []string, res *OptimizeResult) error {
 }
 
 func (s *Store) writeRegionFile(id string, data []byte) error {
-	path := s.regionPath(id)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return durableWrite(s.regionPath(id), data)
 }
 
 // releaseRegionMember はリージョンメンバー1つの参照が消えたときに

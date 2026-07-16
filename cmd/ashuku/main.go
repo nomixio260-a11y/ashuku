@@ -30,6 +30,8 @@ func main() {
 	cacheMB := flag.Int64("cache-mb", 0, "伸長済みチャンクキャッシュ容量 MiB(0=デフォルト128)")
 	optimizeEvery := flag.Duration("optimize-every", time.Hour,
 		"chain repack(デルタチェーン再編成)の自動実行間隔。0 で無効")
+	scrubEvery := flag.Duration("scrub-every", 24*time.Hour,
+		"データ完全性スクラブ(bit rot 検出)の自動実行間隔。0 で無効")
 	precompFlag := flag.Bool("precomp", true,
 		"gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ")
 	precompMax := flag.String("precomp-max", "64M",
@@ -87,19 +89,34 @@ func main() {
 	// 自動最適化: ドリフトが蓄積した星形チェーンを定期的に再編成する。
 	// Optimize は改善がある場合のみ書き換えるので、何度呼んでも安全。
 	if *optimizeEvery > 0 {
-		go func() {
-			for range time.Tick(*optimizeEvery) {
-				res, err := st.Optimize()
-				if err != nil {
-					log.Printf("自動最適化に失敗: %v", err)
-					continue
-				}
-				if res.ChunksRepacked > 0 {
-					log.Printf("自動最適化: %d チャンクを再編成 (%d → %d bytes)",
-						res.ChunksRepacked, res.BytesBefore, res.BytesAfter)
-				}
+		go runPeriodic("自動最適化", *optimizeEvery, func() {
+			res, err := st.Optimize()
+			if err != nil {
+				log.Printf("自動最適化に失敗: %v", err)
+				return
 			}
-		}()
+			if res.ChunksRepacked > 0 || res.RegionsBuilt > 0 {
+				log.Printf("自動最適化: %d チャンク再編成 / %d リージョン化",
+					res.ChunksRepacked, res.RegionsBuilt)
+			}
+		})
+	}
+
+	// 定期スクラブ: 保存データの完全性(bit rot 等)を検証する。
+	if *scrubEvery > 0 {
+		go runPeriodic("スクラブ", *scrubEvery, func() {
+			res, err := st.Scrub()
+			if err != nil {
+				log.Printf("スクラブに失敗: %v", err)
+				return
+			}
+			if !res.Healthy() {
+				log.Printf("⚠️ スクラブ: 破損 %d / 欠損 %d チャンク検出(影響ファイル %d 件)",
+					len(res.Corrupt), len(res.Missing), len(res.AffectedFiles))
+			} else {
+				log.Printf("スクラブ: %d チャンク検証、破損なし", res.ChunksChecked)
+			}
+		})
 	}
 
 	handler := api.New(st, api.Options{
@@ -135,6 +152,23 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("停止しました")
+}
+
+// runPeriodic は fn を interval ごとに実行する。fn がパニックしても
+// ゴルーチン(とサーバー)は死なず、次の周期で再試行する(バックグラウンド
+// ジョブの想定外バグに対する分離)。
+func runPeriodic(name string, interval time.Duration, fn func()) {
+	safe := func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("%s でパニック(継続します): %v", name, rec)
+			}
+		}()
+		fn()
+	}
+	for range time.Tick(interval) {
+		safe()
+	}
 }
 
 // parseBytes は "500M" "10G" のような人間可読のサイズ表記を解析する。

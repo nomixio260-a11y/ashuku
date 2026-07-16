@@ -224,7 +224,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 	if precompPar <= 0 {
 		precompPar = DefaultPrecompParallel
 	}
-	return &Store{
+	st := &Store{
 		dir:         dataDir,
 		db:          db,
 		encFast:     encFast,
@@ -241,7 +241,27 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		precomp:     !cfg.DisablePrecomp && precomp.Supported(),
 		precompMax:  precompMax,
 		precompSem:  make(chan struct{}, precompPar),
-	}, nil
+	}
+	// クラッシュで取り残された temp ファイル(.tmp-*)を掃除する。
+	// これらは rename 前に落ちた書き込みの残骸で、参照されていない。
+	st.sweepTempFiles()
+	return st, nil
+}
+
+// sweepTempFiles は chunks/ と regions/ 配下の孤児 temp ファイルを削除する。
+func (s *Store) sweepTempFiles() {
+	for _, sub := range []string{"chunks", "regions"} {
+		root := filepath.Join(s.dir, sub)
+		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !d.IsDir() && strings.HasPrefix(d.Name(), ".tmp-") {
+				os.Remove(path)
+			}
+			return nil
+		})
+	}
 }
 
 // compressChunk はモードに応じてチャンクを圧縮する。
@@ -734,25 +754,10 @@ func deltaWindowSize(total int) int {
 	return w
 }
 
-// writeChunkFile は temp ファイル + rename でアトミックに書き込む。
+// writeChunkFile はチャンク表現をアトミックかつ耐久的に書き込む
+// (メタデータが指す前にファイルが確実にディスク上にあることを保証する)。
 func (s *Store) writeChunkFile(hash, rep string, data []byte) error {
-	path := s.chunkPath(hash, rep)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return durableWrite(s.chunkPath(hash, rep), data)
 }
 
 // rollbackChunks はアップロード失敗時に、加算済みの参照カウントを戻す。

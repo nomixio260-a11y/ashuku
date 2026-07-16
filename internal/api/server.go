@@ -73,6 +73,7 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/me", s.auth(s.handleMe))
 	s.mux.HandleFunc("GET /api/v1/stats", s.auth(s.handleStats))
 	s.mux.HandleFunc("POST /api/v1/optimize", s.auth(s.handleOptimize))
+	s.mux.HandleFunc("POST /api/v1/scrub", s.auth(s.handleScrub))
 	// ヘルスチェック(認証不要。ロードバランサ・監視用)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	// クライアント支援プロトコル(圧縮・展開・分割をクライアント側で行う)
@@ -86,6 +87,16 @@ func New(st *store.Store, opts Options) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// パニック分離: 1リクエストのパニックがサーバー全体を落とさないように、
+	// ここで捕捉して 500 を返す(ハンドラ内の想定外バグに対する最終防衛線)。
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("panic in %s %s: %v", r.Method, r.URL.Path, rec)
+			// ヘッダ未送信なら 500 を返す(送信済みなら接続が閉じられる)
+			defer func() { recover() }()
+			writeError(w, http.StatusInternalServerError, "内部エラーが発生しました")
+		}
+	}()
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -265,6 +276,17 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
 // handleHealth はサーバーの稼働確認を返す(認証不要)。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleScrub は全チャンクの完全性を検証し、破損・欠損を報告する。
+// 破損があれば 200 で結果を返す(検出は成功しているため)。
+func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, _ authed) {
+	res, err := s.store.Scrub()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleOptimize は chain repack(デルタチェーン再編成)を実行し、

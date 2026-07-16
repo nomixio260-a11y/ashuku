@@ -51,6 +51,8 @@ func main() {
 		err = cmdStats(c)
 	case "me":
 		err = cmdMe(c)
+	case "scrub":
+		err = cmdScrub(c)
 	default:
 		usage()
 	}
@@ -61,7 +63,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID> | stats | me")
+	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID> | stats | me | scrub")
 	os.Exit(2)
 }
 
@@ -143,6 +145,29 @@ func cmdMe(c *client.Client) error {
 		fmt.Printf("%s: 使用 %s / %s (%.1f%%)\n", name, humanF(used), humanF(quota), 100*used/quota)
 	} else {
 		fmt.Printf("%s: 使用 %s / 無制限\n", name, humanF(used))
+	}
+	return nil
+}
+
+func cmdScrub(c *client.Client) error {
+	res, err := c.Scrub()
+	if err != nil {
+		return err
+	}
+	checked, _ := res["chunks_checked"].(float64)
+	corrupt, _ := res["corrupt"].([]any)
+	missing, _ := res["missing"].([]any)
+	affected, _ := res["affected_files"].([]any)
+	if len(corrupt) == 0 && len(missing) == 0 {
+		fmt.Printf("完全性OK: %.0f チャンク検証、破損なし\n", checked)
+		return nil
+	}
+	fmt.Printf("⚠️ 破損 %d / 欠損 %d チャンク検出(影響ファイル %d 件)\n",
+		len(corrupt), len(missing), len(affected))
+	for _, f := range affected {
+		if m, ok := f.(map[string]any); ok {
+			fmt.Printf("  影響: %v  %v\n", m["id"], m["name"])
+		}
 	}
 	return nil
 }
