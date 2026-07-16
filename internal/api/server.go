@@ -73,6 +73,8 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/me", s.auth(s.handleMe))
 	s.mux.HandleFunc("GET /api/v1/stats", s.auth(s.handleStats))
 	s.mux.HandleFunc("POST /api/v1/optimize", s.auth(s.handleOptimize))
+	// ヘルスチェック(認証不要。ロードバランサ・監視用)
+	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	// クライアント支援プロトコル(圧縮・展開・分割をクライアント側で行う)
 	s.mux.HandleFunc("GET /api/v1/config", s.auth(s.handleConfig))
 	s.mux.HandleFunc("POST /api/v1/chunks/missing", s.auth(s.handleChunksMissing))
@@ -258,6 +260,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
 		"used_bytes":  used,
 		"quota_bytes": a.user.Quota,
 	})
+}
+
+// handleHealth はサーバーの稼働確認を返す(認証不要)。
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // handleOptimize は chain repack(デルタチェーン再編成)を実行し、

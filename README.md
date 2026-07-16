@@ -59,7 +59,8 @@
   (gzip のままでは中身が少し違うだけで全バイトが変わり、何も効きません)。
   対応形式: 単一メンバー gzip(Python/Java/nginx 等)、マルチメンバー gzip
   (ローテートログの連結等、1024メンバーまで)、生 zlib ストリーム
-  (git loose object・PDF FlateDecode 等の単体ファイル)。
+  (git loose object・PDF FlateDecode 等)、**PNG**(IDAT の zlib を展開して
+  スキャンラインを dedup/デルタ/zstd-19 の対象に)。
   分解は保存時にビット一致を検証してからのみ採用され、zlib 産でないストリーム
   (GNU gzip / zopfli / Go 等)は安全に素通しされます。復元時も SHA-256 で
   最終検証します。zip bomb 対策として展開は 1GiB で打ち切ります。
@@ -140,7 +141,7 @@ go build -o ashuku ./cmd/ashuku
 go build -o ashuku-cli ./cmd/ashuku-cli
 ashuku-cli -server http://host:8080 -key APIキー put backup.tar   # → ID
 ashuku-cli -server http://host:8080 -key APIキー get <ID> restored.tar
-ashuku-cli ... ls / rm <ID>
+ashuku-cli ... ls / rm <ID> / stats / me
 ```
 
 - チャンクごとに SHA-256 検証つき(アップロード時はサーバーが検証して

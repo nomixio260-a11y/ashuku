@@ -50,6 +50,8 @@ type FileManifest struct {
 	PrecompLevel  int    `json:"precomp_level,omitempty"`
 	// PrecompMembers はマルチメンバー gzip の再構成レシピ列。
 	PrecompMembers []precomp.Member `json:"precomp_members,omitempty"`
+	// PrecompPNG は PNG コンテナの再構成レシピ。
+	PrecompPNG *precomp.PNGRecipe `json:"precomp_png,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -68,6 +70,8 @@ const (
 	EncodingZlibV1 = "zlib-v1"
 	// EncodingGzipMultiV1 はマルチメンバー gzip(連結gzip・ローテートログ等)。
 	EncodingGzipMultiV1 = "gzip-multi-v1"
+	// EncodingPNGV1 は PNG コンテナ(IDAT の zlib を展開して保存)。
+	EncodingPNGV1 = "png-zlib-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

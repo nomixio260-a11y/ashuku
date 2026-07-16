@@ -435,6 +435,30 @@ func (c *Client) List() ([]Manifest, error) {
 	return out.Files, nil
 }
 
+// Stats はストア全体の統計を取得する(任意のフィールドを map で返す)。
+func (c *Client) Stats() (map[string]any, error) {
+	if err := c.init(); err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := c.getJSON("/api/v1/stats", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Me は呼び出しユーザーの使用量とクォータを取得する。
+func (c *Client) Me() (map[string]any, error) {
+	if err := c.init(); err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := c.getJSON("/api/v1/me", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Delete はファイルを削除する。
 func (c *Client) Delete(id string) error {
 	if err := c.init(); err != nil {

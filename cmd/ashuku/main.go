@@ -3,13 +3,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nomixio260-a11y/ashuku/internal/api"
@@ -113,10 +116,25 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+
+	// グレースフルシャットダウン: SIGINT/SIGTERM で新規接続を止め、
+	// 進行中のリクエスト(大容量転送を含む)を最大30秒待ってから閉じる。
+	// bbolt と zstd エンコーダは defer で確実にクローズされ、データは無事。
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Printf("シャットダウン中(進行中リクエストの完了を待機)...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
 	log.Printf("ashuku サーバー起動: %s (データ: %s)", *addr, *dataDir)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	log.Printf("停止しました")
 }
 
 // parseBytes は "500M" "10G" のような人間可読のサイズ表記を解析する。

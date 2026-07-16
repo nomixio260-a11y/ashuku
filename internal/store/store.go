@@ -360,7 +360,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		head := make([]byte, 3)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
-		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head)) && s.acquirePrecomp() {
+		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head) || precomp.IsPNG(head)) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
 				s.releasePrecomp()
@@ -434,6 +434,15 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		} else {
 			return false
 		}
+	case precomp.IsPNG(buf):
+		u, ok := precomp.TryUnwrapPNG(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingPNGV1
+		m.PrecompPNG = u.Recipe
+		m.PrecompLevel = u.Level
+		m.precompPlain = u.Plain
 	case precomp.IsZlib(buf):
 		u, ok := precomp.TryUnwrapZlib(buf, s.precompMax)
 		if !ok {
@@ -791,6 +800,8 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 			orig, err = precomp.ReconstructZlib(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
 		case EncodingGzipMultiV1:
 			orig, err = precomp.ReconstructGzipMulti(m.PrecompMembers, plain.Bytes())
+		case EncodingPNGV1:
+			orig, err = precomp.ReconstructPNG(m.PrecompPNG, m.PrecompLevel, plain.Bytes())
 		default:
 			err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 		}

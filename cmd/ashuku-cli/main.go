@@ -47,6 +47,10 @@ func main() {
 		err = cmdLs(c)
 	case "rm":
 		err = cmdRm(c, args[1:])
+	case "stats":
+		err = cmdStats(c)
+	case "me":
+		err = cmdMe(c)
 	default:
 		usage()
 	}
@@ -57,7 +61,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID>")
+	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID> | stats | me")
 	os.Exit(2)
 }
 
@@ -112,6 +116,48 @@ func cmdRm(c *client.Client, args []string) error {
 		usage()
 	}
 	return c.Delete(args[0])
+}
+
+func cmdStats(c *client.Client) error {
+	st, err := c.Stats()
+	if err != nil {
+		return err
+	}
+	ratio, _ := st["total_ratio"].(float64)
+	logical, _ := st["logical_bytes"].(float64)
+	physical, _ := st["physical_bytes"].(float64)
+	fmt.Printf("論理: %s / 物理: %s / 総削減 %.1fx\n",
+		humanF(logical), humanF(physical), ratio)
+	return nil
+}
+
+func cmdMe(c *client.Client) error {
+	me, err := c.Me()
+	if err != nil {
+		return err
+	}
+	used, _ := me["used_bytes"].(float64)
+	quota, _ := me["quota_bytes"].(float64)
+	name, _ := me["name"].(string)
+	if quota > 0 {
+		fmt.Printf("%s: 使用 %s / %s (%.1f%%)\n", name, humanF(used), humanF(quota), 100*used/quota)
+	} else {
+		fmt.Printf("%s: 使用 %s / 無制限\n", name, humanF(used))
+	}
+	return nil
+}
+
+func humanF(b float64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GiB", b/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", b/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", b/(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B", b)
+	}
 }
 
 func max64(a, b int64) int64 {
