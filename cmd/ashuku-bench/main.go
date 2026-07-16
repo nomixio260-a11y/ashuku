@@ -33,8 +33,8 @@ type dataset struct {
 }
 
 type config struct {
-	name  string
-	cfg   store.Config
+	name string
+	cfg  store.Config
 }
 
 // runOptimize は -optimize フラグの値(投入後に chain repack を実行)。

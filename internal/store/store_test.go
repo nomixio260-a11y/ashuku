@@ -108,7 +108,7 @@ func TestCompressionOnRepetitiveData(t *testing.T) {
 
 func TestIncompressibleDataStoredRaw(t *testing.T) {
 	s := newTestStore(t)
-	data := randomData(t, 4 << 20)
+	data := randomData(t, 4<<20)
 	putBytes(t, s, "noise.bin", data)
 
 	st, err := s.Stats()
@@ -125,7 +125,7 @@ func TestIncompressibleDataStoredRaw(t *testing.T) {
 func TestDeduplicationAcrossFiles(t *testing.T) {
 	s := newTestStore(t)
 	// 「バックアップ2世代」: 同一の大きなデータ + 末尾に少しの差分
-	base := randomData(t, 6 << 20)
+	base := randomData(t, 6<<20)
 	gen1 := base
 	gen2 := append(append([]byte{}, base...), []byte(strings.Repeat("diff", 100))...)
 
@@ -172,7 +172,7 @@ func TestDeleteReleasesSpace(t *testing.T) {
 
 func TestDeleteSharedChunksKeepsOtherFile(t *testing.T) {
 	s := newTestStore(t)
-	data := randomData(t, 4 << 20)
+	data := randomData(t, 4<<20)
 	m1 := putBytes(t, s, "copy1", data)
 	m2 := putBytes(t, s, "copy2", data) // 完全に同一 → 全チャンク共有
 

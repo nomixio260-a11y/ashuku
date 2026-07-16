@@ -1,0 +1,37 @@
+# systemd ユニット例。/usr/local/bin/ashuku を配置し、以下を
+# /etc/systemd/system/ashuku.service に置いて:
+#   systemctl daemon-reload && systemctl enable --now ashuku
+#
+# SIGTERM で graceful shutdown(進行中転送を最大30秒待つ)するので、
+# TimeoutStopSec は余裕を持たせる。
+
+[Unit]
+Description=ashuku dedup+compression storage service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ashuku
+Group=ashuku
+# 事前に: useradd --system --home /var/lib/ashuku ashuku
+ExecStart=/usr/local/bin/ashuku \
+    -addr :8080 \
+    -data /var/lib/ashuku/data \
+    -min-free 5G \
+    -auth-keys /etc/ashuku/keys.txt \
+    -access-log
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+# 堅牢化(データディレクトリ以外は読み取り専用に)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ashuku
+# メモリ上限(precompression の並行数×展開上限+キャッシュに見合う値)
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

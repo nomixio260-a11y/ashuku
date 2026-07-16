@@ -125,6 +125,9 @@ go build -o ashuku ./cmd/ashuku
 | `-auth-keys` | (なし) | APIキーファイル(1行: `<キー> [クォータ 例:10G] [名前]`)。未指定なら認証なし(開発用)。**公開運用では必須** |
 | `-max-upload` | `0` | 1アップロードのサイズ上限(例: `50G`)。超過は 413 |
 | `-server-side-uploads` | `full` | サーバー側圧縮経路(`/api/v1/files`)の扱い: `full` \| `fast`(軽量圧縮のみ) \| `off`(ashuku-cli 専用。圧縮・展開を完全にクライアント側へ) |
+| `-min-free` | `1G` | ディスク空きがこの値を下回ったらアップロードを 507 で拒否(枯渇によるサービス停止・破損を防止) |
+| `-access-log` | `false` | リクエストごとのアクセスログ出力 |
+| `-tls-cert` / `-tls-key` | (なし) | 指定すると HTTPS で待ち受け(両方必須) |
 
 ### API
 
@@ -139,7 +142,8 @@ go build -o ashuku ./cmd/ashuku
 | `POST` | `/api/v1/optimize` | chain repack を即時実行(通常は `-optimize-every` の自動実行で十分) |
 | `POST` | `/api/v1/scrub` | データ完全性検証(全チャンクをハッシュ照合、破損・欠損を報告) |
 | `POST` | `/api/v1/fsck` | メタデータ整合性検証(`?repair=1` で修復)。参照カウント・孤児・壊れた参照・使用量の不整合を検出 |
-| `GET` | `/healthz` | ヘルスチェック(認証不要) |
+| `GET` | `/healthz` | ヘルス/レディネス(認証不要。ディスク低下時は 503) |
+| `GET` | `/metrics` | Prometheus メトリクス(認証不要) |
 
 ### CLIクライアント(推奨: サーバーコスト最小)
 
@@ -222,6 +226,19 @@ curl http://localhost:8080/api/v1/stats
   "pack_garbage_bytes": 1048576  // パック内の解放済み領域(コンパクション待ち)
 }
 ```
+
+## デプロイ
+
+- **Docker**: `docker compose -f deploy/docker-compose.yml up -d`
+  (`Dockerfile` はマルチステージで CGO ビルド、実行イメージに zlib/libzstd を同梱)
+- **systemd**: `deploy/ashuku.service`(堅牢化オプション・graceful stop 対応)
+- **設定**: すべてフラグ(上表)。API キーは `deploy/keys.txt.example` を参照
+- **監視**: `GET /metrics`(Prometheus)でリクエスト数・エラー率・転送量・
+  ストレージ増加・ディスク空きを取得。`GET /healthz` はレディネスプローブ
+  (ディスク低下時は 503)。`-access-log` でアクセスログ
+- **ディスク枯渇対策**: `-min-free`(既定1GiB)を切ると書き込みを 507 で
+  事前に拒否し、満杯によるサービス停止・破損を防ぎます
+- **TLS**: `-tls-cert`/`-tls-key` で HTTPS 直接待ち受け(または L7 プロキシ配下)
 
 ## 信頼性・安定性
 

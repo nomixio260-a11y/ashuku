@@ -139,7 +139,7 @@ type Store struct {
 	encBalanced *zstd.Encoder
 	encBest     *zstd.Encoder
 	dec         *zstd.Decoder
-	mode        string // デフォルト圧縮モード(auto/fast/balanced/max)
+	mode        string            // デフォルト圧縮モード(auto/fast/balanced/max)
 	level       zstd.EncoderLevel // デルタ圧縮のレベル
 	delta       bool
 	chunkSize   int

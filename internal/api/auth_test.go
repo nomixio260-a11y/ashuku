@@ -207,6 +207,64 @@ func TestPanicRecovery(t *testing.T) {
 }
 
 // Authorization: Bearer 形式でも認証できる。
+// /metrics は Prometheus 形式でカウンタを返す。
+func TestMetricsEndpoint(t *testing.T) {
+	srv := newAuthServer(t, Options{})
+	req(t, "POST", srv.URL+"/api/v1/files?name=a", "", bytes.Repeat([]byte("x"), 1<<20)).Body.Close()
+
+	resp := req(t, "GET", srv.URL+"/metrics", "", nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	text := string(body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d", resp.StatusCode)
+	}
+	for _, want := range []string{
+		"ashuku_http_requests_total",
+		"ashuku_uploads_total",
+		"ashuku_bytes_uploaded_total",
+		"ashuku_disk_free_bytes",
+		"# TYPE ashuku_uploads_total counter",
+	} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("metrics に %q がありません:\n%s", want, text)
+		}
+	}
+}
+
+// ディスク予約を極端に大きくすると、アップロードが 507 で拒否され、
+// health が 503(readiness NG)を返す。
+func TestDiskGuard(t *testing.T) {
+	// 現実のディスク空きより大きい予約(必ず不足扱いになる)
+	srv := newAuthServer(t, Options{MinFreeBytes: 1 << 62})
+
+	resp := req(t, "POST", srv.URL+"/api/v1/files?name=x", "", []byte("data"))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("ディスク不足時のアップロード status = %d, want 507", resp.StatusCode)
+	}
+	// health は 503 + low_disk
+	resp = req(t, "GET", srv.URL+"/healthz", "", nil)
+	var h struct {
+		Status string `json:"status"`
+	}
+	json.NewDecoder(resp.Body).Decode(&h)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || h.Status != "low_disk" {
+		t.Fatalf("health status = %d %q, want 503 low_disk", resp.StatusCode, h.Status)
+	}
+}
+
+// 通常時の health は 200 ok。
+func TestHealthOK(t *testing.T) {
+	srv := newAuthServer(t, Options{})
+	resp := req(t, "GET", srv.URL+"/healthz", "", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", resp.StatusCode)
+	}
+}
+
 // newMuxThatPanics は必ずパニックする ServeMux を返す(テスト用)。
 func newMuxThatPanics() *http.ServeMux {
 	mux := http.NewServeMux()

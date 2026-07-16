@@ -40,6 +40,12 @@ type Options struct {
 	// 統計はチャンク全走査 O(N) なので、大規模ストアで /stats を叩かれ
 	// 続けても集計は TTL ごとに1回で済む。
 	StatsTTL time.Duration
+	// MinFreeBytes はこの空き容量を切ったらアップロードを 507 で拒否する
+	// ディスク予約(0 ならデフォルト 1GiB)。満杯直前で書き込みを止め、
+	// ディスク枯渇によるサービス停止・破損を防ぐ。
+	MinFreeBytes int64
+	// AccessLog を true にすると1リクエストごとにアクセスログを出力する。
+	AccessLog bool
 	// ServerSideUploads はサーバー側で圧縮・展開を行う従来経路
 	// (POST/GET /api/v1/files)の扱い:
 	//   "full"(デフォルト) = 従来どおり(auto圧縮・precomp あり)
@@ -49,11 +55,15 @@ type Options struct {
 	ServerSideUploads string
 }
 
+// DefaultMinFreeBytes はディスク予約のデフォルト(1GiB)。
+const DefaultMinFreeBytes = 1 << 30
+
 // Server は REST API サーバー。
 type Server struct {
-	store *store.Store
-	mux   *http.ServeMux
-	opts  Options
+	store   *store.Store
+	mux     *http.ServeMux
+	opts    Options
+	metrics *metrics
 
 	statsMu   sync.Mutex
 	statsAt   time.Time
@@ -65,7 +75,11 @@ func New(st *store.Store, opts Options) *Server {
 	if opts.StatsTTL <= 0 {
 		opts.StatsTTL = 10 * time.Second
 	}
-	s := &Server{store: st, mux: http.NewServeMux(), opts: opts}
+	if opts.MinFreeBytes <= 0 {
+		opts.MinFreeBytes = DefaultMinFreeBytes
+	}
+	s := &Server{store: st, mux: http.NewServeMux(), opts: opts, metrics: newMetrics()}
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/v1/files", s.auth(s.handleUpload))
 	s.mux.HandleFunc("GET /api/v1/files", s.auth(s.handleList))
 	s.mux.HandleFunc("GET /api/v1/files/{id}", s.auth(s.handleDownload))
@@ -88,17 +102,48 @@ func New(st *store.Store, opts Options) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 	// パニック分離: 1リクエストのパニックがサーバー全体を落とさないように、
 	// ここで捕捉して 500 を返す(ハンドラ内の想定外バグに対する最終防衛線)。
 	defer func() {
 		if rec := recover(); rec != nil {
+			if s.metrics != nil {
+				s.metrics.panics.Add(1)
+			}
 			log.Printf("panic in %s %s: %v", r.Method, r.URL.Path, rec)
-			// ヘッダ未送信なら 500 を返す(送信済みなら接続が閉じられる)
 			defer func() { recover() }()
-			writeError(w, http.StatusInternalServerError, "内部エラーが発生しました")
+			sw.status = http.StatusInternalServerError
+			writeError(sw, http.StatusInternalServerError, "内部エラーが発生しました")
+		}
+		if s.metrics != nil {
+			s.metrics.observeRequest(r.Method, sw.status)
+		}
+		if s.opts.AccessLog {
+			log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
 		}
 	}()
-	s.mux.ServeHTTP(w, r)
+	s.mux.ServeHTTP(sw, r)
+}
+
+// statusWriter は書き込まれたステータスコードを記録する ResponseWriter。
+type statusWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	w.wroteHeader = true
+	return w.ResponseWriter.Write(b)
 }
 
 // authed はリクエストの認証結果。
@@ -140,6 +185,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 			"このサーバーはサーバー側圧縮を無効化しています。ashuku-cli(クライアント側圧縮)を使ってください")
 		return
 	}
+	if !s.hasFreeSpace() {
+		s.metrics.uploadErrors.Add(1)
+		writeError(w, http.StatusInsufficientStorage,
+			"サーバーのディスク空き容量が不足しています")
+		return
+	}
+	s.metrics.uploadsTotal.Add(1)
 	name := r.Header.Get("X-File-Name")
 	if name == "" {
 		name = r.URL.Query().Get("name")
@@ -178,6 +230,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		DisablePrecomp: disablePrecomp,
 	})
 	if err != nil {
+		s.metrics.uploadErrors.Add(1)
 		var maxErr *http.MaxBytesError
 		switch {
 		case errors.Is(err, store.ErrQuotaExceeded):
@@ -191,7 +244,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		}
 		return
 	}
+	s.metrics.bytesUploaded.Add(m.Size)
 	writeJSON(w, http.StatusCreated, m)
+}
+
+// hasFreeSpace はディスク予約を満たしているかを返す(取得失敗時は許可)。
+func (s *Server) hasFreeSpace() bool {
+	free, err := s.store.FreeBytes()
+	if err != nil {
+		return true // 取得できないときは書き込みを止めない
+	}
+	return free >= s.opts.MinFreeBytes
 }
 
 // checkOwner は id のファイルが所有者のものであることを確認する。
@@ -229,7 +292,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, a authed
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", m.Size))
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf("attachment; filename*=UTF-8''%s", url.PathEscape(m.Name)))
-	if _, err := io.Copy(w, body); err != nil {
+	n, err := io.Copy(w, body)
+	s.metrics.bytesDownloaded.Add(n)
+	if err != nil {
 		// ヘッダ送信後はエラーレスポンスを返せないのでログのみ
 		log.Printf("download %s: %v", m.ID, err)
 	}
@@ -274,9 +339,35 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
 	})
 }
 
-// handleHealth はサーバーの稼働確認を返す(認証不要)。
+// handleHealth はサーバーの稼働確認とディスク空きを返す(認証不要)。
+// ディスク予約を切っている場合は 503 を返す(readiness プローブ用:
+// 書き込めない状態をロードバランサに知らせる)。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	free, _ := s.store.FreeBytes()
+	ready := free == 0 || free >= s.opts.MinFreeBytes
+	status := "ok"
+	code := http.StatusOK
+	if !ready {
+		status = "low_disk"
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, map[string]any{"status": status, "free_bytes": free})
+}
+
+// handleMetrics は Prometheus 形式でメトリクスを返す(認証不要)。
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	gauges := map[string]int64{}
+	if free, err := s.store.FreeBytes(); err == nil {
+		gauges["ashuku_disk_free_bytes"] = free
+	}
+	if st, err := s.cachedStats(); err == nil {
+		gauges["ashuku_logical_bytes"] = st.LogicalBytes
+		gauges["ashuku_physical_bytes"] = st.PhysicalBytes
+		gauges["ashuku_chunk_count"] = int64(st.ChunkCount)
+		gauges["ashuku_file_count"] = int64(st.FileCount)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Write([]byte(s.metrics.render(gauges)))
 }
 
 // handleScrub は全チャンクの完全性を検証し、破損・欠損を報告する。
@@ -313,26 +404,34 @@ func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, _ authed
 	writeJSON(w, http.StatusOK, res)
 }
 
-// handleStats はストア全体の統計を返す。集計はチャンク全走査 O(N) のため
-// TTL キャッシュする(多数ユーザーが叩いても集計は TTL ごとに1回)。
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, _ authed) {
+// cachedStats はストア統計を TTL キャッシュ付きで返す(集計はチャンク
+// 全走査 O(N) なので、多数の呼び出しでも集計は TTL ごとに1回で済む)。
+func (s *Server) cachedStats() (*store.Stats, error) {
 	s.statsMu.Lock()
 	if s.statsLast != nil && time.Since(s.statsAt) < s.opts.StatsTTL {
 		st := *s.statsLast
 		s.statsMu.Unlock()
-		writeJSON(w, http.StatusOK, &st)
-		return
+		return &st, nil
 	}
 	s.statsMu.Unlock()
 
 	st, err := s.store.Stats()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return nil, err
 	}
 	s.statsMu.Lock()
 	s.statsLast, s.statsAt = st, time.Now()
 	s.statsMu.Unlock()
+	return st, nil
+}
+
+// handleStats はストア全体の統計を返す。
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, _ authed) {
+	st, err := s.cachedStats()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -382,6 +481,10 @@ func (s *Server) handleChunksMissing(w http.ResponseWriter, r *http.Request, _ a
 }
 
 func (s *Server) handleChunkPut(w http.ResponseWriter, r *http.Request, _ authed) {
+	if !s.hasFreeSpace() {
+		writeError(w, http.StatusInsufficientStorage, "サーバーのディスク空き容量が不足しています")
+		return
+	}
 	hash := r.PathValue("hash")
 	rawSize, _ := strconv.ParseInt(r.Header.Get("X-Raw-Size"), 10, 64)
 	compression := r.Header.Get("X-Compression")

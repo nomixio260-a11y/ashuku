@@ -60,9 +60,9 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 	var orphanPaths []string
 	err := work(func(tx *bolt.Tx) error {
 		// 1) 期待参照カウントを再計算
-		expected := map[string]int64{}          // チャンク → 期待 RefCount
-		manifestRefs := map[string]int64{}       // チャンク → マニフェスト参照数
-		ownerSize := map[string]int64{}          // 所有者 → 論理サイズ合計
+		expected := map[string]int64{}     // チャンク → 期待 RefCount
+		manifestRefs := map[string]int64{} // チャンク → マニフェスト参照数
+		ownerSize := map[string]int64{}    // 所有者 → 論理サイズ合計
 		var brokenFiles []AffectedFile
 		chunks := tx.Bucket(bucketChunks)
 

@@ -1,0 +1,36 @@
+# ashuku を Docker Compose で起動する例。
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# 認証を有効にする場合は keys.txt を用意し、-auth-keys を有効化する。
+
+services:
+  ashuku:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ashuku:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ashuku-data:/data
+      # 認証を使う場合(下の command の -auth-keys も有効化):
+      # - ./keys.txt:/etc/ashuku/keys.txt:ro
+    command:
+      - "-addr"
+      - ":8080"
+      - "-data"
+      - "/data"
+      - "-min-free"
+      - "5G"
+      - "-access-log"
+      # - "-auth-keys"
+      # - "/etc/ashuku/keys.txt"
+      # - "-max-upload"
+      # - "50G"
+    # コンテナ側のメモリ上限(precompression の並行数×展開上限に見合う値に)
+    mem_limit: 2g
+
+volumes:
+  ashuku-data:

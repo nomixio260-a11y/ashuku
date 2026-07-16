@@ -47,7 +47,17 @@ func main() {
 		"1アップロードのサイズ上限(例: 50G)。0 で無制限")
 	serverSide := flag.String("server-side-uploads", "full",
 		"サーバー側圧縮経路(/api/v1/files)の扱い: full | fast(軽量圧縮のみ) | off(ashuku-cli専用)")
+	minFree := flag.String("min-free", "1G",
+		"ディスク空きがこの値を下回ったらアップロードを 507 で拒否(枯渇によるサービス停止防止)")
+	accessLog := flag.Bool("access-log", false, "リクエストごとのアクセスログを出力する")
+	tlsCert := flag.String("tls-cert", "", "TLS 証明書ファイル(PEM)。tls-key と併せて指定で HTTPS")
+	tlsKey := flag.String("tls-key", "", "TLS 秘密鍵ファイル(PEM)")
 	flag.Parse()
+
+	minFreeBytes, err := parseBytes(*minFree)
+	if err != nil {
+		log.Fatalf("-min-free: %v", err)
+	}
 
 	switch *serverSide {
 	case "full", "fast", "off":
@@ -139,6 +149,8 @@ func main() {
 		Users:             users,
 		MaxUploadBytes:    maxUploadBytes,
 		ServerSideUploads: *serverSide,
+		MinFreeBytes:      minFreeBytes,
+		AccessLog:         *accessLog,
 	})
 	// タイムアウト: 大容量のアップロード/ダウンロードは何分もかかりうるので
 	// Read/WriteTimeout は設定せず、ヘッダ読取とアイドル接続だけを制限する
@@ -163,8 +175,16 @@ func main() {
 		srv.Shutdown(ctx)
 	}()
 
-	log.Printf("ashuku サーバー起動: %s (データ: %s)", *addr, *dataDir)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	scheme := "http"
+	serve := srv.ListenAndServe
+	if *tlsCert != "" && *tlsKey != "" {
+		scheme = "https"
+		serve = func() error { return srv.ListenAndServeTLS(*tlsCert, *tlsKey) }
+	} else if *tlsCert != "" || *tlsKey != "" {
+		log.Fatalf("TLS には -tls-cert と -tls-key の両方が必要です")
+	}
+	log.Printf("ashuku サーバー起動: %s://%s (データ: %s)", scheme, *addr, *dataDir)
+	if err := serve(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 	log.Printf("停止しました")

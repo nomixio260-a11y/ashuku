@@ -48,12 +48,12 @@ type packMeta struct {
 
 // packWriter は現行パックへの追記を直列化する。
 type packWriter struct {
-	mu          sync.Mutex
-	dir         string
-	id          string
-	f           *os.File
-	off         int64
-	sinceSync   int64
+	mu        sync.Mutex
+	dir       string
+	id        string
+	f         *os.File
+	off       int64
+	sinceSync int64
 }
 
 func newPackWriter(dir string) *packWriter {

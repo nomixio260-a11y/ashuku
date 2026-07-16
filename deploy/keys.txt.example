@@ -1,0 +1,8 @@
+# ashuku API キーファイルの例。-auth-keys で指定する。
+# 形式(1行1キー):  <キー>  [クォータ(例:100G, 0=無制限)]  [表示名]
+# '#' で始まる行と空行は無視される。
+#
+# キーは十分に長いランダム文字列にすること(例: openssl rand -hex 32)。
+
+alice-REPLACE-WITH-random-64hex   100G   Alice
+bob-REPLACE-WITH-random-64hex     10G    Bob
