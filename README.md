@@ -105,6 +105,10 @@ go build -o ashuku ./cmd/ashuku
 | `-cache-mb` | `0`(=128) | 伸長済みチャンクキャッシュ容量(MiB)。デルタチェーンの読み出しを高速化(実測: 深さ32チェーンの読み出しが771ms→30ms) |
 | `-optimize-every` | `1h` | chain repack(チェーン再編成)の自動実行間隔。長期世代保持のドリフト蓄積を回収(100世代実測: 82.7x→142.1x)。`0` で無効 |
 | `-precomp` | `true` | gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ |
+| `-precomp-max` | `64M` | precompression が扱う展開データの上限。この値×並行数がメモリ上限(超過は素通しで安全に保存) |
+| `-precomp-parallel` | `2` | precompression の同時実行数。超過分は素通し(多人数同時アップロードでのメモリ爆発防止) |
+| `-auth-keys` | (なし) | APIキーファイル(1行: `<キー> [クォータ 例:10G] [名前]`)。未指定なら認証なし(開発用)。**公開運用では必須** |
+| `-max-upload` | `0` | 1アップロードのサイズ上限(例: `50G`)。超過は 413 |
 
 ### API
 
@@ -114,8 +118,30 @@ go build -o ashuku ./cmd/ashuku
 | `GET` | `/api/v1/files` | ファイル一覧 |
 | `GET` | `/api/v1/files/{id}` | ダウンロード |
 | `DELETE` | `/api/v1/files/{id}` | 削除(不要チャンクは自動GC) |
-| `GET` | `/api/v1/stats` | 容量統計 |
+| `GET` | `/api/v1/stats` | 容量統計(10秒TTLキャッシュ) |
+| `GET` | `/api/v1/me` | 呼び出しユーザーの使用量とクォータ |
 | `POST` | `/api/v1/optimize` | chain repack を即時実行(通常は `-optimize-every` の自動実行で十分) |
+
+### 多人数運用(認証・クォータ)
+
+```sh
+# keys.txt — 1行1キー: <キー> [クォータ] [名前]
+#   alice-secret-key 100G Alice
+#   bob-secret-key   10G  Bob
+./ashuku -auth-keys keys.txt -max-upload 50G
+```
+
+- キーは `X-API-Key: <キー>` または `Authorization: Bearer <キー>` で渡します
+- **所有者分離**: ファイルは所有キーごとに分離され、他人のファイルは一覧に出ず、
+  取得・削除も 404 になります(存在も漏れない)。チャンクの重複排除は全体で
+  共有され、複数ユーザーが同じデータを上げても物理は1回分です
+- **クォータ**: 使用量+アップロードが上限を超えると 507 を返します
+  (チェックと加算は同一トランザクションなので並行アップロードでも突き抜けません)。
+  使用量は `GET /api/v1/me` で確認できます
+- **メモリ上限**: 大量の同時アップロードでもメモリは一定です(ストリーミング+
+  precompression のサイズ上限・同時実行数制限。実測: 以前 RSS 3.9GB に達した
+  巨大 gzip 並行ワークロードがガード後は 537MB)
+- **HTTPタイムアウト**: ヘッダ読取10秒・アイドル2分(大容量転送自体は無制限)
 
 ### 例
 

@@ -55,7 +55,7 @@ func TestUnwrapAndReconstructRoundTrip(t *testing.T) {
 	for _, level := range []int{1, 6, 9} {
 		for _, name := range []string{"", "app.log"} {
 			orig := zlibGzip(t, plain, level, name)
-			u, ok := TryUnwrap(orig)
+			u, ok := TryUnwrap(orig, 0)
 			if !ok {
 				t.Fatalf("level=%d name=%q: 分解に失敗", level, name)
 			}
@@ -86,7 +86,7 @@ func TestGoGzipFallsBack(t *testing.T) {
 	w := gzip.NewWriter(&buf)
 	w.Write(testPlain(256 << 10))
 	w.Close()
-	if _, ok := TryUnwrap(buf.Bytes()); ok {
+	if _, ok := TryUnwrap(buf.Bytes(), 0); ok {
 		t.Fatal("Go 産 gzip が zlib 産と誤判定されました")
 	}
 }
@@ -97,13 +97,13 @@ func TestCorruptTrailerRejected(t *testing.T) {
 	}
 	orig := zlibGzip(t, testPlain(64<<10), 6, "")
 	orig[len(orig)-2] ^= 0xff // ISIZE を壊す
-	if _, ok := TryUnwrap(orig); ok {
+	if _, ok := TryUnwrap(orig, 0); ok {
 		t.Fatal("トレーラ破損が検出されていません")
 	}
 }
 
 func TestNonGzipRejected(t *testing.T) {
-	if _, ok := TryUnwrap([]byte("not a gzip stream at all........")); ok {
+	if _, ok := TryUnwrap([]byte("not a gzip stream at all........"), 0); ok {
 		t.Fatal("非 gzip が受理されました")
 	}
 }

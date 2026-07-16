@@ -198,7 +198,7 @@ func TestList(t *testing.T) {
 	putBytes(t, s, "one", []byte("hello"))
 	putBytes(t, s, "two", []byte("world"))
 
-	files, err := s.List()
+	files, err := s.List("")
 	if err != nil {
 		t.Fatal(err)
 	}

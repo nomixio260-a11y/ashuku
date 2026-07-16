@@ -21,6 +21,8 @@ var (
 	bucketSettings = []byte("settings")
 	// bucketPacks はパックファイルごとの使用量(total/live バイト)。
 	bucketPacks = []byte("packs")
+	// bucketUsers は所有者ごとの論理使用量(バイト、int64 BigEndian)。
+	bucketUsers = []byte("users")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
@@ -31,6 +33,8 @@ type FileManifest struct {
 	Name      string    `json:"name"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+	// Owner はファイルの所有者ID(APIキーごとの分離)。"" は共有(認証なし運用)。
+	Owner string `json:"owner,omitempty"`
 	// Chunks は復元順に並んだチャンクハッシュ(hex)の列。
 	Chunks []string `json:"chunks"`
 	// Encoding は保存時に適用した可逆変換。"" = なし。
@@ -93,7 +97,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -141,6 +145,40 @@ func getChunkMeta(tx *bolt.Tx, hash string) (*ChunkMeta, error) {
 
 func unmarshalChunkMeta(raw []byte, c *ChunkMeta) error {
 	return json.Unmarshal(raw, c)
+}
+
+// ownerKey は users バケットのキーを返す。bbolt は空キーを許さないため、
+// 匿名所有者("")は NUL 1バイトの番兵キーに写像する(実際の API キーは
+// 印字可能文字列なので衝突しない)。
+func ownerKey(owner string) []byte {
+	if owner == "" {
+		return []byte{0}
+	}
+	return []byte(owner)
+}
+
+// ownerUsage は所有者の論理使用量を返す。
+func ownerUsage(tx *bolt.Tx, owner string) (int64, error) {
+	raw := tx.Bucket(bucketUsers).Get(ownerKey(owner))
+	if raw == nil || len(raw) != 8 {
+		return 0, nil
+	}
+	return int64(binary.BigEndian.Uint64(raw)), nil
+}
+
+// addOwnerUsage は所有者の論理使用量に delta を加算する(負も可)。
+func addOwnerUsage(tx *bolt.Tx, owner string, delta int64) error {
+	used, err := ownerUsage(tx, owner)
+	if err != nil {
+		return err
+	}
+	used += delta
+	if used < 0 {
+		used = 0
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(used))
+	return tx.Bucket(bucketUsers).Put(ownerKey(owner), buf[:])
 }
 
 func putPackMeta(tx *bolt.Tx, packID string, pm *packMeta) error {

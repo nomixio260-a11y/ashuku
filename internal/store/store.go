@@ -88,11 +88,28 @@ type Config struct {
 	// DisablePrecomp は gzip precompression(zlib産gzipを展開して保存)を
 	// 無効化する。CGO 無効ビルドでは常に無効。
 	DisablePrecomp bool
+	// PrecompMaxPlain は precompression が扱う展開データの上限(バイト)。
+	// 0 ならデフォルト(64MiB)。分解・再構成はメモリ上で行うため、
+	// この値 × PrecompParallel がメモリ使用量の上限になる。
+	// 超えるストリームは安全に素通し(通常のストリーミング保存)される。
+	PrecompMaxPlain int64
+	// PrecompParallel は precompression の同時実行数上限。0 ならデフォルト(2)。
+	// 超過分は precompression をスキップして通常経路で保存される
+	// (待たせない: 多人数同時アップロードでのメモリ爆発を防ぐ)。
+	PrecompParallel int
 }
 
-// precompMaxSize を超える gzip は precompression を試みない
-// (分解・再構成をメモリ上で行うため)。
-const precompMaxSize = 256 << 20
+// DefaultPrecompMaxPlain は precompression の展開上限デフォルト(64MiB)。
+const DefaultPrecompMaxPlain = 64 << 20
+
+// DefaultPrecompParallel は precompression の同時実行数デフォルト。
+const DefaultPrecompParallel = 2
+
+// ErrQuotaExceeded は所有者のクォータ超過を示す。
+var ErrQuotaExceeded = errors.New("容量クォータを超過しています")
+
+// ErrTooLarge はアップロードサイズ上限の超過を示す。
+var ErrTooLarge = errors.New("アップロードサイズが上限を超えています")
 
 // ValidCompression は圧縮モード名の妥当性を検査する(""はデフォルト=auto)。
 func ValidCompression(mode string) bool {
@@ -129,7 +146,9 @@ type Store struct {
 	cache       *chunkCache
 	pw          *packWriter
 	precomp     bool
-	optMu       sync.Mutex // Optimize の同時実行を直列化
+	precompMax  int64         // precompression の展開上限
+	precompSem  chan struct{} // precompression の同時実行制限
+	optMu       sync.Mutex    // Optimize の同時実行を直列化
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。
@@ -196,6 +215,14 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 	if cacheBytes <= 0 {
 		cacheBytes = DefaultCacheBytes
 	}
+	precompMax := cfg.PrecompMaxPlain
+	if precompMax <= 0 {
+		precompMax = DefaultPrecompMaxPlain
+	}
+	precompPar := cfg.PrecompParallel
+	if precompPar <= 0 {
+		precompPar = DefaultPrecompParallel
+	}
 	return &Store{
 		dir:         dataDir,
 		db:          db,
@@ -211,6 +238,8 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		cache:       newChunkCache(cacheBytes),
 		pw:          newPackWriter(filepath.Join(dataDir, "packs")),
 		precomp:     !cfg.DisablePrecomp && precomp.Supported(),
+		precompMax:  precompMax,
+		precompSem:  make(chan struct{}, precompPar),
 	}, nil
 }
 
@@ -272,6 +301,15 @@ type PutOptions struct {
 	// Compression は圧縮モードの上書き("" ならストアのデフォルト)。
 	// "auto" | "fast" | "balanced" | "max"
 	Compression string
+	// Owner はファイルの所有者ID(APIキーごとの分離に使う)。"" は共有(認証なし)。
+	Owner string
+	// Quota は所有者の論理容量上限(バイト)。0 なら無制限。
+	// 使用量+このアップロードが上限を超えるとコミット時に
+	// ErrQuotaExceeded で失敗する(チャンクはロールバックされる)。
+	Quota int64
+	// MaxBytes は1アップロードのサイズ上限。0 なら無制限。
+	// 超えると ErrTooLarge で失敗する。
+	MaxBytes int64
 }
 
 // Put は r の内容を name として保存し、マニフェストを返す。
@@ -294,21 +332,33 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		CreatedAt: time.Now().UTC(),
 	}
 
+	m.Owner = opts.Owner
+
 	// precompression: zlib産の deflate 系ストリーム(gzip 単一/マルチメンバー・
 	// 生 zlib)なら「展開データ+レシピ」に分解し、展開データを dedup/デルタ/
 	// zstd の対象にする(ビット一致検証済みの場合のみ)。
-	// 該当しないストリームはそのまま通常経路へ。
+	// 該当しないストリーム・上限超過・同時実行枠の超過は通常経路へ素通し
+	// (多人数同時アップロードでのメモリ爆発を防ぐ)。
 	if s.precomp {
 		head := make([]byte, 3)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
-		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head)) {
-			buf, overflow, err := readUpTo(rest, precompMaxSize)
+		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head)) && s.acquirePrecomp() {
+			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
+				s.releasePrecomp()
 				return nil, err
 			}
+			if opts.MaxBytes > 0 && int64(len(buf)) > opts.MaxBytes {
+				s.releasePrecomp()
+				return nil, ErrTooLarge
+			}
 			if overflow == nil && s.tryPrecomp(m, buf) {
-				if err := s.putStream(m, bytes.NewReader(m.precompPlain), mode); err != nil {
+				// サイズ上限は元ストリーム(len(buf))に適用済み。展開データの
+				// putStream には上限をかけない(展開は正当に大きくなりうる)。
+				err := s.putStream(m, bytes.NewReader(m.precompPlain), mode, 0)
+				s.releasePrecomp()
+				if err != nil {
 					return nil, err
 				}
 				// GET が返すのは元のストリームなので Size は元サイズに合わせ、
@@ -316,8 +366,9 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 				m.ChunkedSize = m.Size
 				m.Size = int64(len(buf))
 				m.precompPlain = nil
-				return m, s.commitManifest(m)
+				return m, s.commitManifest(m, opts.Quota)
 			}
+			s.releasePrecomp()
 			if overflow == nil {
 				rest = bytes.NewReader(buf)
 			} else {
@@ -327,11 +378,23 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		r = rest
 	}
 
-	if err := s.putStream(m, r, mode); err != nil {
+	if err := s.putStream(m, r, mode, opts.MaxBytes); err != nil {
 		return nil, err
 	}
-	return m, s.commitManifest(m)
+	return m, s.commitManifest(m, opts.Quota)
 }
+
+// acquirePrecomp は precompression の実行枠を取る(待たずに false を返す)。
+func (s *Store) acquirePrecomp() bool {
+	select {
+	case s.precompSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) releasePrecomp() { <-s.precompSem }
 
 // tryPrecomp は buf を gzip(単一/マルチ)または生 zlib として分解を試み、
 // 成功したらマニフェストにレシピを記録して真を返す。
@@ -342,12 +405,12 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 	case precomp.IsGzip(buf):
 		// まず単一メンバーとして試し(既存フォーマット互換)、
 		// だめならマルチメンバーとして試す。
-		if u, ok := precomp.TryUnwrap(buf); ok {
+		if u, ok := precomp.TryUnwrap(buf, s.precompMax); ok {
 			m.Encoding = EncodingGzipZlibV1
 			m.PrecompHeader = u.Header
 			m.PrecompLevel = u.Level
 			m.precompPlain = u.Plain
-		} else if plain, members, ok := precomp.TryUnwrapGzipMulti(buf); ok {
+		} else if plain, members, ok := precomp.TryUnwrapGzipMulti(buf, s.precompMax); ok {
 			m.Encoding = EncodingGzipMultiV1
 			m.PrecompMembers = members
 			m.precompPlain = plain
@@ -355,7 +418,7 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 			return false
 		}
 	case precomp.IsZlib(buf):
-		u, ok := precomp.TryUnwrapZlib(buf)
+		u, ok := precomp.TryUnwrapZlib(buf, s.precompMax)
 		if !ok {
 			return false
 		}
@@ -393,7 +456,8 @@ func readUpTo(r io.Reader, max int) ([]byte, io.Reader, error) {
 }
 
 // putStream は r をチャンク化して保存し、m にチャンク列とサイズを記録する。
-func (s *Store) putStream(m *FileManifest, r io.Reader, mode string) error {
+// maxBytes > 0 のとき、超過した時点で中断してロールバックする。
+func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes int64) error {
 	ck, err := chunker.New(r, s.chunkSize)
 	if err != nil {
 		return err
@@ -407,6 +471,10 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string) error {
 			s.rollbackChunks(m.Chunks)
 			return fmt.Errorf("チャンク分割に失敗: %w", err)
 		}
+		if maxBytes > 0 && m.Size+int64(len(chunk.Data)) > maxBytes {
+			s.rollbackChunks(m.Chunks)
+			return ErrTooLarge
+		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
 		if err := s.storeChunk(hexHash, chunk.Data, mode); err != nil {
@@ -419,9 +487,22 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string) error {
 	return nil
 }
 
-// commitManifest はマニフェストを保存する(失敗時はチャンク参照を戻す)。
-func (s *Store) commitManifest(m *FileManifest) error {
+// commitManifest はマニフェストを保存し、所有者の使用量を加算する。
+// quota > 0 で使用量が上限を超える場合はコミットせず ErrQuotaExceeded を
+// 返す(チェックと加算は同一トランザクションなので並行アップロードでも
+// 突き抜けない)。失敗時はチャンク参照を戻す。
+func (s *Store) commitManifest(m *FileManifest, quota int64) error {
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		used, err := ownerUsage(tx, m.Owner)
+		if err != nil {
+			return err
+		}
+		if quota > 0 && used+m.Size > quota {
+			return ErrQuotaExceeded
+		}
+		if err := addOwnerUsage(tx, m.Owner, m.Size); err != nil {
+			return err
+		}
 		return putFileManifest(tx, m)
 	})
 	if err != nil {
@@ -429,6 +510,17 @@ func (s *Store) commitManifest(m *FileManifest) error {
 		return err
 	}
 	return nil
+}
+
+// OwnerUsage は所有者の論理使用量(バイト)を返す。
+func (s *Store) OwnerUsage(owner string) (int64, error) {
+	var used int64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		used, err = ownerUsage(tx, owner)
+		return err
+	})
+	return used, err
 }
 
 // storeChunk はチャンクを重複排除しつつ保存する。
@@ -782,13 +874,29 @@ func decodeDelta(base, delta []byte, rawSize int64) ([]byte, error) {
 	return dec.DecodeAll(delta, make([]byte, 0, rawSize))
 }
 
+// Manifest は指定IDのマニフェストを返す(チャンク列は含む。読み出しは
+// しないため所有者チェック等の軽い用途向け)。
+func (s *Store) Manifest(id string) (*FileManifest, error) {
+	var m *FileManifest
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		m, err = getFileManifest(tx, id)
+		return err
+	})
+	return m, err
+}
+
 // Delete はファイルを削除し、参照されなくなったチャンクを物理削除する。
+// 所有者の使用量も減算する。
 func (s *Store) Delete(id string) error {
 	var m *FileManifest
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		var err error
 		m, err = getFileManifest(tx, id)
 		if err != nil {
+			return err
+		}
+		if err := addOwnerUsage(tx, m.Owner, -m.Size); err != nil {
 			return err
 		}
 		return tx.Bucket(bucketFiles).Delete([]byte(id))
@@ -865,14 +973,18 @@ func (s *Store) removeChunkFiles(paths []string) {
 	}
 }
 
-// List は保存済みファイル一覧を作成日時の降順で返す。
-func (s *Store) List() ([]*FileManifest, error) {
+// List は owner が所有するファイル一覧を作成日時の降順で返す
+// (認証なし運用では owner は常に "" で全件が対象になる)。
+func (s *Store) List(owner string) ([]*FileManifest, error) {
 	var files []*FileManifest
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
 			var m FileManifest
 			if err := json.Unmarshal(v, &m); err != nil {
 				return err
+			}
+			if m.Owner != owner {
+				return nil
 			}
 			m.Chunks = nil // 一覧にはチャンク列は不要
 			files = append(files, &m)

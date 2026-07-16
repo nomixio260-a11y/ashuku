@@ -46,7 +46,11 @@ func IsZlib(head []byte) bool {
 }
 
 // TryUnwrapZlib は生 zlib ストリームを「展開データ+レシピ」に分解する。
-func TryUnwrapZlib(orig []byte) (*Unwrapped, bool) {
+// maxPlain は展開データの上限(0 ならデフォルト上限)。
+func TryUnwrapZlib(orig []byte, maxPlain int64) (*Unwrapped, bool) {
+	if maxPlain <= 0 || maxPlain > maxPlainTotal {
+		maxPlain = maxPlainTotal
+	}
 	if len(orig) < minStreamSize || !IsZlib(orig) {
 		return nil, false
 	}
@@ -54,9 +58,9 @@ func TryUnwrapZlib(orig []byte) (*Unwrapped, bool) {
 	trailer := orig[len(orig)-4:]
 
 	fr := flate.NewReader(bytes.NewReader(deflateStream))
-	plain, err := io.ReadAll(io.LimitReader(fr, maxPlainTotal+1))
+	plain, err := io.ReadAll(io.LimitReader(fr, maxPlain+1))
 	fr.Close()
-	if err != nil || len(plain) > maxPlainTotal {
+	if err != nil || int64(len(plain)) > maxPlain {
 		return nil, false
 	}
 	if adler32.Checksum(plain) != binary.BigEndian.Uint32(trailer) {
@@ -95,8 +99,12 @@ type Member struct {
 
 // TryUnwrapGzipMulti は(マルチメンバーの可能性がある)gzip ストリームを
 // 「連結展開データ+メンバーレシピ列」に分解する。全メンバーが zlib 産で
-// ビット一致再現できる場合のみ成功する。
-func TryUnwrapGzipMulti(orig []byte) ([]byte, []Member, bool) {
+// ビット一致再現できる場合のみ成功する。maxPlain は展開合計の上限
+// (0 ならデフォルト上限)。
+func TryUnwrapGzipMulti(orig []byte, maxPlain int64) ([]byte, []Member, bool) {
+	if maxPlain <= 0 || maxPlain > maxPlainTotal {
+		maxPlain = maxPlainTotal
+	}
 	if len(orig) < minStreamSize || !IsGzip(orig) {
 		return nil, nil, false
 	}
@@ -115,9 +123,9 @@ func TryUnwrapGzipMulti(orig []byte) ([]byte, []Member, bool) {
 		// → 消費バイト数から deflate ストリームの範囲を特定できる。
 		br := bytes.NewReader(orig[pos+hl:])
 		fr := flate.NewReader(br)
-		part, err := io.ReadAll(io.LimitReader(fr, maxPlainTotal+1))
+		part, err := io.ReadAll(io.LimitReader(fr, maxPlain+1))
 		fr.Close()
-		if err != nil || int64(len(plain))+int64(len(part)) > maxPlainTotal {
+		if err != nil || int64(len(plain))+int64(len(part)) > maxPlain {
 			return nil, nil, false
 		}
 		consumed := len(orig) - pos - hl - br.Len()

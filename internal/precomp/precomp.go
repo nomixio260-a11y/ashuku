@@ -154,7 +154,12 @@ func findLevel(plain, deflateStream []byte) (int, bool) {
 
 // TryUnwrap は gzip ストリームを「展開データ+レシピ」に分解する。
 // ビット一致で再構成できる場合のみ結果を返す(それ以外は ok=false)。
-func TryUnwrap(orig []byte) (*Unwrapped, bool) {
+// maxPlain は展開データの上限(0 ならデフォルト上限)で、超えると分解を
+// 諦める(zip bomb・メモリ対策)。
+func TryUnwrap(orig []byte, maxPlain int64) (*Unwrapped, bool) {
+	if maxPlain <= 0 || maxPlain > maxPlainTotal {
+		maxPlain = maxPlainTotal
+	}
 	if !IsGzip(orig) || len(orig) < 18 {
 		return nil, false
 	}
@@ -170,10 +175,10 @@ func TryUnwrap(orig []byte) (*Unwrapped, bool) {
 
 	// 展開(デコードは実装非依存なので Go 標準の flate でよい)
 	fr := flate.NewReader(bytes.NewReader(deflateStream))
-	plain, err := io.ReadAll(fr)
+	plain, err := io.ReadAll(io.LimitReader(fr, maxPlain+1))
 	fr.Close()
-	if err != nil {
-		return nil, false // マルチメンバー等もここで弾かれる
+	if err != nil || int64(len(plain)) > maxPlain {
+		return nil, false // マルチメンバー・上限超過等はここで弾かれる
 	}
 	// トレーラ検証(CRC32 + ISIZE)
 	if crc32.ChecksumIEEE(plain) != binary.LittleEndian.Uint32(trailer) ||

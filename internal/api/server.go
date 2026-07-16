@@ -1,4 +1,8 @@
 // Package api はストレージエンジンを REST API として公開する HTTP レイヤ。
+//
+// 認証(APIキー)・所有者分離・クォータ・アップロードサイズ上限・
+// /stats の TTL キャッシュを持つ。認証を設定しない場合は従来どおり
+// 全操作が匿名(所有者 "")で行える(開発・単一ユーザー運用向け)。
 package api
 
 import (
@@ -11,25 +15,56 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sync"
+	"time"
 
 	"github.com/nomixio260-a11y/ashuku/internal/store"
 )
+
+// User は APIキー1つぶんの認証情報。
+type User struct {
+	// Name は表示名(ログ・/me 用)。
+	Name string
+	// Quota は論理容量上限(バイト)。0 なら無制限。
+	Quota int64
+}
+
+// Options はサーバーの動作設定。
+type Options struct {
+	// Users は APIキー → ユーザー情報。空なら認証なし(全操作が匿名)。
+	Users map[string]User
+	// MaxUploadBytes は1アップロードのサイズ上限。0 なら無制限。
+	MaxUploadBytes int64
+	// StatsTTL は /stats の集計キャッシュ期間。0 ならデフォルト(10秒)。
+	// 統計はチャンク全走査 O(N) なので、大規模ストアで /stats を叩かれ
+	// 続けても集計は TTL ごとに1回で済む。
+	StatsTTL time.Duration
+}
 
 // Server は REST API サーバー。
 type Server struct {
 	store *store.Store
 	mux   *http.ServeMux
+	opts  Options
+
+	statsMu   sync.Mutex
+	statsAt   time.Time
+	statsLast *store.Stats
 }
 
 // New は store を公開する HTTP ハンドラを作る。
-func New(st *store.Store) *Server {
-	s := &Server{store: st, mux: http.NewServeMux()}
-	s.mux.HandleFunc("POST /api/v1/files", s.handleUpload)
-	s.mux.HandleFunc("GET /api/v1/files", s.handleList)
-	s.mux.HandleFunc("GET /api/v1/files/{id}", s.handleDownload)
-	s.mux.HandleFunc("DELETE /api/v1/files/{id}", s.handleDelete)
-	s.mux.HandleFunc("GET /api/v1/stats", s.handleStats)
-	s.mux.HandleFunc("POST /api/v1/optimize", s.handleOptimize)
+func New(st *store.Store, opts Options) *Server {
+	if opts.StatsTTL <= 0 {
+		opts.StatsTTL = 10 * time.Second
+	}
+	s := &Server{store: st, mux: http.NewServeMux(), opts: opts}
+	s.mux.HandleFunc("POST /api/v1/files", s.auth(s.handleUpload))
+	s.mux.HandleFunc("GET /api/v1/files", s.auth(s.handleList))
+	s.mux.HandleFunc("GET /api/v1/files/{id}", s.auth(s.handleDownload))
+	s.mux.HandleFunc("DELETE /api/v1/files/{id}", s.auth(s.handleDelete))
+	s.mux.HandleFunc("GET /api/v1/me", s.auth(s.handleMe))
+	s.mux.HandleFunc("GET /api/v1/stats", s.auth(s.handleStats))
+	s.mux.HandleFunc("POST /api/v1/optimize", s.auth(s.handleOptimize))
 	return s
 }
 
@@ -37,11 +72,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// authed はリクエストの認証結果。
+type authed struct {
+	owner string // 所有者ID(= APIキー)。認証なし運用では ""
+	user  User
+}
+
+// auth は APIキーを検証するミドルウェア。キー未設定なら素通し(匿名)。
+// キーは Authorization: Bearer <key> または X-API-Key ヘッダで渡す。
+func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.opts.Users) == 0 {
+			next(w, r, authed{})
+			return
+		}
+		key := r.Header.Get("X-API-Key")
+		if key == "" {
+			if h := r.Header.Get("Authorization"); len(h) > 7 && h[:7] == "Bearer " {
+				key = h[7:]
+			}
+		}
+		u, ok := s.opts.Users[key]
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "APIキーが無効です")
+			return
+		}
+		next(w, r, authed{owner: key, user: u})
+	}
+}
+
 // handleUpload はリクエストボディをそのまま保存する。
 // ファイル名は X-File-Name ヘッダまたは ?name= で指定(省略可)。
 // 圧縮モードは X-Compression ヘッダまたは ?compression= でアップロード単位に
 // 上書きできる(auto | fast | balanced | max)。
-func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) {
 	name := r.Header.Get("X-File-Name")
 	if name == "" {
 		name = r.URL.Query().Get("name")
@@ -61,22 +125,55 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, err := s.store.PutWithOptions(name, r.Body, store.PutOptions{Compression: mode})
+	body := r.Body
+	if s.opts.MaxUploadBytes > 0 {
+		body = http.MaxBytesReader(w, body, s.opts.MaxUploadBytes)
+	}
+	m, err := s.store.PutWithOptions(name, body, store.PutOptions{
+		Compression: mode,
+		Owner:       a.owner,
+		Quota:       a.user.Quota,
+		MaxBytes:    s.opts.MaxUploadBytes,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存に失敗しました: %v", err))
+		var maxErr *http.MaxBytesError
+		switch {
+		case errors.Is(err, store.ErrQuotaExceeded):
+			writeError(w, http.StatusInsufficientStorage,
+				"容量クォータを超過しています(不要なファイルを削除してください)")
+		case errors.Is(err, store.ErrTooLarge), errors.As(err, &maxErr):
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("アップロードサイズが上限(%d bytes)を超えています", s.opts.MaxUploadBytes))
+		default:
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存に失敗しました: %v", err))
+		}
 		return
 	}
 	writeJSON(w, http.StatusCreated, m)
 }
 
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	m, body, err := s.store.Get(r.PathValue("id"))
+// checkOwner は id のファイルが所有者のものであることを確認する。
+// 他人のファイルは存在自体を漏らさないため 404 相当の扱いにする。
+func (s *Server) checkOwner(id string, a authed) error {
+	m, err := s.store.Manifest(id)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "ファイルが見つかりません")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		return err
+	}
+	if m.Owner != a.owner {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, a authed) {
+	id := r.PathValue("id")
+	if err := s.checkOwner(id, a); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	m, body, err := s.store.Get(id)
+	if err != nil {
+		writeStoreError(w, err)
 		return
 	}
 	defer body.Close()
@@ -91,8 +188,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	files, err := s.store.List()
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
+	files, err := s.store.List(a.owner)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -103,23 +200,37 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"files": files})
 }
 
-func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	err := s.store.Delete(r.PathValue("id"))
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "ファイルが見つかりません")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, a authed) {
+	id := r.PathValue("id")
+	if err := s.checkOwner(id, a); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if err := s.store.Delete(id); err != nil {
+		writeStoreError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleMe は呼び出しユーザーの使用量とクォータを返す。
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
+	used, err := s.store.OwnerUsage(a.owner)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":        a.user.Name,
+		"used_bytes":  used,
+		"quota_bytes": a.user.Quota,
+	})
+}
+
 // handleOptimize は chain repack(デルタチェーン再編成)を実行し、
 // 削減結果を返す。長期の世代保持でドリフトが蓄積したストアの物理容量を
 // 回収する。実行中も読み書きは可能。
-func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, _ authed) {
 	res, err := s.store.Optimize()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -128,13 +239,35 @@ func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+// handleStats はストア全体の統計を返す。集計はチャンク全走査 O(N) のため
+// TTL キャッシュする(多数ユーザーが叩いても集計は TTL ごとに1回)。
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, _ authed) {
+	s.statsMu.Lock()
+	if s.statsLast != nil && time.Since(s.statsAt) < s.opts.StatsTTL {
+		st := *s.statsLast
+		s.statsMu.Unlock()
+		writeJSON(w, http.StatusOK, &st)
+		return
+	}
+	s.statsMu.Unlock()
+
 	st, err := s.store.Stats()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.statsMu.Lock()
+	s.statsLast, s.statsAt = st, time.Now()
+	s.statsMu.Unlock()
 	writeJSON(w, http.StatusOK, st)
+}
+
+func writeStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "ファイルが見つかりません")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error())
 }
 
 func contentType(name string) string {

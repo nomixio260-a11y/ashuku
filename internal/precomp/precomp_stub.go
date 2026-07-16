@@ -41,13 +41,15 @@ type Member struct {
 var errNoCGO = errors.New("このビルドは precompression 非対応です(CGO 無効)")
 
 // TryUnwrap は常に失敗する(CGO 無効)。
-func TryUnwrap(orig []byte) (*Unwrapped, bool) { return nil, false }
+func TryUnwrap(orig []byte, maxPlain int64) (*Unwrapped, bool) { return nil, false }
 
 // TryUnwrapZlib は常に失敗する(CGO 無効)。
-func TryUnwrapZlib(orig []byte) (*Unwrapped, bool) { return nil, false }
+func TryUnwrapZlib(orig []byte, maxPlain int64) (*Unwrapped, bool) { return nil, false }
 
 // TryUnwrapGzipMulti は常に失敗する(CGO 無効)。
-func TryUnwrapGzipMulti(orig []byte) ([]byte, []Member, bool) { return nil, nil, false }
+func TryUnwrapGzipMulti(orig []byte, maxPlain int64) ([]byte, []Member, bool) {
+	return nil, nil, false
+}
 
 // Reconstruct は常にエラーを返す(CGO 無効)。
 func Reconstruct(header []byte, level int, plain []byte) ([]byte, error) {
