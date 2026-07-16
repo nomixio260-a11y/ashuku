@@ -35,6 +35,9 @@ type FsckResult struct {
 	BrokenFiles []AffectedFile `json:"broken_files,omitempty"`
 	// UsageMismatches は所有者使用量が実際のファイル合計と食い違った所有者数。
 	UsageMismatches int `json:"usage_mismatches"`
+	// FileIndexMismatches は所有者→ファイル索引(fileowners)の不整合数
+	// (存在しないファイルを指す孤児エントリ + 実在ファイルに対する欠損エントリ)。
+	FileIndexMismatches int `json:"file_index_mismatches"`
 	// Repaired は修復が実行されたか。
 	Repaired bool `json:"repaired"`
 }
@@ -42,7 +45,8 @@ type FsckResult struct {
 // Healthy は不整合がなかったかを返す。
 func (r *FsckResult) Healthy() bool {
 	return r.RefcountMismatches == 0 && r.OrphanChunks == 0 &&
-		r.DanglingRefs == 0 && r.UsageMismatches == 0
+		r.DanglingRefs == 0 && r.UsageMismatches == 0 &&
+		r.FileIndexMismatches == 0
 }
 
 // Fsck はメタデータの整合性を検証する。repair が真なら、参照カウントの
@@ -63,6 +67,7 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 		expected := map[string]int64{}     // チャンク → 期待 RefCount
 		manifestRefs := map[string]int64{} // チャンク → マニフェスト参照数
 		ownerSize := map[string]int64{}    // 所有者 → 論理サイズ合計
+		expectedIdx := map[string]bool{}   // 期待する fileowners キー
 		var brokenFiles []AffectedFile
 		chunks := tx.Bucket(bucketChunks)
 
@@ -72,6 +77,7 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 				return err
 			}
 			ownerSize[m.Owner] += m.Size
+			expectedIdx[string(ownerFileKey(m.Owner, m.ID))] = true
 			broken := false
 			for _, h := range m.Chunks {
 				manifestRefs[h]++
@@ -153,6 +159,33 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 			return err
 		}
 
+		// 3.5) 所有者→ファイル索引(fileowners)の照合
+		var idxOrphans [][]byte // 実在しないファイルを指すエントリ(削除する)
+		seenIdx := map[string]bool{}
+		err = tx.Bucket(bucketFileOwners).ForEach(func(k, _ []byte) error {
+			ks := string(k)
+			seenIdx[ks] = true
+			if !expectedIdx[ks] {
+				res.FileIndexMismatches++
+				if repair {
+					idxOrphans = append(idxOrphans, append([]byte(nil), k...))
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		var idxMissing [][]byte // 実在ファイルに欠けているエントリ(追加する)
+		for ks := range expectedIdx {
+			if !seenIdx[ks] {
+				res.FileIndexMismatches++
+				if repair {
+					idxMissing = append(idxMissing, []byte(ks))
+				}
+			}
+		}
+
 		if !repair {
 			return nil
 		}
@@ -187,6 +220,17 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 		}
 		for _, f := range usageFixes {
 			if err := setOwnerUsage(tx, f.owner, f.want); err != nil {
+				return err
+			}
+		}
+		idx := tx.Bucket(bucketFileOwners)
+		for _, k := range idxOrphans {
+			if err := idx.Delete(k); err != nil {
+				return err
+			}
+		}
+		for _, k := range idxMissing {
+			if err := idx.Put(k, nil); err != nil {
 				return err
 			}
 		}

@@ -175,7 +175,11 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 	var chunkSize int
 	err = db.Update(func(tx *bolt.Tx) error {
 		chunkSize, err = resolveAvgChunkSize(tx, requested)
-		return err
+		if err != nil {
+			return err
+		}
+		// 所有者→ファイル索引を(未構築なら)一度だけ全ファイルから再構築する。
+		return migrateFileOwners(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -950,7 +954,7 @@ func (s *Store) Delete(id string) error {
 		if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, -1); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketFiles).Delete([]byte(id))
+		return deleteFileManifest(tx, m)
 	})
 	if err != nil {
 		return err
@@ -1029,18 +1033,25 @@ func (s *Store) removeChunkFiles(paths []string) {
 func (s *Store) List(owner string) ([]*FileManifest, error) {
 	var files []*FileManifest
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
-			var m FileManifest
-			if err := json.Unmarshal(v, &m); err != nil {
-				return err
+		// 所有者索引をプレフィックス走査し、その所有者のファイルだけを引く
+		// (店全体を走査しないので、他ユーザーのファイル数に影響されない)。
+		prefix := ownerFilePrefix(owner)
+		fb := tx.Bucket(bucketFiles)
+		c := tx.Bucket(bucketFileOwners).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+			id := k[len(prefix):]
+			raw := fb.Get(id)
+			if raw == nil {
+				continue // 索引に対応するファイルが無い(fsck が掃除する)
 			}
-			if m.Owner != owner {
-				return nil
+			var m FileManifest
+			if err := json.Unmarshal(raw, &m); err != nil {
+				return err
 			}
 			m.Chunks = nil // 一覧にはチャンク列は不要
 			files = append(files, &m)
-			return nil
-		})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

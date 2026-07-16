@@ -29,9 +29,20 @@ var (
 	bucketOwnerChunks = []byte("ownerchunks")
 	// bucketRegions はリージョンごとの使用量(圧縮後サイズ・メンバー数・生存数)。
 	bucketRegions = []byte("regions")
+	// bucketFileOwners は「所有者 → ファイルID」の二次索引。
+	// キーは ownerKey(owner) + 0x1F + fileID、値は空。List(owner) を
+	// 全ファイル走査(O(総ファイル数))から O(その所有者のファイル数)にする。
+	// 多数のユーザーが多数の小ファイルを持つ運用で、一覧取得が店全体の規模に
+	// 比例して遅くなる問題を防ぐ。
+	bucketFileOwners = []byte("fileowners")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
+
+// keyFileOwnersMigrated は fileowners 索引のバックフィル完了フラグ。
+// 索引導入前に作られた既存ストアを開いたとき、一度だけ全ファイルから
+// 索引を再構築する(以降は putFileManifest/deleteFileManifest が維持する)。
+var keyFileOwnersMigrated = []byte("fileowners_migrated_v1")
 
 // FileManifest は保存済みファイル1件のメタデータ。
 type FileManifest struct {
@@ -125,7 +136,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks, bucketRegions} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks, bucketRegions, bucketFileOwners} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -156,7 +167,57 @@ func putFileManifest(tx *bolt.Tx, m *FileManifest) error {
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(bucketFiles).Put([]byte(m.ID), raw)
+	if err := tx.Bucket(bucketFiles).Put([]byte(m.ID), raw); err != nil {
+		return err
+	}
+	// 所有者→ファイルの二次索引を維持(存在確認用の空値)。
+	return tx.Bucket(bucketFileOwners).Put(ownerFileKey(m.Owner, m.ID), nil)
+}
+
+// deleteFileManifest はマニフェストと所有者索引を同一トランザクションで消す。
+func deleteFileManifest(tx *bolt.Tx, m *FileManifest) error {
+	if err := tx.Bucket(bucketFileOwners).Delete(ownerFileKey(m.Owner, m.ID)); err != nil {
+		return err
+	}
+	return tx.Bucket(bucketFiles).Delete([]byte(m.ID))
+}
+
+// ownerFileKey は fileowners バケットのキー(所有者キー + 0x1F + ファイルID)。
+// 区切りの 0x1F により、ある所有者IDが別の所有者IDの接頭辞であっても
+// プレフィックス走査が混ざらない(例: "u" と "u2")。
+func ownerFileKey(owner, id string) []byte {
+	ok := ownerKey(owner)
+	key := make([]byte, 0, len(ok)+1+len(id))
+	key = append(key, ok...)
+	key = append(key, 0x1F)
+	return append(key, id...)
+}
+
+// ownerFilePrefix は List(owner) のプレフィックス走査に使うキー接頭辞。
+func ownerFilePrefix(owner string) []byte {
+	ok := ownerKey(owner)
+	return append(ok, 0x1F)
+}
+
+// migrateFileOwners は fileowners 索引が未構築なら全ファイルから一度だけ
+// 構築する(索引導入前に作られたストアの移行)。以降はフラグで飛ばす。
+func migrateFileOwners(tx *bolt.Tx) error {
+	settings := tx.Bucket(bucketSettings)
+	if settings.Get(keyFileOwnersMigrated) != nil {
+		return nil
+	}
+	idx := tx.Bucket(bucketFileOwners)
+	err := tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
+		var m FileManifest
+		if err := json.Unmarshal(v, &m); err != nil {
+			return err
+		}
+		return idx.Put(ownerFileKey(m.Owner, m.ID), nil)
+	})
+	if err != nil {
+		return err
+	}
+	return settings.Put(keyFileOwnersMigrated, []byte{1})
 }
 
 func getChunkMeta(tx *bolt.Tx, hash string) (*ChunkMeta, error) {
