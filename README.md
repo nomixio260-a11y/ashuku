@@ -122,6 +122,27 @@ go build -o ashuku ./cmd/ashuku
 | `GET` | `/api/v1/me` | 呼び出しユーザーの使用量とクォータ |
 | `POST` | `/api/v1/optimize` | chain repack を即時実行(通常は `-optimize-every` の自動実行で十分) |
 
+### CLIクライアント(推奨: サーバーコスト最小)
+
+圧縮・展開・チャンク分割をクライアント側で行う `ashuku-cli` を使うと、
+サーバーの仕事は「検証(伸長+SHA-256)と保存」だけになります。
+実測(1.16GBテキスト): サーバーCPU **−70%**、サーバーメモリ **−91%**(RSS 40MB)、
+転送量 **−99.2%**(9.1MB)。サーバーに既にあるチャンクは転送すらされません。
+
+```sh
+go build -o ashuku-cli ./cmd/ashuku-cli
+ashuku-cli -server http://host:8080 -key APIキー put backup.tar   # → ID
+ashuku-cli -server http://host:8080 -key APIキー get <ID> restored.tar
+ashuku-cli ... ls / rm <ID>
+```
+
+- チャンクごとに SHA-256 検証つき(アップロード時はサーバーが検証して
+  共有重複排除の汚染を防ぎ、ダウンロード時はクライアントが検証)
+- クライアント経路のチャンクは、バックグラウンドのオフラインデルタパスが
+  後追いで類似デルタに圧縮し直します(取り込みは軽く、圧縮率は維持)
+- チャンク直接ダウンロードは「自分のマニフェストが参照しているチャンク」
+  のみに制限されます(ハッシュを知っているだけでは取得不可)
+
 ### 多人数運用(認証・クォータ)
 
 ```sh

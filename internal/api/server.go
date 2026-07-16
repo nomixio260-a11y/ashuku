@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"sync"
 	"time"
 
@@ -65,6 +66,13 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/me", s.auth(s.handleMe))
 	s.mux.HandleFunc("GET /api/v1/stats", s.auth(s.handleStats))
 	s.mux.HandleFunc("POST /api/v1/optimize", s.auth(s.handleOptimize))
+	// クライアント支援プロトコル(圧縮・展開・分割をクライアント側で行う)
+	s.mux.HandleFunc("GET /api/v1/config", s.auth(s.handleConfig))
+	s.mux.HandleFunc("POST /api/v1/chunks/missing", s.auth(s.handleChunksMissing))
+	s.mux.HandleFunc("PUT /api/v1/chunks/{hash}", s.auth(s.handleChunkPut))
+	s.mux.HandleFunc("GET /api/v1/chunks/{hash}", s.auth(s.handleChunkGet))
+	s.mux.HandleFunc("POST /api/v1/manifests", s.auth(s.handleManifestCommit))
+	s.mux.HandleFunc("GET /api/v1/manifests/{id}", s.auth(s.handleManifestGet))
 	return s
 }
 
@@ -260,6 +268,150 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, _ authed) {
 	s.statsLast, s.statsAt = st, time.Now()
 	s.statsMu.Unlock()
 	writeJSON(w, http.StatusOK, st)
+}
+
+// ---- クライアント支援プロトコル ----
+//
+// 圧縮・展開・チャンク分割をクライアント側で行い、サーバーは検証と保存
+// だけを担う(サーバーCPU: 圧縮 10〜50MB/s → 検証用伸長 500MB/s 超)。
+// 流れ: GET /config → クライアントが FastCDC 分割+SHA-256 →
+// POST /chunks/missing で無いチャンクを特定 → PUT /chunks/{hash} で
+// 圧縮済みチャンクを送信 → POST /manifests で確定。
+// ダウンロードは GET /manifests/{id} + GET /chunks/{hash} を並列取得し、
+// クライアントが伸長・結合する。
+
+// handleConfig はクライアントが分割・圧縮パラメータを揃えるための情報を返す。
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request, _ authed) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"avg_chunk_size":   s.store.AvgChunkSize(),
+		"max_upload_bytes": s.opts.MaxUploadBytes,
+	})
+}
+
+// maxMissingQuery は1回の missing 問い合わせで受け付けるハッシュ数の上限。
+const maxMissingQuery = 10000
+
+func (s *Server) handleChunksMissing(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Hashes []string `json:"hashes"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "JSONを解析できません")
+		return
+	}
+	if len(req.Hashes) > maxMissingQuery {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("1回の問い合わせは %d ハッシュまでです", maxMissingQuery))
+		return
+	}
+	missing, err := s.store.HasChunks(req.Hashes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if missing == nil {
+		missing = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"missing": missing})
+}
+
+func (s *Server) handleChunkPut(w http.ResponseWriter, r *http.Request, _ authed) {
+	hash := r.PathValue("hash")
+	rawSize, _ := strconv.ParseInt(r.Header.Get("X-Raw-Size"), 10, 64)
+	compression := r.Header.Get("X-Compression")
+	if compression == "" {
+		compression = "zstd"
+	}
+	// チャンクは高々 平均×4+圧縮ヘッダ ぶんしか受け取らない(メモリ上限)
+	limit := int64(s.store.AvgChunkSize())*4 + 8192
+	stored, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if int64(len(stored)) > limit {
+		writeError(w, http.StatusRequestEntityTooLarge, "チャンクが大きすぎます")
+		return
+	}
+	if err := s.store.PutChunkVerified(hash, stored, compression, rawSize); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (s *Server) handleChunkGet(w http.ResponseWriter, r *http.Request, a authed) {
+	// 読み出し権チェック: 呼び出しユーザーが自分のマニフェスト経由で参照
+	// しているチャンクだけを返す。「存在確認に成功した」ことと「読み出せる」
+	// ことを分離し、ハッシュだけを知る攻撃者のデータ窃取(Dark Clouds 型)を
+	// 防ぐ(USENIX Sec'11、RESEARCH.md 参照)。
+	hash := r.PathValue("hash")
+	ok, err := s.store.OwnerHasChunk(a.owner, hash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeStoreError(w, store.ErrNotFound)
+		return
+	}
+	data, compression, rawSize, err := s.store.ChunkRep(hash)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("X-Compression", compression)
+	w.Header().Set("X-Raw-Size", strconv.FormatInt(rawSize, 10))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(data)
+}
+
+func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a authed) {
+	var req struct {
+		Name   string   `json:"name"`
+		Chunks []string `json:"chunks"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "JSONを解析できません")
+		return
+	}
+	if req.Name == "" {
+		req.Name = "unnamed"
+	}
+	req.Name = path.Base(req.Name)
+
+	m, missing, err := s.store.CommitClientManifest(
+		req.Name, a.owner, req.Chunks, a.user.Quota, s.opts.MaxUploadBytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrChunksMissing):
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": err.Error(), "missing": missing,
+			})
+		case errors.Is(err, store.ErrQuotaExceeded):
+			writeError(w, http.StatusInsufficientStorage, "容量クォータを超過しています")
+		case errors.Is(err, store.ErrTooLarge):
+			writeError(w, http.StatusRequestEntityTooLarge, "アップロードサイズが上限を超えています")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
+}
+
+func (s *Server) handleManifestGet(w http.ResponseWriter, r *http.Request, a authed) {
+	id := r.PathValue("id")
+	m, err := s.store.Manifest(id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if m.Owner != a.owner {
+		writeStoreError(w, store.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {

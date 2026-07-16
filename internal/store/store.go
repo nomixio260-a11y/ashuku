@@ -503,6 +503,9 @@ func (s *Store) commitManifest(m *FileManifest, quota int64) error {
 		if err := addOwnerUsage(tx, m.Owner, m.Size); err != nil {
 			return err
 		}
+		if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, 1); err != nil {
+			return err
+		}
 		return putFileManifest(tx, m)
 	})
 	if err != nil {
@@ -585,7 +588,9 @@ func (s *Store) storeChunk(hash string, data []byte, mode string) error {
 			}
 		}
 
-		newMeta := &ChunkMeta{RawSize: int64(len(data)), RefCount: 1, Features: features}
+		// サーバー経路の取り込みはこの場でデルタ判定済みなので、
+		// オフラインデルタパスの対象から外す。
+		newMeta := &ChunkMeta{RawSize: int64(len(data)), RefCount: 1, Features: features, DeltaTried: true}
 		var stored []byte
 		switch {
 		case baseHash != "":
@@ -897,6 +902,9 @@ func (s *Store) Delete(id string) error {
 			return err
 		}
 		if err := addOwnerUsage(tx, m.Owner, -m.Size); err != nil {
+			return err
+		}
+		if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, -1); err != nil {
 			return err
 		}
 		return tx.Bucket(bucketFiles).Delete([]byte(id))

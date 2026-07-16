@@ -23,6 +23,10 @@ var (
 	bucketPacks = []byte("packs")
 	// bucketUsers は所有者ごとの論理使用量(バイト、int64 BigEndian)。
 	bucketUsers = []byte("users")
+	// bucketOwnerChunks は「所有者がマニフェスト経由で参照しているチャンク」の
+	// 参照数索引。チャンク直接ダウンロードの読み出し権チェックに使う
+	// (ハッシュを知っているだけでは他人のデータを取得できないようにする)。
+	bucketOwnerChunks = []byte("ownerchunks")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
@@ -87,6 +91,13 @@ type ChunkMeta struct {
 	// (長さは StoredSize)。PackID が空ならファイル表現(hash+Rep 名)。
 	PackID  string `json:"pack,omitempty"`
 	PackOff int64  `json:"poff,omitempty"`
+	// Staged はクライアント直接アップロードされ、まだどのマニフェストにも
+	// コミットされていないチャンクの登録時刻(unix秒)。RefCount==0 のまま
+	// TTL を過ぎると Optimize が掃除する。
+	Staged int64 `json:"staged,omitempty"`
+	// DeltaTried はデルタ圧縮の適用判定を済ませたことを示す
+	// (オフラインデルタパスが同じチャンクを繰り返し評価しないため)。
+	DeltaTried bool `json:"dt,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
 }
@@ -97,7 +108,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -179,6 +190,49 @@ func addOwnerUsage(tx *bolt.Tx, owner string, delta int64) error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(used))
 	return tx.Bucket(bucketUsers).Put(ownerKey(owner), buf[:])
+}
+
+// ownerChunkKey は ownerchunks バケットのキー(所有者キー + 0x1F + ハッシュ)。
+func ownerChunkKey(owner, hash string) []byte {
+	ok := ownerKey(owner)
+	key := make([]byte, 0, len(ok)+1+len(hash))
+	key = append(key, ok...)
+	key = append(key, 0x1F)
+	return append(key, hash...)
+}
+
+// addOwnerChunkRefs は所有者のチャンク参照数を hashes の出現回数ぶん増減する。
+func addOwnerChunkRefs(tx *bolt.Tx, owner string, hashes []string, delta int64) error {
+	b := tx.Bucket(bucketOwnerChunks)
+	counts := make(map[string]int64)
+	for _, h := range hashes {
+		counts[h] += delta
+	}
+	for h, d := range counts {
+		key := ownerChunkKey(owner, h)
+		var cur int64
+		if raw := b.Get(key); len(raw) == 8 {
+			cur = int64(binary.BigEndian.Uint64(raw))
+		}
+		cur += d
+		if cur <= 0 {
+			if err := b.Delete(key); err != nil {
+				return err
+			}
+			continue
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(cur))
+		if err := b.Put(key, buf[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ownerHasChunk は所有者がマニフェスト経由でチャンクを参照しているかを返す。
+func ownerHasChunk(tx *bolt.Tx, owner, hash string) bool {
+	return tx.Bucket(bucketOwnerChunks).Get(ownerChunkKey(owner, hash)) != nil
 }
 
 func putPackMeta(tx *bolt.Tx, packID string, pm *packMeta) error {

@@ -48,6 +48,12 @@ type OptimizeResult struct {
 	// ファイルからは削除済みだが子デルタのベースとしてのみ生き残っている
 	// チャンク(保持期限削除後にディスクを占有し続ける主因)。
 	ZombiesFreed int `json:"zombies_freed"`
+	// DeltaUpgraded はオフラインデルタパスでデルタ化されたチャンク数
+	// (クライアント直接アップロード分は取り込み時にデルタを試みないため、
+	// ここで後追い圧縮される)。
+	DeltaUpgraded int `json:"delta_upgraded"`
+	// StagedSwept は TTL 超過で掃除された未コミットチャンク数。
+	StagedSwept int `json:"staged_swept"`
 }
 
 // minStarSize はこの数以上の子を持つベースだけを再編成対象にする。
@@ -82,11 +88,86 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 			break
 		}
 	}
+	// オフラインデルタパス: 取り込み時にデルタ判定をしていないチャンク
+	// (クライアント直接アップロード分)を、背景で類似デルタに圧縮し直す。
+	if s.delta {
+		if err := s.offlineDeltaPass(res); err != nil {
+			return res, err
+		}
+	}
+	// TTL を過ぎた未コミット(staged)チャンクを掃除する。
+	if err := s.sweepStagedChunks(res); err != nil {
+		return res, err
+	}
 	// repack・救出で解放された領域を含め、live 率の低いパックを回収する。
 	if err := s.compactPacks(res); err != nil {
 		return res, err
 	}
 	return res, nil
+}
+
+// offlineDeltaPass はデルタ未判定(DeltaTried=false)の非デルタチャンクに
+// 対して類似候補とのデルタ圧縮を試みる。取り込み経路の CPU を最小化しつつ
+// (サーバーは検証だけ)、圧縮率は背景で回収する、という分担のための機構。
+// 判定結果は成否にかかわらず DeltaTried に記録し、再評価しない。
+func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
+	type cand struct {
+		hash     string
+		features []uint64
+	}
+	var todo []cand
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
+			if !meta.DeltaTried && meta.Compression != compressionDelta &&
+				meta.RefCount > 0 && len(meta.Features) > 0 {
+				todo = append(todo, cand{hash: hash, features: append([]uint64(nil), meta.Features...)})
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, c := range todo {
+		// 類似候補を検索(自分自身は除く)
+		var base string
+		s.db.View(func(tx *bolt.Tx) error {
+			for _, h := range lookupSketches(tx, c.features) {
+				if h == c.hash {
+					continue
+				}
+				meta, err := getChunkMeta(tx, h)
+				if err == nil && meta != nil && meta.Depth < s.maxDepth {
+					base = h
+					break
+				}
+			}
+			return nil
+		})
+		if base != "" {
+			done, err := s.repackChunk(c.hash, base, res)
+			if err != nil {
+				return err
+			}
+			if done {
+				res.DeltaUpgraded++
+			}
+		}
+		// 成否にかかわらず判定済みを記録
+		err = s.db.Update(func(tx *bolt.Tx) error {
+			meta, err := getChunkMeta(tx, c.hash)
+			if err != nil || meta == nil {
+				return err
+			}
+			meta.DeltaTried = true
+			return putChunkMeta(tx, c.hash, meta)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // rescueZombies は1パスのゾンビ救出を行い、解放できたゾンビ数を返す。
