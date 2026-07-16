@@ -32,6 +32,9 @@ func main() {
 		"chain repack(デルタチェーン再編成)の自動実行間隔。0 で無効")
 	scrubEvery := flag.Duration("scrub-every", 24*time.Hour,
 		"データ完全性スクラブ(bit rot 検出)の自動実行間隔。0 で無効")
+	metaBackupEvery := flag.Duration("meta-backup-every", time.Hour,
+		"メタデータ(bbolt)の自動バックアップ間隔。0 で無効")
+	metaBackupKeep := flag.Int("meta-backup-keep", 24, "保持するメタバックアップ世代数")
 	precompFlag := flag.Bool("precomp", true,
 		"gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ")
 	precompMax := flag.String("precomp-max", "64M",
@@ -116,6 +119,19 @@ func main() {
 			} else {
 				log.Printf("スクラブ: %d チャンク検証、破損なし", res.ChunksChecked)
 			}
+		})
+	}
+
+	// 定期メタバックアップ: meta.db は単一障害点なので一貫スナップショットを
+	// 別ディレクトリへ取り、世代保持する。
+	if *metaBackupEvery > 0 {
+		go runPeriodic("メタバックアップ", *metaBackupEvery, func() {
+			path, n, err := st.BackupMetaRotating(time.Now(), *metaBackupKeep)
+			if err != nil {
+				log.Printf("メタバックアップに失敗: %v", err)
+				return
+			}
+			log.Printf("メタバックアップ: %s (%d bytes)", path, n)
 		})
 	}
 

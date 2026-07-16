@@ -471,6 +471,34 @@ func (c *Client) Scrub() (map[string]any, error) {
 	return out, nil
 }
 
+// Fsck はメタデータ整合性チェックをサーバーに実行させる(repair で修復)。
+func (c *Client) Fsck(repair bool) (map[string]any, error) {
+	if err := c.init(); err != nil {
+		return nil, err
+	}
+	path := "/api/v1/fsck"
+	if repair {
+		path += "?repair=1"
+	}
+	req, err := c.req("POST", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, httpError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Me は呼び出しユーザーの使用量とクォータを取得する。
 func (c *Client) Me() (map[string]any, error) {
 	if err := c.init(); err != nil {

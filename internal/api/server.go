@@ -74,6 +74,7 @@ func New(st *store.Store, opts Options) *Server {
 	s.mux.HandleFunc("GET /api/v1/stats", s.auth(s.handleStats))
 	s.mux.HandleFunc("POST /api/v1/optimize", s.auth(s.handleOptimize))
 	s.mux.HandleFunc("POST /api/v1/scrub", s.auth(s.handleScrub))
+	s.mux.HandleFunc("POST /api/v1/fsck", s.auth(s.handleFsck))
 	// ヘルスチェック(認証不要。ロードバランサ・監視用)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	// クライアント支援プロトコル(圧縮・展開・分割をクライアント側で行う)
@@ -282,6 +283,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // 破損があれば 200 で結果を返す(検出は成功しているため)。
 func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, _ authed) {
 	res, err := s.store.Scrub()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleFsck はメタデータ整合性を検証する。?repair=1 で修復も行う。
+func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, _ authed) {
+	repair := r.URL.Query().Get("repair") == "1"
+	res, err := s.store.Fsck(repair)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

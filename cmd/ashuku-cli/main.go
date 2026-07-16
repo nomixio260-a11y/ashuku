@@ -53,6 +53,8 @@ func main() {
 		err = cmdMe(c)
 	case "scrub":
 		err = cmdScrub(c)
+	case "fsck":
+		err = cmdFsck(c, args[1:])
 	default:
 		usage()
 	}
@@ -63,7 +65,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID> | stats | me | scrub")
+	fmt.Fprintln(os.Stderr, "使い方: ashuku-cli [-server URL] [-key KEY] put <ファイル> [名前] | get <ID> <出力先> | ls | rm <ID> | stats | me | scrub | fsck [--repair]")
 	os.Exit(2)
 }
 
@@ -168,6 +170,32 @@ func cmdScrub(c *client.Client) error {
 		if m, ok := f.(map[string]any); ok {
 			fmt.Printf("  影響: %v  %v\n", m["id"], m["name"])
 		}
+	}
+	return nil
+}
+
+func cmdFsck(c *client.Client, args []string) error {
+	repair := len(args) > 0 && args[0] == "--repair"
+	res, err := c.Fsck(repair)
+	if err != nil {
+		return err
+	}
+	rc, _ := res["refcount_mismatches"].(float64)
+	orphan, _ := res["orphan_chunks"].(float64)
+	dangling, _ := res["dangling_refs"].(float64)
+	usage, _ := res["usage_mismatches"].(float64)
+	if rc == 0 && orphan == 0 && dangling == 0 && usage == 0 {
+		fmt.Println("メタ整合性OK: 不整合なし")
+		return nil
+	}
+	verb := "検出"
+	if repair {
+		verb = "修復"
+	}
+	fmt.Printf("メタ不整合を%s: 参照数 %.0f / 孤児 %.0f / 壊れた参照 %.0f / 使用量 %.0f\n",
+		verb, rc, orphan, dangling, usage)
+	if dangling > 0 {
+		fmt.Println("  ※ 壊れた参照(データ欠損)は修復不能です。メタバックアップからの復旧を検討してください")
 	}
 	return nil
 }

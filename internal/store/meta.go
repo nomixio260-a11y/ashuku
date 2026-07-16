@@ -180,6 +180,24 @@ func ownerKey(owner string) []byte {
 	return []byte(owner)
 }
 
+// decodeOwnerKey は ownerKey の逆変換(番兵キー {0} → "")。
+func decodeOwnerKey(key []byte) string {
+	if len(key) == 1 && key[0] == 0 {
+		return ""
+	}
+	return string(key)
+}
+
+// setOwnerUsage は所有者の論理使用量を絶対値で設定する(fsck の修復用)。
+func setOwnerUsage(tx *bolt.Tx, owner string, used int64) error {
+	if used < 0 {
+		used = 0
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(used))
+	return tx.Bucket(bucketUsers).Put(ownerKey(owner), buf[:])
+}
+
 // ownerUsage は所有者の論理使用量を返す。
 func ownerUsage(tx *bolt.Tx, owner string) (int64, error) {
 	raw := tx.Bucket(bucketUsers).Get(ownerKey(owner))
