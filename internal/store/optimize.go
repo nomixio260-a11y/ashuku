@@ -25,6 +25,8 @@ import (
 	"sort"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/nomixio260-a11y/ashuku/internal/zstdc"
 )
 
 // starChild は再編成候補(同一ベースを共有するデルタチャンク)。
@@ -52,6 +54,9 @@ type OptimizeResult struct {
 	// (クライアント直接アップロード分は取り込み時にデルタを試みないため、
 	// ここで後追い圧縮される)。
 	DeltaUpgraded int `json:"delta_upgraded"`
+	// Recompressed はオフライン再圧縮(本家 libzstd level 19)で表現が
+	// 縮んだチャンク数。
+	Recompressed int `json:"recompressed"`
 	// StagedSwept は TTL 超過で掃除された未コミットチャンク数。
 	StagedSwept int `json:"staged_swept"`
 }
@@ -145,6 +150,7 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 			}
 			return nil
 		})
+		deltaDone := false
 		if base != "" {
 			done, err := s.repackChunk(c.hash, base, res)
 			if err != nil {
@@ -152,6 +158,18 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 			}
 			if done {
 				res.DeltaUpgraded++
+				deltaDone = true
+			}
+		}
+		// デルタ化しなかったチャンクは、本家 libzstd(level 19)での
+		// 再圧縮を試す(クライアントの純Goエンコーダより 8〜10% 縮む)。
+		if !deltaDone && zstdc.Available() {
+			done, err := s.recompressChunk(c.hash, res)
+			if err != nil {
+				return err
+			}
+			if done {
+				res.Recompressed++
 			}
 		}
 		// 成否にかかわらず判定済みを記録
@@ -168,6 +186,82 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 		}
 	}
 	return nil
+}
+
+// recompressChunk はチャンクの保存表現を最強エンコーダで圧縮し直し、
+// 現表現より小さい場合のみ切り替える(表現の差し替えは repack と同じ
+// クラッシュ安全機構を使う)。
+func (s *Store) recompressChunk(hash string, res *OptimizeResult) (bool, error) {
+	data, err := s.readChunk(hash)
+	if err != nil {
+		return false, nil // 並行削除など。スキップ
+	}
+	out, err := zstdc.Compress(data)
+	if err != nil {
+		return false, nil
+	}
+
+	// 事前チェック(改善なしならファイルを書かない)
+	newRep := "z19"
+	improves := false
+	s.db.View(func(tx *bolt.Tx) error {
+		meta, err := getChunkMeta(tx, hash)
+		if err == nil && meta != nil && meta.Compression != compressionDelta &&
+			!(meta.Rep == newRep && meta.PackID == "") &&
+			int64(len(out)) < meta.StoredSize {
+			improves = true
+		}
+		return nil
+	})
+	if !improves {
+		return false, nil
+	}
+
+	loc, err := s.writeRep(hash, newRep, out)
+	if err != nil {
+		return false, err
+	}
+	done := false
+	var oldPath string
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		meta, err := getChunkMeta(tx, hash)
+		if err != nil || meta == nil {
+			return err
+		}
+		if meta.Compression == compressionDelta ||
+			int64(len(out)) >= meta.StoredSize ||
+			(meta.Rep == newRep && meta.PackID == "") {
+			return nil
+		}
+		oldSize := meta.StoredSize
+		oldPath, err = s.releaseRep(tx, hash, meta)
+		if err != nil {
+			return err
+		}
+		meta.Compression = compressionZstd
+		meta.StoredSize = int64(len(out))
+		if err := applyRepLocation(tx, meta, newRep, loc, int64(len(out))); err != nil {
+			return err
+		}
+		if err := putChunkMeta(tx, hash, meta); err != nil {
+			return err
+		}
+		res.BytesBefore += oldSize
+		res.BytesAfter += int64(len(out))
+		done = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if done {
+		if oldPath != "" {
+			os.Remove(oldPath)
+		}
+	} else {
+		s.discardNewRep(hash, newRep, loc)
+	}
+	return done, nil
 }
 
 // rescueZombies は1パスのゾンビ救出を行い、解放できたゾンビ数を返す。

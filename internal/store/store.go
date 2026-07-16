@@ -33,6 +33,7 @@ import (
 
 	"github.com/nomixio260-a11y/ashuku/internal/chunker"
 	"github.com/nomixio260-a11y/ashuku/internal/precomp"
+	"github.com/nomixio260-a11y/ashuku/internal/zstdc"
 )
 
 // ErrNotFound は指定IDのファイルが存在しないことを示す。
@@ -260,7 +261,7 @@ func (s *Store) compressChunk(data []byte, mode string) []byte {
 	case "balanced":
 		return s.encBalanced.EncodeAll(data, out)
 	case "max":
-		return s.encBest.EncodeAll(data, out)
+		return s.bestCompress(data)
 	default: // auto
 		if len(data) < 128<<10 {
 			return s.encBalanced.EncodeAll(data, out)
@@ -269,12 +270,25 @@ func (s *Store) compressChunk(data []byte, mode string) []byte {
 		if len(quick)*10 >= len(data)*9 {
 			return quick // ほぼ縮まない → 重い再圧縮は無駄
 		}
-		best := s.encBest.EncodeAll(data, make([]byte, 0, len(quick)))
+		best := s.bestCompress(data)
 		if len(best) < len(quick) {
 			return best
 		}
 		return quick
 	}
+}
+
+// bestCompress は使える中で最強のエンコーダで圧縮する。
+// 本家 libzstd(level 19)が使えるビルドではそれを使い(純Go最高レベル
+// = 本家 level 11 相当より、テキスト系で 8〜10% 小さい)、
+// 出力は標準 zstd フレームなので復号側は変わらない。
+func (s *Store) bestCompress(data []byte) []byte {
+	if zstdc.Available() {
+		if out, err := zstdc.Compress(data); err == nil {
+			return out
+		}
+	}
+	return s.encBest.EncodeAll(data, make([]byte, 0, len(data)/2))
 }
 
 // Close はストアを閉じる。
