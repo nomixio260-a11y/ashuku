@@ -861,6 +861,16 @@ func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("チャンクメタデータがありません")
 	}
 
+	// リージョン(ソリッド圧縮)内のチャンクは専用パスで取り出す。
+	if meta.RegionID != "" {
+		data, err := s.readChunkFromRegion(hash, meta)
+		if err != nil {
+			return nil, err
+		}
+		s.cache.put(hash, data)
+		return data, nil
+	}
+
 	var stored []byte
 	if meta.PackID != "" {
 		stored, err = s.readFromPack(meta.PackID, meta.PackOff, meta.StoredSize)
@@ -1061,6 +1071,8 @@ type Stats struct {
 	PackCount int `json:"pack_count"`
 	// PackGarbageBytes はパック内の解放済み領域(次のコンパクションで回収)。
 	PackGarbageBytes int64 `json:"pack_garbage_bytes"`
+	// RegionCount はリージョン(ソリッド圧縮)ファイル数。
+	RegionCount int `json:"region_count"`
 	// chunkedLogical はチャンク化視点の論理サイズ合計(precompression 適用
 	// ファイルは展開データのサイズ)。DedupRatio の分子に使う内部値。
 	chunkedLogical int64
@@ -1103,13 +1115,25 @@ func (s *Store) Stats() (*Stats, error) {
 		}); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketPacks).ForEach(func(_, v []byte) error {
+		if err := tx.Bucket(bucketPacks).ForEach(func(_, v []byte) error {
 			var pm packMeta
 			if err := unmarshalPackMeta(v, &pm); err != nil {
 				return err
 			}
 			st.PackCount++
 			st.PackGarbageBytes += pm.TotalBytes - pm.LiveBytes
+			return nil
+		}); err != nil {
+			return err
+		}
+		// リージョンチャンクは StoredSize=0 なので、圧縮後サイズはここで計上する。
+		return tx.Bucket(bucketRegions).ForEach(func(_, v []byte) error {
+			var rm regionMeta
+			if err := json.Unmarshal(v, &rm); err != nil {
+				return err
+			}
+			st.RegionCount++
+			st.PhysicalBytes += rm.StoredSize
 			return nil
 		})
 	})

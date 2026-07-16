@@ -263,6 +263,15 @@ func (s *Store) ChunkRep(hash string) (data []byte, compression string, rawSize 
 	if meta == nil {
 		return nil, "", 0, ErrNotFound
 	}
+	// リージョン内チャンクはソリッド表現なので単独では返せない。
+	// 展開して raw で返す(クライアントは再圧縮せずそのまま検証する)。
+	if meta.RegionID != "" {
+		raw, err := s.readChunk(hash)
+		if err != nil {
+			return nil, "", 0, err
+		}
+		return raw, "none", meta.RawSize, nil
+	}
 	switch meta.Compression {
 	case compressionZstd, compressionRaw:
 		var stored []byte

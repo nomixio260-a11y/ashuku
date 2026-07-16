@@ -59,6 +59,12 @@ type OptimizeResult struct {
 	Recompressed int `json:"recompressed"`
 	// StagedSwept は TTL 超過で掃除された未コミットチャンク数。
 	StagedSwept int `json:"staged_swept"`
+	// RegionsBuilt / RegionChunks はリージョン(ソリッド)圧縮でまとめた
+	// リージョン数とメンバーチャンク数。
+	RegionsBuilt int `json:"regions_built"`
+	RegionChunks int `json:"region_chunks"`
+	// RegionsCompacted は生存率低下で解体したリージョン数。
+	RegionsCompacted int `json:"regions_compacted"`
 }
 
 // minStarSize はこの数以上の子を持つベースだけを再編成対象にする。
@@ -102,6 +108,15 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 	}
 	// TTL を過ぎた未コミット(staged)チャンクを掃除する。
 	if err := s.sweepStagedChunks(res); err != nil {
+		return res, err
+	}
+	// リージョン(ソリッド)圧縮: ファイル順に連続する独立チャンクをまとめて
+	// 再圧縮し、チャンクをまたぐ冗長性を回収する。先に生存率の低いリージョンを
+	// 解体してから詰め直す。
+	if err := s.compactRegions(res); err != nil {
+		return res, err
+	}
+	if err := s.buildRegions(res); err != nil {
 		return res, err
 	}
 	// repack・救出で解放された領域を含め、live 率の低いパックを回収する。

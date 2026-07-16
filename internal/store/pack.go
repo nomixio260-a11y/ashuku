@@ -199,8 +199,12 @@ func applyRepLocation(tx *bolt.Tx, meta *ChunkMeta, rep string, loc repLocation,
 }
 
 // releaseRep は表現の解放を計上する(tx 内)。ファイル表現なら削除すべき
-// パスを返し、パック表現なら live を減らして空文字を返す。
+// パスを返し、パック/リージョン表現なら使用量を減らして空文字を返す
+// (リージョンは LiveCount が 0 になったときに削除パスを返す)。
 func (s *Store) releaseRep(tx *bolt.Tx, hash string, meta *ChunkMeta) (string, error) {
+	if meta.RegionID != "" {
+		return s.releaseRegionMember(tx, meta.RegionID)
+	}
 	if meta.PackID != "" {
 		return "", adjustPackUsage(tx, meta.PackID, 0, -meta.StoredSize)
 	}

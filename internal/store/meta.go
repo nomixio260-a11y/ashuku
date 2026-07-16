@@ -27,6 +27,8 @@ var (
 	// 参照数索引。チャンク直接ダウンロードの読み出し権チェックに使う
 	// (ハッシュを知っているだけでは他人のデータを取得できないようにする)。
 	bucketOwnerChunks = []byte("ownerchunks")
+	// bucketRegions はリージョンごとの使用量(圧縮後サイズ・メンバー数・生存数)。
+	bucketRegions = []byte("regions")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
@@ -95,6 +97,12 @@ type ChunkMeta struct {
 	// (長さは StoredSize)。PackID が空ならファイル表現(hash+Rep 名)。
 	PackID  string `json:"pack,omitempty"`
 	PackOff int64  `json:"poff,omitempty"`
+	// RegionID / RegionOff はリージョン(複数チャンクをまとめて1本の zstd で
+	// ソリッド圧縮した保存単位)内の位置。RegionID が非空なら、このチャンクの
+	// 生バイトはリージョンを伸長した [RegionOff : RegionOff+RawSize] にある。
+	// StoredSize はリージョン内の按分ではなく 0(容量はリージョン側で計上)。
+	RegionID  string `json:"reg,omitempty"`
+	RegionOff int64  `json:"roff,omitempty"`
 	// Staged はクライアント直接アップロードされ、まだどのマニフェストにも
 	// コミットされていないチャンクの登録時刻(unix秒)。RefCount==0 のまま
 	// TTL を過ぎると Optimize が掃除する。
@@ -112,7 +120,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks, bucketRegions} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}

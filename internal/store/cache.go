@@ -70,3 +70,15 @@ func (c *chunkCache) put(hash string, data []byte) {
 		c.curBytes -= int64(len(ent.data))
 	}
 }
+
+// remove はキャッシュエントリを明示的に無効化する(リージョン解体時など)。
+func (c *chunkCache) remove(hash string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[hash]; ok {
+		ent := el.Value.(cacheEntry)
+		c.order.Remove(el)
+		delete(c.entries, hash)
+		c.curBytes -= int64(len(ent.data))
+	}
+}
