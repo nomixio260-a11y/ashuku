@@ -119,6 +119,11 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 	if err := s.buildRegions(res); err != nil {
 		return res, err
 	}
+	// 小さなファイル(単一チャンク)はファイル内グループ化から漏れるので、
+	// zstd 圧縮済みの小チャンクをファイル横断で束ねてソリッド圧縮する。
+	if err := s.buildSmallChunkRegions(res); err != nil {
+		return res, err
+	}
 	// repack・救出で解放された領域を含め、live 率の低いパックを回収する。
 	if err := s.compactPacks(res); err != nil {
 		return res, err

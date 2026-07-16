@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -175,6 +176,122 @@ func (s *Store) buildRegions(res *OptimizeResult) error {
 		}
 	}
 	return nil
+}
+
+// smallChunkMax はこのサイズ以下の独立チャンクを「小チャンク」とみなし、
+// ファイルをまたいでソリッド圧縮の対象にする。平均チャンク(1MiB)未満の
+// 小さなファイルは単一チャンクになり、buildRegions のファイル内グループ化から
+// 漏れる。多数のユーザーが小さなファイル(設定・JSON・小さなログ・
+// サムネイル等)を大量に投下すると、それぞれが独立圧縮され、ファイルを
+// またぐ共通部分(共有辞書)を取りこぼす。ここで拾い直す。
+const smallChunkMax = 512 << 10
+
+// smallRegionMaxMembers は小チャンクリージョンの最大メンバー数。
+const smallRegionMaxMembers = 64
+
+// smallRegionRawMax は小チャンクリージョンの生バイト上限。1メンバーの
+// 読み出しでこのサイズまで伸長しうる(読み出し増幅の上限)。テストから調整可能。
+var smallRegionRawMax int64 = 4 << 20
+
+// buildSmallChunkRegions は zstd 圧縮済みの小チャンクをファイル横断で集め、
+// スーパーフィーチャで内容の近いものを隣接させてから、生バイトで
+// smallRegionRawMax まで束ねて1本の zstd-19 で再圧縮する。
+//
+// packRegion の「連結圧縮後サイズ < メンバー現表現合計の場合のみ採用」
+// 判定により、束ねても縮まない組み合わせは不採用となり物理容量は後退しない。
+// 採用されなかった小チャンクは RegionTried を立て、次回以降の Optimize で
+// 同じ束を無駄に再試行しない(新しく届いた小チャンクだけが対象になる)。
+//
+// 対象を zstd 圧縮済みに限るのは、raw(圧縮不能=乱数・メディア)チャンクを
+// 束ねてもソリッド圧縮は効かず、リージョンファイルの書き捨てを増やすだけ
+// だからである。
+func (s *Store) buildSmallChunkRegions(res *OptimizeResult) error {
+	type smallChunk struct {
+		hash    string
+		raw     int64
+		feature uint64
+	}
+	var chunks []smallChunk
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
+			if meta.RegionID == "" && !meta.RegionTried &&
+				meta.Compression == compressionZstd && meta.RefCount > 0 &&
+				meta.RawSize > 0 && meta.RawSize <= smallChunkMax {
+				var f uint64
+				if len(meta.Features) > 0 {
+					f = meta.Features[0]
+				}
+				chunks = append(chunks, smallChunk{hash: hash, raw: meta.RawSize, feature: f})
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if len(chunks) < 2 {
+		return nil
+	}
+	// 内容の近いチャンク(共有スーパーフィーチャ)を隣接させ、ソリッド圧縮の
+	// 効きを最大化する。特徴が無い/一致しないチャンクはハッシュ順で安定化。
+	sort.Slice(chunks, func(i, j int) bool {
+		if chunks[i].feature != chunks[j].feature {
+			return chunks[i].feature < chunks[j].feature
+		}
+		return chunks[i].hash < chunks[j].hash
+	})
+
+	var run []string
+	var runBytes int64
+	var attempted []string
+	flush := func() error {
+		if len(run) >= 2 {
+			attempted = append(attempted, run...)
+			if err := s.packRegion(run, res); err != nil {
+				return err
+			}
+		}
+		run = run[:0]
+		runBytes = 0
+		return nil
+	}
+	for _, c := range chunks {
+		if len(run) >= smallRegionMaxMembers || (runBytes > 0 && runBytes+c.raw > smallRegionRawMax) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		run = append(run, c.hash)
+		runBytes += c.raw
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+
+	// 束ねても採用されなかった(=まだ独立 zstd 表現のままの)小チャンクに
+	// RegionTried を立て、次回の Optimize で同じ束を再試行しない。
+	if len(attempted) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, hash := range attempted {
+			meta, err := getChunkMeta(tx, hash)
+			if err != nil {
+				return err
+			}
+			if meta == nil || meta.RegionID != "" || meta.Compression != compressionZstd {
+				continue // 採用された or 状況が変わった
+			}
+			if meta.RegionTried {
+				continue
+			}
+			meta.RegionTried = true
+			if err := putChunkMeta(tx, hash, meta); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // regionEligible はチャンクがリージョン化の対象か(独立 zstd/raw 表現で、

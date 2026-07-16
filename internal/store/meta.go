@@ -110,6 +110,11 @@ type ChunkMeta struct {
 	// DeltaTried はデルタ圧縮の適用判定を済ませたことを示す
 	// (オフラインデルタパスが同じチャンクを繰り返し評価しないため)。
 	DeltaTried bool `json:"dt,omitempty"`
+	// RegionTried は小チャンクのファイル横断ソリッド圧縮を試したが採用され
+	// なかったことを示す(buildSmallChunkRegions が同じ「束ねても縮まない」
+	// 小チャンクを Optimize のたびに再試行してディスクを空回りさせないため)。
+	// リージョン化に成功したチャンクは RegionID が非空になるので別途区別できる。
+	RegionTried bool `json:"rt,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
 }

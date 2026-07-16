@@ -68,6 +68,92 @@ func TestRegionCompressionImprovesRatioAndRoundTrips(t *testing.T) {
 	}
 }
 
+// smallVocabFile は共有語彙から作った小さなファイル(単一チャンク)を返す。
+// seed ごとに内容は違うが語彙は共有するので、ファイル横断のソリッド圧縮が
+// 効く(=多数の似た小ファイルを投下する実運用のワークロード)。
+// 互いに近似重複ではないので取り込み時のデルタには回収されない。
+func smallVocabFile(seed int64, size int) []byte {
+	rng := rand.New(rand.NewSource(1000)) // 語彙は全ファイル共通
+	vocab := make([]string, 3000)
+	for i := range vocab {
+		n := 5 + rng.Intn(10)
+		b := make([]byte, n)
+		for j := range b {
+			b[j] = byte('a' + rng.Intn(26))
+		}
+		vocab[i] = string(b)
+	}
+	r := rand.New(rand.NewSource(seed)) // 中身の並びはファイルごとに違う
+	var buf bytes.Buffer
+	buf.Grow(size + 16)
+	for buf.Len() < size {
+		buf.WriteString(vocab[r.Intn(len(vocab))])
+		buf.WriteByte(' ')
+	}
+	return buf.Bytes()[:size]
+}
+
+// 多数の小さなファイル(単一チャンク)は buildRegions のファイル内グループ化
+// から漏れる。buildSmallChunkRegions がファイル横断でソリッド圧縮し、
+// 物理容量を減らしつつ全ファイルをビット一致で復元できることを確認する。
+func TestSmallFilesCrossFileSolidCompression(t *testing.T) {
+	s := newTestStore(t)
+	const n = 200
+	const fsize = 40 << 10 // 256KiB 未満 → 各ファイル単一チャンク
+
+	ids := make([]string, n)
+	want := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		data := smallVocabFile(int64(i), fsize)
+		want[i] = data
+		ids[i] = putBytes(t, s, "small", data).ID
+	}
+
+	before, _ := s.Stats()
+	// 前提: 小ファイルは単一チャンクなので buildRegions では拾えていない
+	if before.RegionCount != 0 {
+		t.Fatalf("投入直後に想定外のリージョン %d 本", before.RegionCount)
+	}
+
+	res, err := s.Optimize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.Stats()
+
+	if res.RegionsBuilt == 0 {
+		t.Fatalf("小チャンクのファイル横断リージョンが作られていません (chunks=%d)", before.ChunkCount)
+	}
+	if after.PhysicalBytes >= before.PhysicalBytes {
+		t.Fatalf("小ファイルのソリッド圧縮で物理が減っていません: %d → %d",
+			before.PhysicalBytes, after.PhysicalBytes)
+	}
+	t.Logf("小ファイル %d 個: 物理 %d → %d (%.1f%% 削減, リージョン %d 本 %d チャンク)",
+		n, before.PhysicalBytes, after.PhysicalBytes,
+		100*(1-float64(after.PhysicalBytes)/float64(before.PhysicalBytes)),
+		res.RegionsBuilt, res.RegionChunks)
+
+	// 全ファイルがビット一致で復元できる
+	for i, id := range ids {
+		got := getBytes(t, s, id)
+		if !bytes.Equal(got, want[i]) {
+			t.Fatalf("ファイル %d の復元が一致しません", i)
+		}
+	}
+
+	// 2回目の Optimize は冪等(物理は増えず、束ねても縮まない残りは
+	// RegionTried が立って再試行されない)。
+	res2, err := s.Optimize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := s.Stats()
+	if again.PhysicalBytes > after.PhysicalBytes {
+		t.Fatalf("2回目の Optimize で物理が増えました: %d → %d", after.PhysicalBytes, again.PhysicalBytes)
+	}
+	t.Logf("2回目 Optimize: 追加リージョン %d 本(冪等)", res2.RegionsBuilt)
+}
+
 // リージョンは冪等(2回 Optimize しても壊れない・物理が増えない)。
 func TestRegionOptimizeIdempotent(t *testing.T) {
 	s := newTestStore(t)
