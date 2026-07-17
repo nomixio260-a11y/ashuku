@@ -209,3 +209,93 @@ func TestNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+// 管理操作(optimize/scrub/fsck)は @admin キーだけが実行できる。
+func TestAdminEndpointsRequireAdminKey(t *testing.T) {
+	st, err := store.Open(t.TempDir(), store.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(st, Options{Users: map[string]User{
+		"user-key":  {Name: "普通の人"},
+		"admin-key": {Name: "管理者", Admin: true},
+	}}))
+	t.Cleanup(func() { srv.Close(); st.Close() })
+
+	call := func(key, path string) int {
+		req, _ := http.NewRequest("POST", srv.URL+path, nil)
+		req.Header.Set("X-API-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for _, path := range []string{"/api/v1/optimize", "/api/v1/scrub", "/api/v1/fsck"} {
+		if got := call("user-key", path); got != http.StatusForbidden {
+			t.Fatalf("一般キーの %s = %d, want 403", path, got)
+		}
+		if got := call("admin-key", path); got != http.StatusOK {
+			t.Fatalf("管理キーの %s = %d, want 200", path, got)
+		}
+	}
+}
+
+// id= で所有者IDを分離すると、別のキーでも同じファイルにアクセスできる
+// (キーローテーション)。id なしのキーはキー自身が所有者。
+func TestKeyRotationViaUserID(t *testing.T) {
+	st, err := store.Open(t.TempDir(), store.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(st, Options{Users: map[string]User{
+		"old-key":   {ID: "alice"},
+		"new-key":   {ID: "alice"}, // ローテーション後の新キー
+		"other-key": {ID: "bob"},
+	}}))
+	t.Cleanup(func() { srv.Close(); st.Close() })
+
+	// 旧キーでアップロード
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/files", bytes.NewReader([]byte("rotate me")))
+	req.Header.Set("X-API-Key", "old-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m store.FileManifest
+	json.NewDecoder(resp.Body).Decode(&m)
+	resp.Body.Close()
+
+	get := func(key string) int {
+		req, _ := http.NewRequest("GET", srv.URL+"/api/v1/files/"+m.ID, nil)
+		req.Header.Set("X-API-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := get("new-key"); got != http.StatusOK {
+		t.Fatalf("新キーでのアクセス = %d, want 200(同じ id=alice)", got)
+	}
+	if got := get("other-key"); got != http.StatusNotFound {
+		t.Fatalf("他人のキーでのアクセス = %d, want 404", got)
+	}
+}
+
+// 長すぎるファイル名は 400 で拒否される。
+func TestNameLengthLimit(t *testing.T) {
+	srv := newTestServer(t)
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/files", bytes.NewReader([]byte("x")))
+	req.Header.Set("X-File-Name", strings.Repeat("a", 300))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}

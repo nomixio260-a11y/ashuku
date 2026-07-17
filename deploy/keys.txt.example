@@ -1,8 +1,17 @@
 # ashuku API キーファイルの例。-auth-keys で指定する。
-# 形式(1行1キー):  <キー>  [クォータ(例:100G, 0=無制限)]  [表示名]
+# 形式(1行1キー):  <キー>  [クォータ(例:100G, 0=無制限)]  [id=ユーザーID]  [@admin]  [表示名]
 # '#' で始まる行と空行は無視される。
 #
-# キーは十分に長いランダム文字列にすること(例: openssl rand -hex 32)。
+# - キーは十分に長いランダム文字列にすること(例: openssl rand -hex 32)。
+# - id=xxx を付けると所有者IDがキーではなく xxx になる。同じ id の行を複数
+#   書けば1ユーザーに複数キーを発行でき、キーのローテーション(漏洩時の
+#   差し替え)がファイルへのアクセスを失わずにできる。id を省略すると
+#   キー自身が所有者IDになる(その場合キー変更=別ユーザー扱いになるので、
+#   本番運用では id= の使用を強く推奨)。
+# - @admin を付けたキーだけが管理操作(optimize / scrub / fsck)を実行できる。
+#   scrub は全データ読み出しを伴う重い操作なので、一般ユーザーには渡さない。
 
-alice-REPLACE-WITH-random-64hex   100G   Alice
-bob-REPLACE-WITH-random-64hex     10G    Bob
+admin-REPLACE-WITH-random-64hex   0      id=admin  @admin  管理者
+alice-REPLACE-WITH-random-64hex   100G   id=alice  Alice
+alice-NEW-KEY-AFTER-ROTATION      100G   id=alice  Alice(新キー)
+bob-REPLACE-WITH-random-64hex     10G    id=bob    Bob

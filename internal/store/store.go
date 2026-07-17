@@ -98,6 +98,11 @@ type Config struct {
 	// 超過分は precompression をスキップして通常経路で保存される
 	// (待たせない: 多人数同時アップロードでのメモリ爆発を防ぐ)。
 	PrecompParallel int
+	// MinFreeBytes はディスク空きがこの値を下回ったら書き込みを拒否する
+	// 予約(0 = ガードなし)。取り込み中(64チャンクごと)と Optimize の
+	// 各フェーズ前に検査し、バックグラウンド処理自身がディスクを満杯に
+	// することを防ぐ。API 層の事前拒否と同じ値を渡すこと。
+	MinFreeBytes int64
 }
 
 // DefaultPrecompMaxPlain は precompression の展開上限デフォルト(64MiB)。
@@ -111,6 +116,9 @@ var ErrQuotaExceeded = errors.New("容量クォータを超過しています")
 
 // ErrTooLarge はアップロードサイズ上限の超過を示す。
 var ErrTooLarge = errors.New("アップロードサイズが上限を超えています")
+
+// ErrDiskFull はディスク予約(MinFreeBytes)を下回ったことを示す。
+var ErrDiskFull = errors.New("ディスクの空き容量が不足しています")
 
 // ValidCompression は圧縮モード名の妥当性を検査する(""はデフォルト=auto)。
 func ValidCompression(mode string) bool {
@@ -150,9 +158,22 @@ type Store struct {
 	precompMax  int64         // precompression の展開上限
 	precompSem  chan struct{} // precompression の同時実行制限
 	optMu       sync.Mutex    // Optimize の同時実行を直列化
+	minFree     int64         // ディスク予約(0 = ガードなし)
 	// writeWaiters は進行中の書き込みトランザクション要求数(batchUpdate の
 	// 適応判定に使う: 並行書き込みがあるときだけグループコミットに切り替える)。
 	writeWaiters atomic.Int64
+}
+
+// checkDiskSpace はディスク予約を検査する(取得失敗時は書き込みを止めない)。
+func (s *Store) checkDiskSpace() error {
+	if s.minFree <= 0 {
+		return nil
+	}
+	free, err := s.FreeBytes()
+	if err != nil || free >= s.minFree {
+		return nil
+	}
+	return ErrDiskFull
 }
 
 // batchDelay はグループコミットの合流待ち時間の上限。並行書き込みが
@@ -273,6 +294,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		precomp:     !cfg.DisablePrecomp && precomp.Supported(),
 		precompMax:  precompMax,
 		precompSem:  make(chan struct{}, precompPar),
+		minFree:     cfg.MinFreeBytes,
 	}
 	// クラッシュで取り残された temp ファイル(.tmp-*)を掃除する。
 	// これらは rename 前に落ちた書き込みの残骸で、参照されていない。
@@ -571,7 +593,7 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 		pending = nil
 		return nil
 	}
-	for {
+	for i := 0; ; i++ {
 		chunk, err := ck.Next()
 		if err == io.EOF {
 			break
@@ -581,6 +603,14 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 		}
 		if maxBytes > 0 && m.Size+int64(len(chunk.Data)) > maxBytes {
 			return fail(ErrTooLarge)
+		}
+		// 巨大アップロードが取り込み途中でディスクを埋め切らないよう、
+		// 定期的(64チャンク≒64MiBごと)に残量を検査する。API 層の
+		// 開始時チェックだけでは長いストリームの途中枯渇を防げない。
+		if i%64 == 0 {
+			if err := s.checkDiskSpace(); err != nil {
+				return fail(err)
+			}
 		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
@@ -972,38 +1002,19 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 
 	// precompression されたファイルはチャンク列(展開データ)からレシピで
 	// 元のストリームをビット単位に再構成し、SHA-256 で検証してから返す。
+	// 再構成はメモリ上で行うため、同時実行を precompSem で制限する
+	// (多数の並行ダウンロードでのメモリ爆発防止。枠が空くまで待つ)。
+	// 枠は返却ストリームのクローズまで保持し、組み立て済みバッファの
+	// 同時滞留数も制限する。
 	if m.Encoding != "" {
-		var plain bytes.Buffer
-		plain.Grow(int(m.ChunkedSize))
-		for _, hash := range m.Chunks {
-			data, err := s.readChunk(hash)
-			if err != nil {
-				return nil, nil, fmt.Errorf("チャンク %s の読み出しに失敗: %w", hash[:12], err)
-			}
-			plain.Write(data)
-		}
-		var orig []byte
-		var err error
-		switch m.Encoding {
-		case EncodingGzipZlibV1:
-			orig, err = precomp.Reconstruct(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
-		case EncodingZlibV1:
-			orig, err = precomp.ReconstructZlib(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
-		case EncodingGzipMultiV1:
-			orig, err = precomp.ReconstructGzipMulti(m.PrecompMembers, plain.Bytes())
-		case EncodingPNGV1:
-			orig, err = precomp.ReconstructPNG(m.PrecompPNG, m.PrecompLevel, plain.Bytes())
-		default:
-			err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
-		}
+		s.precompSem <- struct{}{}
+		release := func() { <-s.precompSem }
+		orig, err := s.reconstructPrecomp(m)
 		if err != nil {
-			return nil, nil, fmt.Errorf("precompression の再構成に失敗: %w", err)
+			release()
+			return nil, nil, err
 		}
-		sum := sha256.Sum256(orig)
-		if hex.EncodeToString(sum[:]) != m.OrigSHA256 {
-			return nil, nil, fmt.Errorf("再構成の検証に失敗しました(保存時と異なる zlib 実装の可能性)")
-		}
-		return m, io.NopCloser(bytes.NewReader(orig)), nil
+		return m, &releaseReadCloser{Reader: bytes.NewReader(orig), release: release}, nil
 	}
 
 	pr, pw := io.Pipe()
@@ -1021,6 +1032,54 @@ func (s *Store) Get(id string) (*FileManifest, io.ReadCloser, error) {
 		pw.Close()
 	}()
 	return m, pr, nil
+}
+
+// releaseReadCloser はクローズ時にコールバックを一度だけ呼ぶ ReadCloser。
+type releaseReadCloser struct {
+	io.Reader
+	release func()
+	once    sync.Once
+}
+
+func (r *releaseReadCloser) Close() error {
+	r.once.Do(r.release)
+	return nil
+}
+
+// reconstructPrecomp は precompression されたファイルの元ストリームを
+// レシピから再構成し、SHA-256 で検証して返す。
+func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
+	var plain bytes.Buffer
+	plain.Grow(int(m.ChunkedSize))
+	for _, hash := range m.Chunks {
+		data, err := s.readChunk(hash)
+		if err != nil {
+			return nil, fmt.Errorf("チャンク %s の読み出しに失敗: %w", hash[:12], err)
+		}
+		plain.Write(data)
+	}
+	var orig []byte
+	var err error
+	switch m.Encoding {
+	case EncodingGzipZlibV1:
+		orig, err = precomp.Reconstruct(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+	case EncodingZlibV1:
+		orig, err = precomp.ReconstructZlib(m.PrecompHeader, m.PrecompLevel, plain.Bytes())
+	case EncodingGzipMultiV1:
+		orig, err = precomp.ReconstructGzipMulti(m.PrecompMembers, plain.Bytes())
+	case EncodingPNGV1:
+		orig, err = precomp.ReconstructPNG(m.PrecompPNG, m.PrecompLevel, plain.Bytes())
+	default:
+		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("precompression の再構成に失敗: %w", err)
+	}
+	sum := sha256.Sum256(orig)
+	if hex.EncodeToString(sum[:]) != m.OrigSHA256 {
+		return nil, fmt.Errorf("再構成の検証に失敗しました(保存時と異なる zlib 実装の可能性)")
+	}
+	return orig, nil
 }
 
 // readChunk はチャンクを読み出して伸長し、ハッシュを検証して返す。

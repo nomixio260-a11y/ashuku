@@ -72,9 +72,17 @@ const minStarSize = 4
 
 // Optimize は星形チェーンを検出して再編成し、物理容量を削減する。
 // サーバー稼働中に呼んでも安全。同時実行は1つに直列化される。
+//
+// リージョン化・repack は一時的に新旧表現を併存させて書き込みを増やすため、
+// 各フェーズの前にディスク予約を検査し、残量僅少時は ErrDiskFull で中断する
+// (最適化自身がディスクを満杯にしてサービスを止めることを防ぐ)。
 func (s *Store) Optimize() (*OptimizeResult, error) {
 	s.optMu.Lock()
 	defer s.optMu.Unlock()
+
+	if err := s.checkDiskSpace(); err != nil {
+		return nil, err
+	}
 
 	stars, err := s.collectStars()
 	if err != nil {
@@ -112,7 +120,10 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 	}
 	// リージョン(ソリッド)圧縮: ファイル順に連続する独立チャンクをまとめて
 	// 再圧縮し、チャンクをまたぐ冗長性を回収する。先に生存率の低いリージョンを
-	// 解体してから詰め直す。
+	// 解体してから詰め直す。書き込みを伴うフェーズなので残量を再検査する。
+	if err := s.checkDiskSpace(); err != nil {
+		return res, err
+	}
 	if err := s.compactRegions(res); err != nil {
 		return res, err
 	}

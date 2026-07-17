@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"crypto/sha256"
+	"github.com/nomixio260-a11y/ashuku/internal/precomp"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -251,5 +252,41 @@ func TestOfflineDeltaUpgradesClientChunks(t *testing.T) {
 	}
 	if !bytes.Equal(out.Bytes(), base) {
 		t.Fatal("デルタ化後の復元が一致しません")
+	}
+}
+
+// precompression されたファイル(サーバー経路でアップロードされた gzip 等)を
+// クライアント経路でダウンロードしても、元のバイト列がビット一致で返る
+// (チャンク列=展開データの結合ではなく、サーバー経路への自動フォール
+// バックで再構成される)。修正前は展開データがエラーなしで返るバグだった。
+func TestClientGetPrecompFileFallsBack(t *testing.T) {
+	if !precomp.Supported() {
+		t.Skip("CGO 無効")
+	}
+	st, c := newServerAndClient(t, api.Options{})
+
+	// zlib 産 gzip を合成し(Reconstruct はシステム zlib を使う)、
+	// サーバー経路(store.Put)で保存 → precomp が適用される
+	header := []byte{0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3}
+	plain := bytes.Repeat([]byte("precomp fallback test data! "), 20000)
+	orig, err := precomp.Reconstruct(header, 6, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.Put("test.gz", bytes.NewReader(orig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Encoding == "" {
+		t.Fatal("precomp が適用されていません(テスト前提が崩れています)")
+	}
+
+	var out bytes.Buffer
+	if err := c.Get(m.ID, &out); err != nil {
+		t.Fatal(err)
+	}
+	if sha256.Sum256(out.Bytes()) != sha256.Sum256(orig) {
+		t.Fatalf("クライアント経路の復元が元と一致しません: got %d bytes, want %d",
+			out.Len(), len(orig))
 	}
 }

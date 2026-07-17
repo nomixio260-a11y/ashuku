@@ -284,3 +284,20 @@ func TestList(t *testing.T) {
 		t.Fatalf("len(files) = %d, want 2", len(files))
 	}
 }
+
+// MinFreeBytes を極端に大きくすると、取り込みと Optimize がディスク保護で
+// 拒否される(バックグラウンド処理が満杯を招かない)。
+func TestDiskGuardBlocksWrites(t *testing.T) {
+	s, err := Open(t.TempDir(), Config{MinFreeBytes: 1 << 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if _, err := s.Put("x", bytes.NewReader(randomData(t, 64<<10))); err != ErrDiskFull {
+		t.Fatalf("Put err = %v, want ErrDiskFull", err)
+	}
+	if _, err := s.Optimize(); err != ErrDiskFull {
+		t.Fatalf("Optimize err = %v, want ErrDiskFull", err)
+	}
+}

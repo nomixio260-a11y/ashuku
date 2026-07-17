@@ -29,6 +29,14 @@ type User struct {
 	Name string
 	// Quota は論理容量上限(バイト)。0 なら無制限。
 	Quota int64
+	// ID は所有者ID。空ならAPIキー自身が所有者IDになる(後方互換)。
+	// IDを設定しておくと、同じIDで別のキーを発行してローテーションできる
+	// (キー漏洩時にファイルへのアクセスを失わずキーだけ差し替えられる)。
+	ID string
+	// Admin は管理エンドポイント(optimize / scrub / fsck)の実行権限。
+	// scrub は全チャンク読み出し+検証でTBクラスでは数時間ディスクを占有する
+	// ため、一般ユーザーに開放するとDoSベクタになる。
+	Admin bool
 }
 
 // Options はサーバーの動作設定。
@@ -54,10 +62,23 @@ type Options struct {
 	//   "off"  = 拒否(403)。クライアント支援プロトコル(ashuku-cli)専用にし、
 	//            圧縮・展開を完全にユーザーデバイス側へ寄せる
 	ServerSideUploads string
+	// MaxConcurrent は同時処理するリクエスト数の上限(0 ならデフォルト512)。
+	// 超過分は 503 + Retry-After で即座に拒否する。1リクエストは最大で
+	// 数MiB(チャンク)〜数十MiB(precomp)のメモリを使うため、無制限だと
+	// 大量の並行リクエストでメモリが枯渇する。/healthz と /metrics は
+	// 監視を止めないため制限対象外。負値で無制限(テスト用)。
+	MaxConcurrent int
 }
 
 // DefaultMinFreeBytes はディスク予約のデフォルト(1GiB)。
 const DefaultMinFreeBytes = 1 << 30
+
+// DefaultMaxConcurrent は同時リクエスト数のデフォルト上限。
+const DefaultMaxConcurrent = 512
+
+// maxNameLen はファイル名の最大バイト長。無制限だと巨大な名前が
+// マニフェストと一覧索引レコードにそのまま入り、メタデータを肥大させる。
+const maxNameLen = 255
 
 // Server は REST API サーバー。
 type Server struct {
@@ -65,6 +86,8 @@ type Server struct {
 	mux     *http.ServeMux
 	opts    Options
 	metrics *metrics
+	// sem は同時リクエスト数の制限(nil = 無制限)。
+	sem chan struct{}
 
 	statsMu   sync.Mutex
 	statsAt   time.Time
@@ -79,7 +102,13 @@ func New(st *store.Store, opts Options) *Server {
 	if opts.MinFreeBytes <= 0 {
 		opts.MinFreeBytes = DefaultMinFreeBytes
 	}
+	if opts.MaxConcurrent == 0 {
+		opts.MaxConcurrent = DefaultMaxConcurrent
+	}
 	s := &Server{store: st, mux: http.NewServeMux(), opts: opts, metrics: newMetrics()}
+	if opts.MaxConcurrent > 0 {
+		s.sem = make(chan struct{}, opts.MaxConcurrent)
+	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/v1/files", s.auth(s.handleUpload))
 	s.mux.HandleFunc("GET /api/v1/files", s.auth(s.handleList))
@@ -103,6 +132,22 @@ func New(st *store.Store, opts Options) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 同時リクエスト数の制限(監視エンドポイントは除外: 過負荷時こそ
+	// ヘルスチェックとメトリクスが届く必要がある)。
+	if s.sem != nil && r.URL.Path != "/healthz" && r.URL.Path != "/metrics" {
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable,
+				"サーバーが混雑しています。少し待って再試行してください")
+			if s.metrics != nil {
+				s.metrics.observeRequest(r.Method, http.StatusServiceUnavailable)
+			}
+			return
+		}
+	}
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 	// パニック分離: 1リクエストのパニックがサーバー全体を落とさないように、
@@ -172,8 +217,23 @@ func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) htt
 			writeError(w, http.StatusUnauthorized, "APIキーが無効です")
 			return
 		}
-		next(w, r, authed{owner: key, user: u})
+		owner := key
+		if u.ID != "" {
+			owner = u.ID // ユーザーIDが設定されていればキーではなくIDを所有者にする
+		}
+		next(w, r, authed{owner: owner, user: u})
 	}
+}
+
+// requireAdmin は管理操作の権限を検査する。認証なし運用(単一運用者の
+// 開発・自己ホスト)では全操作を許可し、認証あり運用では Admin キーだけを
+// 許可する。
+func (s *Server) requireAdmin(w http.ResponseWriter, a authed) bool {
+	if len(s.opts.Users) == 0 || a.user.Admin {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "この操作には管理者キーが必要です")
+	return false
 }
 
 // lookupUser は APIキーを定時間比較で照合する。マップの直接引きと違い、
@@ -235,6 +295,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		name = "unnamed"
 	}
 	name = path.Base(name) // パス区切りは受け付けない
+	if len(name) > maxNameLen {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("ファイル名が長すぎます(最大 %d バイト)", maxNameLen))
+		return
+	}
 
 	mode := r.Header.Get("X-Compression")
 	if mode == "" {
@@ -271,6 +336,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		case errors.Is(err, store.ErrQuotaExceeded):
 			writeError(w, http.StatusInsufficientStorage,
 				"容量クォータを超過しています(不要なファイルを削除してください)")
+		case errors.Is(err, store.ErrDiskFull):
+			writeError(w, http.StatusInsufficientStorage,
+				"サーバーのディスク空き容量が不足しています")
 		case errors.Is(err, store.ErrTooLarge), errors.As(err, &maxErr):
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("アップロードサイズが上限(%d bytes)を超えています", s.opts.MaxUploadBytes))
@@ -306,14 +374,18 @@ func (s *Server) checkOwner(id string, a authed) error {
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, a authed) {
-	if s.opts.ServerSideUploads == "off" {
-		writeError(w, http.StatusForbidden,
-			"このサーバーはサーバー側展開を無効化しています。ashuku-cli get(クライアント側展開)を使ってください")
+	id := r.PathValue("id")
+	man, err := s.store.Manifest(id)
+	if err != nil || man.Owner != a.owner {
+		writeStoreError(w, store.ErrNotFound)
 		return
 	}
-	id := r.PathValue("id")
-	if err := s.checkOwner(id, a); err != nil {
-		writeStoreError(w, err)
+	// "off"(クライアント専用)モードでも precompression 適用済みファイルは
+	// 例外的に許可する: 再構成レシピはサーバーにしかなく、チャンク経路では
+	// 元のバイト列を復元できないため(クライアントはここへフォールバックする)。
+	if s.opts.ServerSideUploads == "off" && man.Encoding == "" {
+		writeError(w, http.StatusForbidden,
+			"このサーバーはサーバー側展開を無効化しています。ashuku-cli get(クライアント側展開)を使ってください")
 		return
 	}
 	m, body, err := s.store.Get(id)
@@ -388,9 +460,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          a.owner,
 		"name":        a.user.Name,
 		"used_bytes":  used,
 		"quota_bytes": a.user.Quota,
+		"admin":       a.user.Admin,
 	})
 }
 
@@ -427,7 +501,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 // handleScrub は全チャンクの完全性を検証し、破損・欠損を報告する。
 // 破損があれば 200 で結果を返す(検出は成功しているため)。
-func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, _ authed) {
+func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, a authed) {
+	if !s.requireAdmin(w, a) {
+		return
+	}
 	res, err := s.store.Scrub()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -437,7 +514,10 @@ func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, _ authed) {
 }
 
 // handleFsck はメタデータ整合性を検証する。?repair=1 で修復も行う。
-func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, _ authed) {
+func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, a authed) {
+	if !s.requireAdmin(w, a) {
+		return
+	}
 	repair := r.URL.Query().Get("repair") == "1"
 	res, err := s.store.Fsck(repair)
 	if err != nil {
@@ -450,7 +530,10 @@ func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, _ authed) {
 // handleOptimize は chain repack(デルタチェーン再編成)を実行し、
 // 削減結果を返す。長期の世代保持でドリフトが蓄積したストアの物理容量を
 // 回収する。実行中も読み書きは可能。
-func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, _ authed) {
+func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, a authed) {
+	if !s.requireAdmin(w, a) {
+		return
+	}
 	res, err := s.store.Optimize()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -608,6 +691,11 @@ func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a 
 		req.Name = "unnamed"
 	}
 	req.Name = path.Base(req.Name)
+	if len(req.Name) > maxNameLen {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("ファイル名が長すぎます(最大 %d バイト)", maxNameLen))
+		return
+	}
 
 	m, missing, err := s.store.CommitClientManifest(
 		req.Name, a.owner, req.Chunks, a.user.Quota, s.opts.MaxUploadBytes)

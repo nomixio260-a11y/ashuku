@@ -62,6 +62,12 @@ type Manifest struct {
 	Name   string   `json:"name"`
 	Size   int64    `json:"size"`
 	Chunks []string `json:"chunks"`
+	// Encoding が非空のファイルは precompression 適用済みで、チャンク列は
+	// 展開データ。元ストリームの再構成レシピはサーバーだけが持つため、
+	// ダウンロードはサーバー経路にフォールバックする。
+	Encoding string `json:"encoding"`
+	// OrigSHA256 は元ストリームの SHA-256(フォールバック経路の検証用)。
+	OrigSHA256 string `json:"orig_sha256"`
 }
 
 func (c *Client) init() error {
@@ -347,6 +353,11 @@ func (c *Client) Put(name string, r io.Reader) (*PutResult, error) {
 
 // Get は id のファイルをダウンロードし、クライアント側で伸長・検証しながら
 // w に書き出す。チャンク取得は並列、書き出しは順序どおり。
+//
+// precompression 適用済みファイル(Encoding 非空)はチャンク列が展開データで
+// あり、元ストリームの再構成レシピはサーバーにしかないため、サーバー経路の
+// ダウンロードに自動フォールバックする(チャンク結合では元と違うバイト列に
+// なってしまう)。その場合も OrigSHA256 でクライアント側検証を行う。
 func (c *Client) Get(id string, w io.Writer) error {
 	if err := c.init(); err != nil {
 		return err
@@ -354,6 +365,9 @@ func (c *Client) Get(id string, w io.Writer) error {
 	var m Manifest
 	if err := c.getJSON("/api/v1/manifests/"+id, &m); err != nil {
 		return err
+	}
+	if m.Encoding != "" {
+		return c.getServerSide(id, w, m.OrigSHA256)
 	}
 
 	// 並列取得+順序書き出し: 各位置の結果チャネルを先に用意し、
@@ -385,6 +399,31 @@ func (c *Client) Get(id string, w io.Writer) error {
 		if _, err := w.Write(r.data); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// getServerSide はサーバー経路(GET /files/{id})でダウンロードし、
+// ストリーミングしながら SHA-256 を計算して wantSHA256(非空なら)と照合する。
+func (c *Client) getServerSide(id string, w io.Writer, wantSHA256 string) error {
+	req, err := c.req("GET", "/api/v1/files/"+id, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return httpError(resp)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+		return err
+	}
+	if wantSHA256 != "" && hex.EncodeToString(h.Sum(nil)) != wantSHA256 {
+		return fmt.Errorf("ダウンロードした内容の検証に失敗しました")
 	}
 	return nil
 }
