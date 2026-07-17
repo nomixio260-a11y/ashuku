@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
 	"strings"
 	"testing"
 
@@ -163,4 +166,122 @@ func TestPrecompTruncatedGzipFallsBack(t *testing.T) {
 	if got := getBytes(t, s, m.ID); !bytes.Equal(got, junk) {
 		t.Fatal("復元が一致しません")
 	}
+}
+
+// ZIP コンテナ(zlib 産メンバー)が分解され、ビット一致で往復し、
+// 「外側から zstd」より縮むことを確認する。
+func TestPrecompZipRoundTrip(t *testing.T) {
+	if !precomp.Supported() {
+		t.Skip("CGO 無効")
+	}
+	s := newTestStore(t)
+
+	// 最小の手組み ZIP(1 deflate メンバー、zlib 産ストリーム)
+	plain := textData(3 << 20)
+	full, err := precomp.ReconstructZlib([]byte{0x78, 0x9c}, 6, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := full[2 : len(full)-4] // 生 deflate 部分
+	orig := buildMinimalZip(t, "doc.xml", plain, stream)
+
+	m := putBytes(t, s, "archive.zip", orig)
+	if m.Encoding != EncodingZipV1 {
+		t.Fatalf("encoding = %q, want %q", m.Encoding, EncodingZipV1)
+	}
+	got := getBytes(t, s, m.ID)
+	if sha256.Sum256(got) != sha256.Sum256(orig) {
+		t.Fatal("ZIP の復元がビット一致しません")
+	}
+	st, _ := s.Stats()
+	// deflate 済み ZIP は外側からは縮まない(≈1.0x)が、分解により
+	// 展開データが zstd-19 で再圧縮されて物理が元より小さくなる
+	if st.PhysicalBytes >= int64(len(orig)) {
+		t.Fatalf("physical %d >= zip %d: 分解による削減が効いていません",
+			st.PhysicalBytes, len(orig))
+	}
+	t.Logf("zip %d bytes → physical %d bytes (%.2fx)",
+		len(orig), st.PhysicalBytes, float64(len(orig))/float64(st.PhysicalBytes))
+}
+
+// PDF(FlateDecode)が分解され、ビット一致で往復する。
+func TestPrecompPDFRoundTrip(t *testing.T) {
+	if !precomp.Supported() {
+		t.Skip("CGO 無効")
+	}
+	s := newTestStore(t)
+	content := textData(2 << 20)
+	stream, err := precomp.ReconstructZlib([]byte{0x78, 0x9c}, 6, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pdf bytes.Buffer
+	fmt.Fprintf(&pdf, "%%PDF-1.4\n1 0 obj\n<</Length %d /Filter /FlateDecode>>\nstream\n", len(stream))
+	pdf.Write(stream)
+	pdf.WriteString("\nendstream\nendobj\ntrailer\n%%EOF\n")
+	orig := append([]byte(nil), pdf.Bytes()...)
+
+	m := putBytes(t, s, "doc.pdf", orig)
+	if m.Encoding != EncodingPDFV1 {
+		t.Fatalf("encoding = %q, want %q", m.Encoding, EncodingPDFV1)
+	}
+	got := getBytes(t, s, m.ID)
+	if sha256.Sum256(got) != sha256.Sum256(orig) {
+		t.Fatal("PDF の復元がビット一致しません")
+	}
+	st, _ := s.Stats()
+	if st.PhysicalBytes >= int64(len(orig)) {
+		t.Fatalf("physical %d >= pdf %d: 分解による削減が効いていません",
+			st.PhysicalBytes, len(orig))
+	}
+}
+
+// buildMinimalZip はテスト用の最小 ZIP(deflate メンバー1つ)を手組みする。
+func buildMinimalZip(t *testing.T, name string, plain, stream []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w16 := func(v uint16) { binary.Write(&out, binary.LittleEndian, v) }
+	w32 := func(v uint32) { binary.Write(&out, binary.LittleEndian, v) }
+	out.WriteString("PK\x03\x04")
+	w16(20)
+	w16(0)
+	w16(8) // deflate
+	w16(0)
+	w16(0x21)
+	w32(crc32.ChecksumIEEE(plain))
+	w32(uint32(len(stream)))
+	w32(uint32(len(plain)))
+	w16(uint16(len(name)))
+	w16(0)
+	out.WriteString(name)
+	out.Write(stream)
+	cdStart := out.Len()
+	out.WriteString("PK\x01\x02")
+	w16(20)
+	w16(20)
+	w16(0)
+	w16(8)
+	w16(0)
+	w16(0x21)
+	w32(crc32.ChecksumIEEE(plain))
+	w32(uint32(len(stream)))
+	w32(uint32(len(plain)))
+	w16(uint16(len(name)))
+	w16(0)
+	w16(0)
+	w16(0)
+	w16(0)
+	w32(0)
+	w32(0) // local header offset
+	out.WriteString(name)
+	cdSize := out.Len() - cdStart
+	out.WriteString("PK\x05\x06")
+	w16(0)
+	w16(0)
+	w16(1)
+	w16(1)
+	w32(uint32(cdSize))
+	w32(uint32(cdStart))
+	w16(0)
+	return out.Bytes()
 }

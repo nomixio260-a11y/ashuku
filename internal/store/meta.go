@@ -70,6 +70,9 @@ type FileManifest struct {
 	PrecompMembers []precomp.Member `json:"precomp_members,omitempty"`
 	// PrecompPNG は PNG コンテナの再構成レシピ。
 	PrecompPNG *precomp.PNGRecipe `json:"precomp_png,omitempty"`
+	// PrecompContainer は ZIP / PDF コンテナの再構成レシピ
+	// (チャンク列 = スケルトン+展開データ列)。
+	PrecompContainer *precomp.ContainerRecipe `json:"precomp_container,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -90,6 +93,11 @@ const (
 	EncodingGzipMultiV1 = "gzip-multi-v1"
 	// EncodingPNGV1 は PNG コンテナ(IDAT の zlib を展開して保存)。
 	EncodingPNGV1 = "png-zlib-v1"
+	// EncodingZipV1 は ZIP コンテナ(docx/xlsx/jar 等を含む)。zlib 産の
+	// deflate メンバーを展開して保存し、スケルトンごとチャンク化する。
+	EncodingZipV1 = "zip-deflate-v1"
+	// EncodingPDFV1 は PDF コンテナ(FlateDecode の zlib を展開して保存)。
+	EncodingPDFV1 = "pdf-zlib-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

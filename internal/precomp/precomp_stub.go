@@ -93,3 +93,42 @@ func TryUnwrapPNG(orig []byte, maxPlain int64) (*PNGUnwrapped, bool) { return ni
 func ReconstructPNG(recipe *PNGRecipe, level int, plain []byte) ([]byte, error) {
 	return nil, errNoCGO
 }
+
+// IsZip は ZIP のローカルファイルヘッダ署名かを返す。
+func IsZip(head []byte) bool {
+	return len(head) >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 3 && head[3] == 4
+}
+
+// IsPDF は PDF 署名かを返す。
+func IsPDF(head []byte) bool {
+	return len(head) >= 5 && string(head[:5]) == "%PDF-"
+}
+
+// ContainerSegment はコンテナ分解の1ストリームレシピ。
+type ContainerSegment struct {
+	SkelPos  int64  `json:"skel_pos"`
+	PlainLen int64  `json:"plain_len"`
+	Level    int    `json:"level"`
+	Header   []byte `json:"header,omitempty"`
+}
+
+// ContainerRecipe はコンテナ分解の再構成レシピ。
+type ContainerRecipe struct {
+	SkelLen  int64              `json:"skel_len"`
+	Segments []ContainerSegment `json:"segments"`
+}
+
+// TryUnwrapZip は常に失敗する(CGO 無効)。
+func TryUnwrapZip(orig []byte, maxPlain int64) ([]byte, *ContainerRecipe, bool) {
+	return nil, nil, false
+}
+
+// TryUnwrapPDF は常に失敗する(CGO 無効)。
+func TryUnwrapPDF(orig []byte, maxPlain int64) ([]byte, *ContainerRecipe, bool) {
+	return nil, nil, false
+}
+
+// ReconstructContainer は常にエラーを返す(CGO 無効)。
+func ReconstructContainer(recipe *ContainerRecipe, chunked []byte) ([]byte, error) {
+	return nil, errNoCGO
+}

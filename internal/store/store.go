@@ -434,10 +434,11 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 	// 該当しないストリーム・上限超過・同時実行枠の超過は通常経路へ素通し
 	// (多人数同時アップロードでのメモリ爆発を防ぐ)。
 	if s.precomp && !opts.DisablePrecomp {
-		head := make([]byte, 3)
+		head := make([]byte, 5)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
-		if n == 3 && (precomp.IsGzip(head) || precomp.IsZlib(head) || precomp.IsPNG(head)) && s.acquirePrecomp() {
+		if n == 5 && (precomp.IsGzip(head) || precomp.IsZlib(head) || precomp.IsPNG(head) ||
+			precomp.IsZip(head) || precomp.IsPDF(head)) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
 				s.releasePrecomp()
@@ -521,6 +522,22 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		m.PrecompPNG = u.Recipe
 		m.PrecompLevel = u.Level
 		m.precompPlain = u.Plain
+	case precomp.IsZip(buf):
+		chunked, recipe, ok := precomp.TryUnwrapZip(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingZipV1
+		m.PrecompContainer = recipe
+		m.precompPlain = chunked
+	case precomp.IsPDF(buf):
+		chunked, recipe, ok := precomp.TryUnwrapPDF(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingPDFV1
+		m.PrecompContainer = recipe
+		m.precompPlain = chunked
 	case precomp.IsZlib(buf):
 		u, ok := precomp.TryUnwrapZlib(buf, s.precompMax)
 		if !ok {
@@ -1069,6 +1086,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructGzipMulti(m.PrecompMembers, plain.Bytes())
 	case EncodingPNGV1:
 		orig, err = precomp.ReconstructPNG(m.PrecompPNG, m.PrecompLevel, plain.Bytes())
+	case EncodingZipV1, EncodingPDFV1:
+		orig, err = precomp.ReconstructContainer(m.PrecompContainer, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}
