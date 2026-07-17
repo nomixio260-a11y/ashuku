@@ -428,7 +428,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			if overflow == nil && s.tryPrecomp(m, buf) {
 				// サイズ上限は元ストリーム(len(buf))に適用済み。展開データの
 				// putStream には上限をかけない(展開は正当に大きくなりうる)。
-				err := s.putStream(m, bytes.NewReader(m.precompPlain), mode, 0)
+				pending, err := s.putStream(m, bytes.NewReader(m.precompPlain), mode, 0)
 				s.releasePrecomp()
 				if err != nil {
 					return nil, err
@@ -438,7 +438,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 				m.ChunkedSize = m.Size
 				m.Size = int64(len(buf))
 				m.precompPlain = nil
-				return m, s.commitManifest(m, opts.Quota)
+				return m, s.commitManifest(m, opts.Quota, pending)
 			}
 			s.releasePrecomp()
 			if overflow == nil {
@@ -450,10 +450,11 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		r = rest
 	}
 
-	if err := s.putStream(m, r, mode, opts.MaxBytes); err != nil {
+	pending, err := s.putStream(m, r, mode, opts.MaxBytes)
+	if err != nil {
 		return nil, err
 	}
-	return m, s.commitManifest(m, opts.Quota)
+	return m, s.commitManifest(m, opts.Quota, pending)
 }
 
 // acquirePrecomp は precompression の実行枠を取る(待たずに false を返す)。
@@ -538,10 +539,37 @@ func readUpTo(r io.Reader, max int) ([]byte, io.Reader, error) {
 
 // putStream は r をチャンク化して保存し、m にチャンク列とサイズを記録する。
 // maxBytes > 0 のとき、超過した時点で中断してロールバックする。
-func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes int64) error {
+//
+// 小さなファイル(バッファ上限 = 最大チャンクサイズまで)はチャンクを
+// 確定せず、準備(圧縮)だけして pending として返す。呼び出し側が
+// commitManifest でマニフェストと同一トランザクションにまとめて確定する
+// (小ファイル1個 = 書き込みTx 1回。多数の小ファイル投下で fsync 数が半減
+// する上、クォータ超過時もチャンクが一切コミットされない完全な原子性になる)。
+// 大きなファイルは従来どおりストリーミングで逐次確定する(メモリ一定)。
+// pending が nil のときはチャンクは確定済み(ストリーミング経路)。
+func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes int64) ([]*preparedChunk, error) {
 	ck, err := chunker.New(r, s.chunkSize)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	bufLimit := int64(s.chunkSize) * 4 // 最大チャンクサイズ = 必ず1チャンクは収まる
+	pending := []*preparedChunk{}
+	var buffered int64
+	var committed []string // 逐次確定済みのチャンク(エラー時のロールバック対象)
+	fail := func(err error) ([]*preparedChunk, error) {
+		s.rollbackChunks(committed)
+		return nil, err
+	}
+	// flush は pending を諦めて逐次確定に切り替える(大きなファイルと判明)。
+	flush := func() error {
+		for _, pc := range pending {
+			if err := s.applyPrepared(pc); err != nil {
+				return err
+			}
+			committed = append(committed, pc.hash)
+		}
+		pending = nil
+		return nil
 	}
 	for {
 		chunk, err := ck.Next()
@@ -549,51 +577,114 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 			break
 		}
 		if err != nil {
-			s.rollbackChunks(m.Chunks)
-			return fmt.Errorf("チャンク分割に失敗: %w", err)
+			return fail(fmt.Errorf("チャンク分割に失敗: %w", err))
 		}
 		if maxBytes > 0 && m.Size+int64(len(chunk.Data)) > maxBytes {
-			s.rollbackChunks(m.Chunks)
-			return ErrTooLarge
+			return fail(ErrTooLarge)
 		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
-		if err := s.storeChunk(hexHash, chunk.Data, mode); err != nil {
-			s.rollbackChunks(m.Chunks)
-			return err
+		switch {
+		case pending != nil && buffered+int64(len(chunk.Data)) <= bufLimit:
+			// チャンカーのバッファは再利用されるためコピーして保持する。
+			data := append([]byte(nil), chunk.Data...)
+			pc, err := s.prepareChunk(hexHash, data, mode)
+			if err != nil {
+				return fail(err)
+			}
+			pending = append(pending, pc)
+			buffered += int64(len(data))
+		default:
+			if pending != nil {
+				if err := flush(); err != nil {
+					return fail(err)
+				}
+			}
+			if err := s.storeChunk(hexHash, chunk.Data, mode); err != nil {
+				return fail(err)
+			}
+			committed = append(committed, hexHash)
 		}
 		m.Chunks = append(m.Chunks, hexHash)
 		m.Size += int64(len(chunk.Data))
 	}
-	return nil
+	return pending, nil
+}
+
+// applyPrepared は準備済みチャンク1つを単独トランザクションで確定する
+// (storeChunk の後半と同じ。vanished レースはロック外で圧縮し直す)。
+func (s *Store) applyPrepared(pc *preparedChunk) error {
+	for attempt := 0; ; attempt++ {
+		var cleanup []string
+		err := s.batchUpdate(func(tx *bolt.Tx) error {
+			cleanup = cleanup[:0]
+			return s.applyChunk(tx, pc, &cleanup)
+		})
+		if err == nil {
+			return nil
+		}
+		s.removeChunkFiles(cleanup)
+		if errors.Is(err, errChunkVanished) && attempt < 2 {
+			s.fillPrepared(pc)
+			continue
+		}
+		return err
+	}
 }
 
 // commitManifest はマニフェストを保存し、所有者の使用量を加算する。
 // quota > 0 で使用量が上限を超える場合はコミットせず ErrQuotaExceeded を
 // 返す(チェックと加算は同一トランザクションなので並行アップロードでも
-// 突き抜けない)。失敗時はチャンク参照を戻す。
-func (s *Store) commitManifest(m *FileManifest, quota int64) error {
-	err := s.batchUpdate(func(tx *bolt.Tx) error {
-		used, err := ownerUsage(tx, m.Owner)
-		if err != nil {
-			return err
+// 突き抜けない)。
+//
+// pending(小ファイルの準備済みチャンク)がある場合はチャンク確定も同じ
+// トランザクションで行う: 成功すれば全部、失敗すれば何も残らない。
+// pending が nil(ストリーミング経路)で失敗したときは確定済みチャンクの
+// 参照を戻す。
+func (s *Store) commitManifest(m *FileManifest, quota int64, pending []*preparedChunk) error {
+	for attempt := 0; ; attempt++ {
+		var cleanup []string
+		err := s.batchUpdate(func(tx *bolt.Tx) error {
+			cleanup = cleanup[:0] // Batch 再実行に備えリセット
+			// クォータは先に判定する(超過時にチャンクの書き込みすら始めない)。
+			used, err := ownerUsage(tx, m.Owner)
+			if err != nil {
+				return err
+			}
+			if quota > 0 && used+m.Size > quota {
+				return ErrQuotaExceeded
+			}
+			for _, pc := range pending {
+				if err := s.applyChunk(tx, pc, &cleanup); err != nil {
+					return err
+				}
+			}
+			if err := addOwnerUsage(tx, m.Owner, m.Size); err != nil {
+				return err
+			}
+			if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, 1); err != nil {
+				return err
+			}
+			return putFileManifest(tx, m)
+		})
+		if err == nil {
+			return nil
 		}
-		if quota > 0 && used+m.Size > quota {
-			return ErrQuotaExceeded
+		s.removeChunkFiles(cleanup)
+		if errors.Is(err, errChunkVanished) && attempt < 2 {
+			// 既存見込みのチャンクが確定前に消えた(稀)。ロック外で圧縮し直す。
+			for _, pc := range pending {
+				if pc.compressed == nil {
+					s.fillPrepared(pc)
+				}
+			}
+			continue
 		}
-		if err := addOwnerUsage(tx, m.Owner, m.Size); err != nil {
-			return err
+		if pending == nil {
+			s.rollbackChunks(m.Chunks) // ストリーミング経路: 確定済み分を戻す
 		}
-		if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, 1); err != nil {
-			return err
-		}
-		return putFileManifest(tx, m)
-	})
-	if err != nil {
-		s.rollbackChunks(m.Chunks)
 		return err
 	}
-	return nil
 }
 
 // OwnerUsage は所有者の論理使用量(バイト)を返す。
@@ -607,16 +698,30 @@ func (s *Store) OwnerUsage(owner string) (int64, error) {
 	return used, err
 }
 
-// storeChunk はチャンクを重複排除しつつ保存する。
-//
-//  1. 既存チャンク(完全一致)なら参照カウントを増やすだけ(重複排除)
-//  2. 新規なら類似チャンクを索引から探し、見つかればそれをベースに
-//     デルタ圧縮(zstd 辞書圧縮)を試す。十分縮めばデルタで保存
-//  3. それ以外は zstd 圧縮(縮まなければ raw)で保存
-func (s *Store) storeChunk(hash string, data []byte, mode string) error {
-	// 高速パス: まず読み取りトランザクションで存在確認する(以前は存在
-	// しない場合も空の書き込みTxをコミットし、新規チャンクごとに fsync を
-	// 1回浪費していた)。既存なら参照カウントだけ増やす(重複排除)。
+// preparedChunk は取り込み待ちチャンク。重い処理(圧縮・類似検索)は
+// prepare 段階でトランザクション外に済ませ、確定(applyChunk)は
+// メタ操作とディスク書き込みだけにする。小さなファイルでは複数チャンクと
+// マニフェストを1つのトランザクションでまとめて確定できる。
+type preparedChunk struct {
+	hash string
+	mode string
+	data []byte
+	// compressed が nil の場合は「既存チャンクの見込み」(prepare 時に存在を
+	// 確認済みで、圧縮を省略した)。applyChunk 時に消えていたら
+	// errChunkVanished を返し、呼び出し側がロック外で再 prepare する。
+	compressed []byte
+	features   []uint64
+	baseHash   string
+	deltaData  []byte
+}
+
+// errChunkVanished は「既存の見込みだったチャンクが確定時に消えていた」
+// ことを示す(稀なレース。ロック外で圧縮し直して再試行する)。
+var errChunkVanished = errors.New("chunk vanished between prepare and apply")
+
+// prepareChunk はチャンク取り込みの重い前半(存在確認・圧縮・類似検索)を
+// 行う。既存チャンクなら圧縮を省略する(重複排除の高速パス)。
+func (s *Store) prepareChunk(hash string, data []byte, mode string) (*preparedChunk, error) {
 	exists := false
 	err := s.db.View(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)
@@ -624,103 +729,131 @@ func (s *Store) storeChunk(hash string, data []byte, mode string) error {
 		return err
 	})
 	if err != nil {
+		return nil, err
+	}
+	pc := &preparedChunk{hash: hash, mode: mode, data: data}
+	if !exists {
+		s.fillPrepared(pc)
+	}
+	return pc, nil
+}
+
+// fillPrepared は圧縮・類似検索(CPU/IO の重い部分)を行う。
+// bbolt の書き込みロック外で呼ぶこと。
+func (s *Store) fillPrepared(pc *preparedChunk) {
+	pc.compressed = s.compressChunk(pc.data, pc.mode)
+	if s.delta {
+		pc.features = computeFeatures(pc.data)
+		pc.baseHash, pc.deltaData = s.tryDelta(pc.features, pc.data, len(pc.compressed))
+	}
+}
+
+// applyChunk は準備済みチャンクをトランザクション内で確定する。
+//
+//  1. 既存チャンク(完全一致)なら参照カウントを増やすだけ(重複排除)
+//  2. デルタ候補があればベースの生存・深さを再確認してデルタで保存
+//  3. それ以外は zstd 圧縮(縮まなければ raw)で保存
+//
+// 新しく書いたファイル表現のパスは cleanup に積む(トランザクションが
+// 失敗したときに呼び出し側が消す。パック追記の取り残しは無害なゴミで、
+// コンパクションが回収する)。
+func (s *Store) applyChunk(tx *bolt.Tx, pc *preparedChunk, cleanup *[]string) error {
+	// 並行アップロードが同じチャンクを先に登録した可能性を再確認。
+	meta, err := getChunkMeta(tx, pc.hash)
+	if err != nil {
 		return err
 	}
-	if exists {
-		bumped := false
-		err := s.batchUpdate(func(tx *bolt.Tx) error {
-			bumped = false
-			meta, err := getChunkMeta(tx, hash)
-			if err != nil || meta == nil {
-				return err
-			}
-			meta.RefCount++
-			bumped = true
-			return putChunkMeta(tx, hash, meta)
-		})
+	if meta != nil {
+		meta.RefCount++
+		return putChunkMeta(tx, pc.hash, meta)
+	}
+	if pc.compressed == nil {
+		// 既存の見込みが外れた(prepare と apply の間に削除された)。
+		// 圧縮は書き込みロック内でやりたくないので、外でやり直させる。
+		return errChunkVanished
+	}
+
+	// デルタ採用時はベースがまだ存在し深さに余裕があるか確認し、参照を増やす。
+	baseHash := pc.baseHash
+	depth := 0
+	if baseHash != "" {
+		baseMeta, err := getChunkMeta(tx, baseHash)
 		if err != nil {
 			return err
 		}
-		if bumped {
+		if baseMeta == nil || baseMeta.Depth >= s.maxDepth {
+			baseHash = "" // ベース消失/深すぎ → 通常圧縮にフォールバック
+		} else {
+			depth = baseMeta.Depth + 1
+			baseMeta.RefCount++
+			if err := putChunkMeta(tx, baseHash, baseMeta); err != nil {
+				return err
+			}
+		}
+	}
+
+	// サーバー経路の取り込みはこの場でデルタ判定済みなので、
+	// オフラインデルタパスの対象から外す。
+	newMeta := &ChunkMeta{RawSize: int64(len(pc.data)), RefCount: 1, Features: pc.features, DeltaTried: true}
+	var stored []byte
+	switch {
+	case baseHash != "":
+		newMeta.Compression = compressionDelta
+		newMeta.BaseHash = baseHash
+		newMeta.Depth = depth
+		stored = pc.deltaData
+	case len(pc.compressed) < len(pc.data):
+		newMeta.Compression = compressionZstd
+		stored = pc.compressed
+	default:
+		newMeta.Compression = compressionRaw
+		stored = pc.data
+	}
+	newMeta.StoredSize = int64(len(stored))
+
+	loc, err := s.writeRep(pc.hash, "", stored)
+	if err != nil {
+		return err
+	}
+	if loc.packID == "" {
+		*cleanup = append(*cleanup, s.chunkPath(pc.hash, ""))
+	}
+	if err := applyRepLocation(tx, newMeta, "", loc, int64(len(stored))); err != nil {
+		return err
+	}
+	// 深さ上限に達したチャンクはベースにできないので索引を汚さない。
+	if newMeta.Depth < s.maxDepth {
+		if err := registerSketches(tx, pc.hash, pc.features); err != nil {
+			return err
+		}
+	}
+	return putChunkMeta(tx, pc.hash, newMeta)
+}
+
+// storeChunk はチャンク1つを重複排除しつつ即時確定する(大きなファイルの
+// ストリーミング経路)。小さなファイルはマニフェストと同一トランザクションで
+// まとめて確定される(commitManifest 参照)。
+func (s *Store) storeChunk(hash string, data []byte, mode string) error {
+	pc, err := s.prepareChunk(hash, data, mode)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; ; attempt++ {
+		var cleanup []string
+		err := s.batchUpdate(func(tx *bolt.Tx) error {
+			cleanup = cleanup[:0] // Batch 再実行に備えリセット
+			return s.applyChunk(tx, pc, &cleanup)
+		})
+		if err == nil {
 			return nil
 		}
-		// View と Update の間に削除された → 新規として保存し直す
+		s.removeChunkFiles(cleanup)
+		if errors.Is(err, errChunkVanished) && attempt < 2 {
+			s.fillPrepared(pc) // ロック外で圧縮し直して再試行
+			continue
+		}
+		return err
 	}
-
-	// 圧縮・類似検索は CPU/IO コストが高いので bbolt の書き込みロック外で行う。
-	compressed := s.compressChunk(data, mode)
-
-	var features []uint64
-	var baseHash string
-	var deltaData []byte
-	if s.delta {
-		features = computeFeatures(data)
-		baseHash, deltaData = s.tryDelta(features, data, len(compressed))
-	}
-
-	return s.batchUpdate(func(tx *bolt.Tx) error {
-		// 並行アップロードが同じチャンクを先に登録した可能性を再確認。
-		meta, err := getChunkMeta(tx, hash)
-		if err != nil {
-			return err
-		}
-		if meta != nil {
-			meta.RefCount++
-			return putChunkMeta(tx, hash, meta)
-		}
-
-		// デルタ採用時はベースがまだ存在し深さに余裕があるか確認し、参照を増やす。
-		depth := 0
-		if baseHash != "" {
-			baseMeta, err := getChunkMeta(tx, baseHash)
-			if err != nil {
-				return err
-			}
-			if baseMeta == nil || baseMeta.Depth >= s.maxDepth {
-				baseHash = "" // ベース消失/深すぎ → 通常圧縮にフォールバック
-			} else {
-				depth = baseMeta.Depth + 1
-				baseMeta.RefCount++
-				if err := putChunkMeta(tx, baseHash, baseMeta); err != nil {
-					return err
-				}
-			}
-		}
-
-		// サーバー経路の取り込みはこの場でデルタ判定済みなので、
-		// オフラインデルタパスの対象から外す。
-		newMeta := &ChunkMeta{RawSize: int64(len(data)), RefCount: 1, Features: features, DeltaTried: true}
-		var stored []byte
-		switch {
-		case baseHash != "":
-			newMeta.Compression = compressionDelta
-			newMeta.BaseHash = baseHash
-			newMeta.Depth = depth
-			stored = deltaData
-		case len(compressed) < len(data):
-			newMeta.Compression = compressionZstd
-			stored = compressed
-		default:
-			newMeta.Compression = compressionRaw
-			stored = data
-		}
-		newMeta.StoredSize = int64(len(stored))
-
-		loc, err := s.writeRep(hash, "", stored)
-		if err != nil {
-			return err
-		}
-		if err := applyRepLocation(tx, newMeta, "", loc, int64(len(stored))); err != nil {
-			return err
-		}
-		// 深さ上限に達したチャンクはベースにできないので索引を汚さない。
-		if newMeta.Depth < s.maxDepth {
-			if err := registerSketches(tx, hash, features); err != nil {
-				return err
-			}
-		}
-		return putChunkMeta(tx, hash, newMeta)
-	})
 }
 
 // tryDelta は類似チャンクをベースとしたデルタ圧縮を試す。特徴ごとの候補

@@ -193,6 +193,84 @@ func TestDeleteNotFound(t *testing.T) {
 	}
 }
 
+// 小ファイルはチャンク+マニフェストが単一トランザクションで確定される。
+// クォータ超過時は何もコミットされない(チャンクの孤児が残らない)。
+func TestSmallFileQuotaAtomic(t *testing.T) {
+	s := newTestStore(t)
+	data := randomData(t, 64<<10)
+	_, err := s.PutWithOptions("over", bytes.NewReader(data),
+		PutOptions{Owner: "u", Quota: 1024})
+	if err != ErrQuotaExceeded {
+		t.Fatalf("err = %v, want ErrQuotaExceeded", err)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ChunkCount != 0 || st.PhysicalBytes != 0 || st.FileCount != 0 {
+		t.Fatalf("クォータ超過後に chunks=%d physical=%d files=%d が残っています",
+			st.ChunkCount, st.PhysicalBytes, st.FileCount)
+	}
+	res, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Healthy() {
+		t.Fatalf("fsck が不健全: %+v", res)
+	}
+}
+
+// 同一チャンクが1つの小ファイル内に複数回現れても正しく確定される
+// (単一トランザクション内の自己重複排除)。
+func TestSmallFileDupChunksWithinFile(t *testing.T) {
+	s := newTestStore(t)
+	// 同じ 300KiB ブロックを2回繰り返す(min チャンク 256KiB 超なので
+	// 同一境界で同一チャンクが出うる)
+	block := randomData(t, 300<<10)
+	data := append(append([]byte(nil), block...), block...)
+	m := putBytes(t, s, "dup-in-file", data)
+	got := getBytes(t, s, m.ID)
+	if sha256.Sum256(got) != sha256.Sum256(data) {
+		t.Fatal("自己重複ファイルの復元が一致しません")
+	}
+	res, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Healthy() {
+		t.Fatalf("fsck が不健全: %+v", res)
+	}
+	if err := s.Delete(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.Stats()
+	if st.ChunkCount != 0 || st.PhysicalBytes != 0 {
+		t.Fatalf("削除後に chunks=%d physical=%d が残っています", st.ChunkCount, st.PhysicalBytes)
+	}
+}
+
+// 小ファイル(バッファ内)と大ファイル(ストリーミング)の境界をまたいでも
+// 双方が正しく往復する。
+func TestBufferBoundaryFiles(t *testing.T) {
+	s := newTestStore(t)
+	// バッファ上限 = chunkSize*4 = 4MiB(デフォルト)前後のサイズ群
+	for _, size := range []int{1 << 10, 256 << 10, 1 << 20, 4 << 20, (4 << 20) + 1, 6 << 20, 9 << 20} {
+		data := randomDataSeed(t, size, int64(size))
+		m := putBytes(t, s, "bound", data)
+		got := getBytes(t, s, m.ID)
+		if sha256.Sum256(got) != sha256.Sum256(data) {
+			t.Fatalf("size=%d の復元が一致しません", size)
+		}
+	}
+	res, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Healthy() {
+		t.Fatalf("fsck が不健全: %+v", res)
+	}
+}
+
 func TestList(t *testing.T) {
 	s := newTestStore(t)
 	putBytes(t, s, "one", []byte("hello"))
