@@ -32,9 +32,12 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// regionChunks は1リージョンにまとめるチャンク数。8で solid の利得の
-// 8割超が取れ、読み出しコスト(~12MiB/リージョン伸長)はキャッシュが吸収する。
-const regionChunks = 8
+// regionChunks は1リージョンにまとめるチャンク数。実データ(Goソース tar
+// 64MiB)での実測: 独立圧縮比で 束8+19=9.97% / 束16+22=11.35% / 束32+22=
+// 12.26% 改善。16 は 32 の利得の大半を取りつつ、コールドなランダム読みの
+// 伸長コスト(最大 ~16MiB)を半分に抑えるバランス点(RESEARCH.md §4.15)。
+// 順次読み出しはリージョンキャッシュが吸収する。
+const regionChunks = 16
 
 // regionMeta はリージョン1本の使用量。
 type regionMeta struct {
@@ -336,7 +339,10 @@ func (s *Store) packRegion(run []string, res *OptimizeResult) error {
 	if len(members) < 2 {
 		return nil
 	}
-	compressed := s.bestCompress(buf)
+	// オフラインパスなので最強設定(level 22 + リージョン全体が窓に収まる
+	// 大窓)を使う。リージョンは複数チャンクの連結なので、大窓により
+	// チャンクをまたぐ遠距離の反復も1本のフレーム内で拾える。
+	compressed := s.maxCompress(buf)
 
 	regionID := newID()
 	// メンバーの現表現サイズ合計を見積もる

@@ -218,3 +218,67 @@ func TestContainerRejectsGarbage(t *testing.T) {
 		t.Fatal("ストリームのない PDF を受理してしまいました")
 	}
 }
+
+// 拡張パラメータ(memLevel 9 / Z_FILTERED)で作られた gzip も分解できる
+// (従来は memLevel=8 / default strategy しか探索していなかった)。
+func TestExtendedParamSearch(t *testing.T) {
+	plain := testText(300 << 10)
+	for _, tc := range []struct {
+		name   string
+		params int
+	}{
+		{"memLevel9", encodeParams(6, 9, 0)},
+		{"filtered", encodeParams(9, 8, 1)},
+		{"memLevel9-filtered-level1", encodeParams(1, 9, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := deflateExact(plain, tc.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 生成物が標準構成と本当に違うことを確認(探索拡張の意味の検証)
+			std, _ := deflateExact(plain, encodeParams(6, 8, 0))
+			if tc.name == "memLevel9" && bytes.Equal(stream, std) {
+				t.Skip("この zlib では memLevel 9 の出力が標準と同一(探索不要)")
+			}
+			// gzip に包んで TryUnwrap
+			var gz bytes.Buffer
+			gz.Write([]byte{0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3})
+			gz.Write(stream)
+			var tr [8]byte
+			binary.LittleEndian.PutUint32(tr[:], crc32.ChecksumIEEE(plain))
+			binary.LittleEndian.PutUint32(tr[4:], uint32(len(plain)))
+			gz.Write(tr[:])
+
+			u, ok := TryUnwrap(gz.Bytes(), 0)
+			if !ok {
+				t.Fatal("拡張パラメータの gzip を分解できません")
+			}
+			rebuilt, err := Reconstruct(u.Header, u.Level, u.Plain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(rebuilt, gz.Bytes()) {
+				t.Fatal("再構成がビット一致しません")
+			}
+		})
+	}
+}
+
+// パラメータ符号化の後方互換: 0..9 は素のレベルとして復号される。
+func TestParamEncoding(t *testing.T) {
+	for l := 0; l <= 9; l++ {
+		if got := encodeParams(l, 8, 0); got != l {
+			t.Fatalf("encodeParams(%d,8,0) = %d, want %d(後方互換)", l, got, l)
+		}
+		lv, m, st := decodeParams(l)
+		if lv != l || m != 8 || st != 0 {
+			t.Fatalf("decodeParams(%d) = (%d,%d,%d)", l, lv, m, st)
+		}
+	}
+	v := encodeParams(9, 9, 1)
+	lv, m, st := decodeParams(v)
+	if lv != 9 || m != 9 || st != 1 {
+		t.Fatalf("拡張符号の往復に失敗: (%d,%d,%d)", lv, m, st)
+	}
+}

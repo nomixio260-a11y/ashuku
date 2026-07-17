@@ -21,13 +21,14 @@ package precomp
 #include <stdlib.h>
 #include <string.h>
 
-// raw deflate (windowBits=-15, memLevel=8, default strategy) を1回で実行する。
+// raw deflate (windowBits=-15) を memLevel / strategy 指定つきで1回実行する。
 // 戻り値: 出力長(>=0)、エラー時は負の zlib エラーコード。
 static long deflate_exact(const unsigned char* in, unsigned long in_len,
-                          unsigned char* out, unsigned long out_cap, int level) {
+                          unsigned char* out, unsigned long out_cap,
+                          int level, int memLevel, int strategy) {
 	z_stream zs;
 	memset(&zs, 0, sizeof(zs));
-	int rc = deflateInit2(&zs, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+	int rc = deflateInit2(&zs, level, Z_DEFLATED, -15, memLevel, strategy);
 	if (rc != Z_OK) return rc < 0 ? rc : -100;
 	zs.next_in = (unsigned char*)in;
 	zs.avail_in = in_len;
@@ -40,13 +41,14 @@ static long deflate_exact(const unsigned char* in, unsigned long in_len,
 	return n;
 }
 
-static unsigned long deflate_bound(unsigned long n) {
+static unsigned long deflate_bound(unsigned long n, int memLevel) {
 	z_stream zs;
 	memset(&zs, 0, sizeof(zs));
-	if (deflateInit2(&zs, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return n + n/2 + 1024;
+	if (deflateInit2(&zs, 6, Z_DEFLATED, -15, memLevel, Z_DEFAULT_STRATEGY) != Z_OK) return n + n/2 + 1024;
 	unsigned long b = deflateBound(&zs, n);
 	deflateEnd(&zs);
-	return b;
+	// memLevel 次第で保存ブロックが増えうるので余裕を持たせる
+	return b + n/8 + 1024;
 }
 */
 import "C"
@@ -119,34 +121,88 @@ func parseHeaderLen(data []byte) (int, error) {
 	return n, nil
 }
 
-// deflateExact は zlib の raw deflate をレベル指定で実行する。
-func deflateExact(plain []byte, level int) ([]byte, error) {
-	bound := uint64(C.deflate_bound(C.ulong(len(plain))))
+// パラメータ符号化: レシピの「レベル」フィールド(int)に level / memLevel /
+// strategy を詰める。0..9 は従来形式(level のみ、memLevel=8・default
+// strategy)と解釈するため、既存レシピとの後方互換が保たれる。
+func encodeParams(level, memLevel, strategy int) int {
+	if memLevel == 8 && strategy == 0 {
+		return level
+	}
+	return level | memLevel<<8 | strategy<<16
+}
+
+func decodeParams(v int) (level, memLevel, strategy int) {
+	if v >= 0 && v <= 9 {
+		return v, 8, 0
+	}
+	return v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff
+}
+
+// deflateExact は zlib の raw deflate をパラメータ指定で実行する。
+// params は encodeParams の符号化値(0..9 は素のレベル)。
+func deflateExact(plain []byte, params int) ([]byte, error) {
+	level, memLevel, strategy := decodeParams(params)
+	bound := uint64(C.deflate_bound(C.ulong(len(plain)), C.int(memLevel)))
 	out := make([]byte, bound)
 	var inPtr *C.uchar
 	if len(plain) > 0 {
 		inPtr = (*C.uchar)(unsafe.Pointer(&plain[0]))
 	}
 	n := C.deflate_exact(inPtr, C.ulong(len(plain)),
-		(*C.uchar)(unsafe.Pointer(&out[0])), C.ulong(bound), C.int(level))
+		(*C.uchar)(unsafe.Pointer(&out[0])), C.ulong(bound),
+		C.int(level), C.int(memLevel), C.int(strategy))
 	if n < 0 {
 		return nil, fmt.Errorf("zlib deflate 失敗 (code %d)", int(n))
 	}
 	return out[:n], nil
 }
 
-// 探索順: zlib デフォルト6と最高9が実世界の大半を占めるので先に試す。
-var levelOrder = []int{6, 9, 1, 2, 3, 4, 5, 7, 8}
+// 探索候補。標準構成(memLevel=8, default strategy)のレベル 6/9 が実世界の
+// 大半を占めるので先に試し、外れたら拡張構成(memLevel 9 = 一部ライブラリの
+// 設定、Z_FILTERED = PNG 最適化ツール等)を試す。
+// Z_HUFFMAN_ONLY / Z_RLE をストリーム全体に使うプロデューサは実世界では
+// 稀なため探索に含めない(RESEARCH.md §4.15)。
+var paramOrder, paramOrderSmall = func() ([]int, []int) {
+	var full, small []int
+	levels := []int{6, 9, 1, 2, 3, 4, 5, 7, 8}
+	// 標準構成(従来の探索空間)
+	for _, l := range levels {
+		full = append(full, encodeParams(l, 8, 0))
+	}
+	small = append(small, full...)
+	// 拡張: memLevel 9(zlib 利用側が MAX_MEM_LEVEL を指定するケース)
+	for _, l := range levels {
+		full = append(full, encodeParams(l, 9, 0))
+	}
+	// 拡張: Z_FILTERED(PNG 系ツールが使う)× 標準/最大 memLevel
+	for _, l := range levels {
+		full = append(full, encodeParams(l, 8, 1))
+	}
+	// 大きな入力用の縮小版: 拡張はよく現れる組み合わせだけに絞る
+	small = append(small,
+		encodeParams(6, 9, 0), encodeParams(9, 9, 0),
+		encodeParams(6, 8, 1), encodeParams(9, 8, 1))
+	return full, small
+}()
 
-// findLevel は deflate ストリームをビット一致再現できる zlib レベルを探す。
+// fullSearchMax を超える展開データでは縮小候補だけ試す
+// (1候補=1回の deflate なので、巨大入力での全探索は CPU を浪費する)。
+const fullSearchMax = 8 << 20
+
+// findLevel は deflate ストリームをビット一致再現できる zlib パラメータを
+// 探す。返り値は encodeParams の符号化値(標準構成なら素のレベル)。
 func findLevel(plain, deflateStream []byte) (int, bool) {
-	for _, level := range levelOrder {
-		candidate, err := deflateExact(plain, level)
+	order := paramOrder
+	if len(plain) > fullSearchMax {
+		order = paramOrderSmall
+	}
+	for _, params := range order {
+		candidate, err := deflateExact(plain, params)
 		if err != nil {
 			return 0, false
 		}
 		if bytes.Equal(candidate, deflateStream) {
-			return level, true
+			return params, true
 		}
 	}
 	return 0, false

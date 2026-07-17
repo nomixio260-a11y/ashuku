@@ -227,13 +227,15 @@ func (s *Store) recompressChunk(hash string, res *OptimizeResult) (bool, error) 
 	if err != nil {
 		return false, nil // 並行削除など。スキップ
 	}
-	out, err := zstdc.Compress(data)
+	// オフラインなので最強設定(level 22)。旧 "z19" 表現もこの条件
+	// (厳密に縮む場合のみ)で自然にアップグレードされる。
+	out, err := zstdc.CompressMax(data)
 	if err != nil {
 		return false, nil
 	}
 
 	// 事前チェック(改善なしならファイルを書かない)
-	newRep := "z19"
+	newRep := "z22"
 	improves := false
 	s.db.View(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)

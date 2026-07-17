@@ -11,7 +11,15 @@ func Available() bool { return false }
 // Level は本家エンコーダで使う圧縮レベル(参考値)。
 const Level = 19
 
+// MaxLevel はオフライン経路の最高レベル(参考値)。
+const MaxLevel = 22
+
 // Compress は常にエラーを返す(CGO 無効)。
 func Compress(data []byte) ([]byte, error) {
+	return nil, errors.New("このビルドは libzstd 非対応です(CGO 無効)")
+}
+
+// CompressMax は常にエラーを返す(CGO 無効)。
+func CompressMax(data []byte) ([]byte, error) {
 	return nil, errors.New("このビルドは libzstd 非対応です(CGO 無効)")
 }

@@ -352,7 +352,7 @@ func (s *Store) compressChunk(data []byte, mode string) []byte {
 	}
 }
 
-// bestCompress は使える中で最強のエンコーダで圧縮する。
+// bestCompress は取り込み経路の最強エンコーダで圧縮する。
 // 本家 libzstd(level 19)が使えるビルドではそれを使い(純Go最高レベル
 // = 本家 level 11 相当より、テキスト系で 8〜10% 小さい)、
 // 出力は標準 zstd フレームなので復号側は変わらない。
@@ -363,6 +363,19 @@ func (s *Store) bestCompress(data []byte) []byte {
 		}
 	}
 	return s.encBest.EncodeAll(data, make([]byte, 0, len(data)/2))
+}
+
+// maxCompress はオフライン経路(リージョン圧縮・背景再圧縮)用の最強圧縮:
+// level 22(ultra)+ 入力サイズに合わせた大窓 + long-distance matching。
+// 取り込み経路の bestCompress(19)よりさらに数%小さいが数倍遅いため、
+// ユーザーを待たせない背景処理だけで使う(実測は RESEARCH.md §4.15)。
+func (s *Store) maxCompress(data []byte) []byte {
+	if zstdc.Available() {
+		if out, err := zstdc.CompressMax(data); err == nil {
+			return out
+		}
+	}
+	return s.bestCompress(data)
 }
 
 // Close はストアを閉じる。
