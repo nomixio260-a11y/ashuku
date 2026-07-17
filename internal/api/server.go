@@ -6,6 +6,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -166,13 +167,27 @@ func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) htt
 				key = h[7:]
 			}
 		}
-		u, ok := s.opts.Users[key]
+		u, ok := s.lookupUser(key)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "APIキーが無効です")
 			return
 		}
 		next(w, r, authed{owner: key, user: u})
 	}
+}
+
+// lookupUser は APIキーを定時間比較で照合する。マップの直接引きと違い、
+// 比較時間がキー内容に依存しないため、応答時間からキーを1文字ずつ
+// 推測するタイミング攻撃が成立しない(全登録キーと必ず比較する)。
+func (s *Server) lookupUser(key string) (User, bool) {
+	var found User
+	ok := false
+	for k, u := range s.opts.Users {
+		if subtle.ConstantTimeCompare([]byte(k), []byte(key)) == 1 {
+			found, ok = u, true
+		}
+	}
+	return found, ok
 }
 
 // handleUpload はリクエストボディをそのまま保存する。
@@ -190,6 +205,26 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 		writeError(w, http.StatusInsufficientStorage,
 			"サーバーのディスク空き容量が不足しています")
 		return
+	}
+	// Content-Length が申告されている場合はボディを読む前に事前拒否する
+	// (上限やクォータを大幅に超えるアップロードの帯域・CPUを浪費しない)。
+	// 申告なし/虚偽申告は従来どおり取り込み中の上限とコミット時のクォータ
+	// 検査(権威判定)で守られる。
+	if cl := r.ContentLength; cl > 0 {
+		if s.opts.MaxUploadBytes > 0 && cl > s.opts.MaxUploadBytes {
+			s.metrics.uploadErrors.Add(1)
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("アップロードサイズが上限(%d bytes)を超えています", s.opts.MaxUploadBytes))
+			return
+		}
+		if a.user.Quota > 0 {
+			if used, err := s.store.OwnerUsage(a.owner); err == nil && used+cl > a.user.Quota {
+				s.metrics.uploadErrors.Add(1)
+				writeError(w, http.StatusInsufficientStorage,
+					"容量クォータを超過しています(不要なファイルを削除してください)")
+				return
+			}
+		}
 	}
 	s.metrics.uploadsTotal.Add(1)
 	name := r.Header.Get("X-File-Name")
@@ -300,8 +335,24 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, a authed
 	}
 }
 
+// maxListLimit は1ページの最大件数。
+const maxListLimit = 10000
+
+// handleList はファイル一覧を作成日時の降順で返す。
+// ?limit=N でページ件数を制限でき(最大10000)、続きがある場合は
+// レスポンスの next_cursor を次の ?after= に渡す(カーソルページング)。
+// limit 省略時は全件(後方互換)。
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
-	files, err := s.store.List(a.owner)
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit は正の整数で指定してください")
+			return
+		}
+		limit = min(n, maxListLimit)
+	}
+	files, next, err := s.store.ListPage(a.owner, r.URL.Query().Get("after"), limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -309,7 +360,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
 	if files == nil {
 		files = []*store.FileManifest{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	resp := map[string]any{"files": files}
+	if next != "" {
+		resp["next_cursor"] = next
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, a authed) {
@@ -503,9 +558,12 @@ func (s *Server) handleChunkPut(w http.ResponseWriter, r *http.Request, _ authed
 		return
 	}
 	if err := s.store.PutChunkVerified(hash, stored, compression, rawSize); err != nil {
+		s.metrics.uploadErrors.Add(1)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// クライアント支援経路も転送量メトリクスに計上する(圧縮済みサイズ)。
+	s.metrics.bytesUploaded.Add(int64(len(stored)))
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -532,7 +590,9 @@ func (s *Server) handleChunkGet(w http.ResponseWriter, r *http.Request, a authed
 	w.Header().Set("X-Compression", compression)
 	w.Header().Set("X-Raw-Size", strconv.FormatInt(rawSize, 10))
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.Write(data)
+	s.metrics.bytesDownloaded.Add(int64(len(data)))
 }
 
 func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a authed) {
@@ -552,6 +612,10 @@ func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a 
 	m, missing, err := s.store.CommitClientManifest(
 		req.Name, a.owner, req.Chunks, a.user.Quota, s.opts.MaxUploadBytes)
 	if err != nil {
+		if !errors.Is(err, store.ErrChunksMissing) {
+			// 409(missing 交渉)は正常なプロトコルの一部なのでエラーに数えない
+			s.metrics.uploadErrors.Add(1)
+		}
 		switch {
 		case errors.Is(err, store.ErrChunksMissing):
 			writeJSON(w, http.StatusConflict, map[string]any{
@@ -566,6 +630,8 @@ func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a 
 		}
 		return
 	}
+	// クライアント支援経路のアップロード完了もメトリクスに計上する。
+	s.metrics.uploadsTotal.Add(1)
 	writeJSON(w, http.StatusCreated, m)
 }
 

@@ -23,9 +23,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -150,6 +150,31 @@ type Store struct {
 	precompMax  int64         // precompression の展開上限
 	precompSem  chan struct{} // precompression の同時実行制限
 	optMu       sync.Mutex    // Optimize の同時実行を直列化
+	// writeWaiters は進行中の書き込みトランザクション要求数(batchUpdate の
+	// 適応判定に使う: 並行書き込みがあるときだけグループコミットに切り替える)。
+	writeWaiters atomic.Int64
+}
+
+// batchDelay はグループコミットの合流待ち時間の上限。並行書き込みが
+// この窓に到着すると1回の fsync に合流する。単独の書き込みは batchUpdate の
+// 適応判定で通常の Update(遅延なし)を使うため、この遅延を払わない。
+const batchDelay = 2 * time.Millisecond
+
+// batchUpdate は書き込みトランザクションを実行する。並行する書き込みが
+// ある場合は bbolt の Batch でグループコミット(複数のコミットが1回の
+// fsync に合流し、多ユーザー同時アップロードのスループットが桁で上がる)、
+// 単独の場合は通常の Update(追加遅延なし)。
+//
+// 契約: fn はリトライされうる(Batch は同居した別の fn が失敗すると各 fn を
+// 単独で再実行する)。fn 内で外の変数に書く場合は fn の先頭で毎回
+// リセットし、途中経過を持ち越さないこと。
+func (s *Store) batchUpdate(fn func(*bolt.Tx) error) error {
+	n := s.writeWaiters.Add(1)
+	defer s.writeWaiters.Add(-1)
+	if n > 1 {
+		return s.db.Batch(fn)
+	}
+	return s.db.Update(fn)
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。
@@ -168,6 +193,9 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// グループコミットの合流窓(batchUpdate 参照)。デフォルトの 10ms は
+	// 並行書き込みのレイテンシに直結するので短く抑える。
+	db.MaxBatchDelay = batchDelay
 	requested := cfg.AvgChunkSize
 	if requested <= 0 {
 		requested = chunker.DefaultAverageSize
@@ -317,12 +345,15 @@ func (s *Store) bestCompress(data []byte) []byte {
 
 // Close はストアを閉じる。
 func (s *Store) Close() error {
-	s.pw.close()
+	perr := s.pw.close()
 	s.encFast.Close()
 	s.encBalanced.Close()
 	s.encBest.Close()
 	s.dec.Close()
-	return s.db.Close()
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+	return perr
 }
 
 // chunkPath は保存表現ファイルのパス。rep は表現ID(空=初期表現)。
@@ -542,7 +573,7 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 // 返す(チェックと加算は同一トランザクションなので並行アップロードでも
 // 突き抜けない)。失敗時はチャンク参照を戻す。
 func (s *Store) commitManifest(m *FileManifest, quota int64) error {
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.batchUpdate(func(tx *bolt.Tx) error {
 		used, err := ownerUsage(tx, m.Owner)
 		if err != nil {
 			return err
@@ -583,19 +614,37 @@ func (s *Store) OwnerUsage(owner string) (int64, error) {
 //     デルタ圧縮(zstd 辞書圧縮)を試す。十分縮めばデルタで保存
 //  3. それ以外は zstd 圧縮(縮まなければ raw)で保存
 func (s *Store) storeChunk(hash string, data []byte, mode string) error {
-	// 高速パス: 完全一致の既存チャンクは圧縮せずに参照カウントだけ増やす。
-	existed := false
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	// 高速パス: まず読み取りトランザクションで存在確認する(以前は存在
+	// しない場合も空の書き込みTxをコミットし、新規チャンクごとに fsync を
+	// 1回浪費していた)。既存なら参照カウントだけ増やす(重複排除)。
+	exists := false
+	err := s.db.View(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)
-		if err != nil || meta == nil {
+		exists = meta != nil
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if exists {
+		bumped := false
+		err := s.batchUpdate(func(tx *bolt.Tx) error {
+			bumped = false
+			meta, err := getChunkMeta(tx, hash)
+			if err != nil || meta == nil {
+				return err
+			}
+			meta.RefCount++
+			bumped = true
+			return putChunkMeta(tx, hash, meta)
+		})
+		if err != nil {
 			return err
 		}
-		existed = true
-		meta.RefCount++
-		return putChunkMeta(tx, hash, meta)
-	})
-	if err != nil || existed {
-		return err
+		if bumped {
+			return nil
+		}
+		// View と Update の間に削除された → 新規として保存し直す
 	}
 
 	// 圧縮・類似検索は CPU/IO コストが高いので bbolt の書き込みロック外で行う。
@@ -609,7 +658,7 @@ func (s *Store) storeChunk(hash string, data []byte, mode string) error {
 		baseHash, deltaData = s.tryDelta(features, data, len(compressed))
 	}
 
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.batchUpdate(func(tx *bolt.Tx) error {
 		// 並行アップロードが同じチャンクを先に登録した可能性を再確認。
 		meta, err := getChunkMeta(tx, hash)
 		if err != nil {
@@ -942,7 +991,7 @@ func (s *Store) Manifest(id string) (*FileManifest, error) {
 // 所有者の使用量も減算する。
 func (s *Store) Delete(id string) error {
 	var m *FileManifest
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.batchUpdate(func(tx *bolt.Tx) error {
 		var err error
 		m, err = getFileManifest(tx, id)
 		if err != nil {
@@ -972,9 +1021,9 @@ func (s *Store) Delete(id string) error {
 // (=物理削除してよい)チャンクのファイルパス列を返す。
 func (s *Store) releaseChunks(hashes []string) ([]string, error) {
 	var orphans []string
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.batchUpdate(func(tx *bolt.Tx) error {
 		var err error
-		orphans, err = s.releaseChunksTx(tx, hashes)
+		orphans, err = s.releaseChunksTx(tx, hashes) // 再実行時は再代入される
 		return err
 	})
 	return orphans, err
@@ -1031,35 +1080,61 @@ func (s *Store) removeChunkFiles(paths []string) {
 // List は owner が所有するファイル一覧を作成日時の降順で返す
 // (認証なし運用では owner は常に "" で全件が対象になる)。
 func (s *Store) List(owner string) ([]*FileManifest, error) {
+	files, _, err := s.ListPage(owner, "", 0)
+	return files, err
+}
+
+// ListPage は owner のファイル一覧を作成日時の降順でページ単位に返す。
+// after は前ページの next カーソル("" で先頭から)、limit は最大件数
+// (0 で無制限)。まだ続きがある場合は次ページ用の不透明カーソルを返す。
+//
+// 所有者索引(作成日時降順キー+表示レコード内蔵)のプレフィックス走査
+// なので、O(このページの件数)で済む: 店全体はもちろん、その所有者の
+// 全ファイルすら走査せず、巨大マニフェスト(チャンク列)も読まない。
+func (s *Store) ListPage(owner, after string, limit int) ([]*FileManifest, string, error) {
 	var files []*FileManifest
+	var next string
 	err := s.db.View(func(tx *bolt.Tx) error {
-		// 所有者索引をプレフィックス走査し、その所有者のファイルだけを引く
-		// (店全体を走査しないので、他ユーザーのファイル数に影響されない)。
 		prefix := ownerFilePrefix(owner)
-		fb := tx.Bucket(bucketFiles)
 		c := tx.Bucket(bucketFileOwners).Cursor()
-		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			id := k[len(prefix):]
-			raw := fb.Get(id)
-			if raw == nil {
-				continue // 索引に対応するファイルが無い(fsck が掃除する)
+		k, v := c.Seek(prefix)
+		if after != "" {
+			// カーソルはキーの接頭辞以降(反転TS+ID)の hex 表現。
+			suffix, err := hex.DecodeString(after)
+			if err != nil {
+				return fmt.Errorf("カーソルが不正です")
 			}
-			var m FileManifest
-			if err := json.Unmarshal(raw, &m); err != nil {
+			k, v = c.Seek(append(append([]byte(nil), prefix...), suffix...))
+			if k != nil && bytes.HasPrefix(k, prefix) && bytes.Equal(k[len(prefix):], suffix) {
+				k, v = c.Next() // カーソル自身は前ページで返済み
+			}
+		}
+		var lastSuffix []byte
+		for ; k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			if limit > 0 && len(files) >= limit {
+				// まだ続きがある → 最後に返した要素をカーソルにする
+				next = hex.EncodeToString(lastSuffix)
+				return nil
+			}
+			var rec fileIndexRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
 			}
-			m.Chunks = nil // 一覧にはチャンク列は不要
-			files = append(files, &m)
+			files = append(files, &FileManifest{
+				ID:        rec.ID,
+				Name:      rec.Name,
+				Size:      rec.Size,
+				CreatedAt: rec.CreatedAt,
+				Owner:     owner,
+			})
+			lastSuffix = append(lastSuffix[:0], k[len(prefix):]...)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].CreatedAt.After(files[j].CreatedAt)
-	})
-	return files, nil
+	return files, next, nil
 }
 
 // Stats はストア全体の容量統計。

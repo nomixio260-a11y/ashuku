@@ -2,7 +2,9 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -121,10 +123,10 @@ func TestFsckRepairsFileOwnerIndex(t *testing.T) {
 	// 孤児エントリを1つ追加する。
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		idx := tx.Bucket(bucketFileOwners)
-		if err := idx.Delete(ownerFileKey("u", m.ID)); err != nil { // 欠損を作る
+		if err := idx.Delete(ownerFileKey("u", m.CreatedAt, m.ID)); err != nil { // 欠損を作る
 			return err
 		}
-		return idx.Put(ownerFileKey("u", "ghost-id"), nil) // 孤児を作る
+		return idx.Put(ownerFileKey("u", time.Now(), "ghost-id"), nil) // 孤児を作る
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +155,97 @@ func TestFsckRepairsFileOwnerIndex(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].ID != m.ID {
 		t.Fatalf("修復後の List = %v, want [%s]", names(files), m.ID)
+	}
+}
+
+// List は作成日時の降順(新しい順)で返る。索引キーの反転タイムスタンプに
+// よる順序であり、ソート処理は無い。
+func TestListNewestFirst(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 5; i++ {
+		putOwned(t, s, "u", fmt.Sprintf("f%d", i), []byte{byte(i)})
+		time.Sleep(2 * time.Millisecond) // CreatedAt を確実に単調増加させる
+	}
+	files, err := s.List("u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 5 {
+		t.Fatalf("len = %d, want 5", len(files))
+	}
+	for i := 0; i < len(files)-1; i++ {
+		if files[i].CreatedAt.Before(files[i+1].CreatedAt) {
+			t.Fatalf("順序が新しい順ではありません: %v", names(files))
+		}
+	}
+	if files[0].Name != "f4" || files[4].Name != "f0" {
+		t.Fatalf("順序が不正: %v", names(files))
+	}
+}
+
+// ListPage はカーソルで全件を漏れなく重複なく辿れる。
+func TestListPagePagination(t *testing.T) {
+	s := newTestStore(t)
+	const n = 7
+	for i := 0; i < n; i++ {
+		putOwned(t, s, "u", fmt.Sprintf("f%d", i), []byte{byte(i)})
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	seen := map[string]bool{}
+	cursor := ""
+	pages := 0
+	for {
+		files, next, err := s.ListPage("u", cursor, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		for _, f := range files {
+			if seen[f.ID] {
+				t.Fatalf("ページ間でファイル %s (%s) が重複しました", f.ID, f.Name)
+			}
+			seen[f.ID] = true
+		}
+		if next == "" {
+			break
+		}
+		if len(files) != 3 {
+			t.Fatalf("途中ページの件数 = %d, want 3", len(files))
+		}
+		cursor = next
+	}
+	if len(seen) != n {
+		t.Fatalf("ページング合計 = %d 件, want %d", len(seen), n)
+	}
+	if pages != 3 { // 3+3+1
+		t.Fatalf("ページ数 = %d, want 3", pages)
+	}
+
+	// 不正カーソルはエラー
+	if _, _, err := s.ListPage("u", "zz-not-hex", 3); err == nil {
+		t.Fatal("不正カーソルがエラーになりません")
+	}
+}
+
+// 一覧は索引レコードだけで組み立てられ、名前・サイズが正しい
+// (巨大マニフェストを読まない実装になっても内容が欠けないことの確認)。
+func TestListRecordFields(t *testing.T) {
+	s := newTestStore(t)
+	data := []byte("hello world, this is content")
+	putOwned(t, s, "u", "record.txt", data)
+
+	files, err := s.List("u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("len = %d, want 1", len(files))
+	}
+	f := files[0]
+	if f.Name != "record.txt" || f.Size != int64(len(data)) || f.Owner != "u" ||
+		f.ID == "" || f.CreatedAt.IsZero() {
+		t.Fatalf("一覧レコードのフィールドが不正: %+v", f)
 	}
 }
 

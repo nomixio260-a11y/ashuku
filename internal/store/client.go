@@ -61,7 +61,7 @@ func (s *Store) HasChunks(hashes []string) ([]string, error) {
 		return missing, err
 	}
 	now := time.Now().Unix()
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err = s.batchUpdate(func(tx *bolt.Tx) error {
 		for _, h := range stagedHits {
 			meta, err := getChunkMeta(tx, h)
 			if err != nil || meta == nil || meta.Staged == 0 {
@@ -140,7 +140,7 @@ func (s *Store) PutChunkVerified(hash string, stored []byte, compression string,
 	// デルタ圧縮そのものはオフラインパスに任せる。
 	features := computeFeatures(raw)
 
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.batchUpdate(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)
 		if err != nil {
 			return err
@@ -183,8 +183,8 @@ func (s *Store) CommitClientManifest(name, owner string, hashes []string, quota,
 		Chunks:    hashes,
 	}
 	var missing []string
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		missing = missing[:0]
+	err := s.batchUpdate(func(tx *bolt.Tx) error {
+		missing = missing[:0] // Batch 再実行に備え毎回リセット
 		total := int64(0)
 		metas := make([]*ChunkMeta, len(hashes))
 		for i, h := range hashes {

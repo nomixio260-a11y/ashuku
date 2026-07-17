@@ -13,9 +13,11 @@ package store
 // 現行パックへ copy-forward してから削除)が回収する。Data Domain の
 // container cleaning と同じ方式。
 //
-// クラッシュ安全性: パック追記→メタ更新の順で行うため、クラッシュしても
-// メタデータが指す領域は常に書き込み済み(取り残された追記は無害なゴミに
-// なり、コンパクションで消える)。
+// クラッシュ安全性: パック追記→fsync→メタ更新の順で行うため、クラッシュ
+// してもメタデータが指す領域は常にディスク上にある(取り残された追記は
+// 無害なゴミになり、コンパクションで消える)。fsync は「同期済み水位」で
+// 管理され、並行する複数の追記を1回の fsync がまとめてカバーする
+// (グループコミット。追記のたびに毎回 fsync するわけではない)。
 
 import (
 	"fmt"
@@ -31,9 +33,6 @@ const (
 	packThreshold = 128 << 10
 	// maxPackSize を超えたパックは閉じて新しいパックに切り替える。
 	maxPackSize = 64 << 20
-	// syncEvery バイト追記するごとに fsync する(クラッシュ時の
-	// 未書き込み窓を制限しつつ、小さな追記ごとの fsync を避ける)。
-	syncEvery = 4 << 20
 )
 
 // compactMinSize 以上かつ live 率 50% 未満のパックをコンパクションする
@@ -48,12 +47,12 @@ type packMeta struct {
 
 // packWriter は現行パックへの追記を直列化する。
 type packWriter struct {
-	mu        sync.Mutex
-	dir       string
-	id        string
-	f         *os.File
-	off       int64
-	sinceSync int64
+	mu     sync.Mutex
+	dir    string
+	id     string
+	f      *os.File
+	off    int64
+	synced int64 // ここまでのオフセットは fsync 済み(同期水位)
 }
 
 func newPackWriter(dir string) *packWriter {
@@ -65,6 +64,8 @@ func (w *packWriter) packPath(id string) string {
 }
 
 // append はデータを現行パックに追記し、(packID, offset) を返す。
+// 書き込みはまだ fsync されていない。メタデータがこの位置を指す前に
+// ensureSynced を呼ぶこと(耐久性の契約)。
 func (w *packWriter) append(data []byte) (string, int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -79,21 +80,44 @@ func (w *packWriter) append(data []byte) (string, int64, error) {
 		return "", 0, err
 	}
 	w.off += int64(len(data))
-	w.sinceSync += int64(len(data))
-	if w.sinceSync >= syncEvery {
-		if err := w.f.Sync(); err != nil {
-			return "", 0, err
-		}
-		w.sinceSync = 0
-	}
 	return w.id, off, nil
 }
 
-// roll は現行パックを閉じ、新しいパックを開く。
+// ensureSynced はパック id のオフセット end までがディスク上にあることを
+// 保証する。同期水位方式: 1回の fsync がその時点までの全追記をカバーする
+// ので、並行する多数の小さな追記の fsync は自然に1回へ合流する
+// (最初の呼び出しが支払い、残りはほぼ無料)。ロール済みのパックは
+// クローズ時に同期済みなので何もしない。
+func (w *packWriter) ensureSynced(id string, end int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.id != id || w.f == nil {
+		return nil // ロール済み(クローズ時に fsync 済み)
+	}
+	if w.synced >= end {
+		return nil
+	}
+	if err := w.f.Sync(); err != nil {
+		return err
+	}
+	w.synced = w.off
+	return nil
+}
+
+// roll は現行パックを閉じ、新しいパックを開く。閉じる際に fsync し、
+// 新しいパックのディレクトリエントリも fsync する(クラッシュしても
+// メタデータが指すパックファイルが確実に存在する)。
 func (w *packWriter) roll() error {
 	if w.f != nil {
-		w.f.Sync()
-		w.f.Close()
+		if err := w.f.Sync(); err != nil {
+			w.f.Close()
+			w.f = nil
+			return err
+		}
+		if err := w.f.Close(); err != nil {
+			w.f = nil
+			return err
+		}
 		w.f = nil
 	}
 	if err := os.MkdirAll(w.dir, 0o700); err != nil {
@@ -104,7 +128,12 @@ func (w *packWriter) roll() error {
 	if err != nil {
 		return err
 	}
-	w.id, w.f, w.off, w.sinceSync = id, f, 0, 0
+	if err := fsyncDir(w.dir); err != nil {
+		f.Close()
+		os.Remove(w.packPath(id))
+		return err
+	}
+	w.id, w.f, w.off, w.synced = id, f, 0, 0
 	return nil
 }
 
@@ -126,14 +155,18 @@ func (w *packWriter) rollIf(id string) error {
 	return w.roll()
 }
 
-func (w *packWriter) close() {
+func (w *packWriter) close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.f != nil {
-		w.f.Sync()
-		w.f.Close()
-		w.f = nil
+	if w.f == nil {
+		return nil
 	}
+	err := w.f.Sync()
+	if cerr := w.f.Close(); err == nil {
+		err = cerr
+	}
+	w.f = nil
+	return err
 }
 
 // readFromPack はパック内の表現を読み出す。
@@ -170,13 +203,17 @@ type repLocation struct {
 	packOff int64
 }
 
-// writeRep は保存表現を書き込む。小さければパックへ、大きければ
-// 単独ファイル(hash+rep 名)へ。パック使用量の計上は呼び出し側の tx で
-// commitRepUsage を呼んで行う。
+// writeRep は保存表現を耐久的に書き込む。小さければパックへ追記して
+// fsync 水位を進め(並行書き込みの fsync は1回に合流する)、大きければ
+// 単独ファイル(hash+rep 名)へ durableWrite する。どちらの経路でも、
+// 返った時点でデータはディスク上にある(この後のメタコミットが安全)。
 func (s *Store) writeRep(hash, rep string, data []byte) (repLocation, error) {
 	if len(data) < packThreshold {
 		packID, off, err := s.pw.append(data)
 		if err != nil {
+			return repLocation{}, err
+		}
+		if err := s.pw.ensureSynced(packID, off+int64(len(data))); err != nil {
 			return repLocation{}, err
 		}
 		return repLocation{packID: packID, packOff: off}, nil
@@ -288,6 +325,8 @@ func (s *Store) compactOnePack(packID string, res *OptimizeResult) error {
 	// 移動とバケットエントリ削除を1トランザクションで原子的に行う。
 	// (移動先への追記はファイルIOなので tx 内で行っても安全)
 	err = s.db.Update(func(tx *bolt.Tx) error {
+		var lastPack string
+		var lastEnd int64
 		for _, hash := range movers {
 			meta, err := getChunkMeta(tx, hash)
 			if err != nil {
@@ -310,6 +349,14 @@ func (s *Store) compactOnePack(packID string, res *OptimizeResult) error {
 				return err
 			}
 			if err := adjustPackUsage(tx, newPack, meta.StoredSize, meta.StoredSize); err != nil {
+				return err
+			}
+			lastPack, lastEnd = newPack, newOff+meta.StoredSize
+		}
+		// メタがコミットされる前に移動先の追記をディスクへ確定する
+		// (途中のロールで閉じたパックは閉鎖時に同期済み)。
+		if lastPack != "" {
+			if err := s.pw.ensureSynced(lastPack, lastEnd); err != nil {
 				return err
 			}
 		}

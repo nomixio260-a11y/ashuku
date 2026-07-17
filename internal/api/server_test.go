@@ -126,6 +126,78 @@ func TestListAndStats(t *testing.T) {
 	}
 }
 
+// 一覧の ?limit= と next_cursor によるページングで全件を漏れなく辿れる。
+func TestListPagination(t *testing.T) {
+	srv := newTestServer(t)
+	for i := 0; i < 5; i++ {
+		upload(t, srv, "p", []byte{byte(i)})
+	}
+
+	seen := map[string]bool{}
+	cursor := ""
+	for {
+		u := srv.URL + "/api/v1/files?limit=2"
+		if cursor != "" {
+			u += "&after=" + cursor
+		}
+		resp, err := http.Get(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var page struct {
+			Files      []store.FileManifest `json:"files"`
+			NextCursor string               `json:"next_cursor"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		for _, f := range page.Files {
+			if seen[f.ID] {
+				t.Fatalf("ページ間で %s が重複", f.ID)
+			}
+			seen[f.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != 5 {
+		t.Fatalf("ページング合計 = %d, want 5", len(seen))
+	}
+
+	// 不正な limit は 400
+	resp, err := http.Get(srv.URL + "/api/v1/files?limit=abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("limit=abc の status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// Content-Length が上限超過のアップロードはボディを読まずに 413 で拒否される。
+func TestUploadEarlyRejectByContentLength(t *testing.T) {
+	st, err := store.Open(t.TempDir(), store.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(st, Options{MaxUploadBytes: 1024}))
+	t.Cleanup(func() { srv.Close(); st.Close() })
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/files", bytes.NewReader(make([]byte, 4096)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
 func TestNotFound(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := http.Get(srv.URL + "/api/v1/files/deadbeef")

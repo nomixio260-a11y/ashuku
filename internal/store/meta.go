@@ -29,20 +29,25 @@ var (
 	bucketOwnerChunks = []byte("ownerchunks")
 	// bucketRegions はリージョンごとの使用量(圧縮後サイズ・メンバー数・生存数)。
 	bucketRegions = []byte("regions")
-	// bucketFileOwners は「所有者 → ファイルID」の二次索引。
-	// キーは ownerKey(owner) + 0x1F + fileID、値は空。List(owner) を
-	// 全ファイル走査(O(総ファイル数))から O(その所有者のファイル数)にする。
-	// 多数のユーザーが多数の小ファイルを持つ運用で、一覧取得が店全体の規模に
-	// 比例して遅くなる問題を防ぐ。
+	// bucketFileOwners は「所有者 → ファイル」の二次索引。
+	// キーは ownerKey(owner) + 0x1F + 反転UnixNano(8B) + fileID で、
+	// プレフィックス走査が自然に作成日時の降順(新しい順)になる。
+	// 値は一覧表示用の小さなレコード(ID/名前/サイズ/作成日時)なので、
+	// 一覧のために巨大なマニフェスト(チャンク列込み。1万チャンクで
+	// ~660KB の JSON)を読む必要がない。
+	// これにより List(owner) は O(その所有者のファイル数)・ソート不要・
+	// カーソルページング可能になり、多数のユーザーが多数の小ファイルを
+	// 持つ運用でも一覧取得が店全体の規模に影響されない。
 	bucketFileOwners = []byte("fileowners")
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
 
 // keyFileOwnersMigrated は fileowners 索引のバックフィル完了フラグ。
-// 索引導入前に作られた既存ストアを開いたとき、一度だけ全ファイルから
+// 索引導入前(または旧形式)のストアを開いたとき、一度だけ全ファイルから
 // 索引を再構築する(以降は putFileManifest/deleteFileManifest が維持する)。
-var keyFileOwnersMigrated = []byte("fileowners_migrated_v1")
+// v2: キーに反転タイムスタンプ、値に一覧レコードを持つ形式。
+var keyFileOwnersMigrated = []byte("fileowners_migrated_v2")
 
 // FileManifest は保存済みファイル1件のメタデータ。
 type FileManifest struct {
@@ -170,26 +175,50 @@ func putFileManifest(tx *bolt.Tx, m *FileManifest) error {
 	if err := tx.Bucket(bucketFiles).Put([]byte(m.ID), raw); err != nil {
 		return err
 	}
-	// 所有者→ファイルの二次索引を維持(存在確認用の空値)。
-	return tx.Bucket(bucketFileOwners).Put(ownerFileKey(m.Owner, m.ID), nil)
+	// 所有者→ファイルの二次索引を維持(値は一覧表示レコード)。
+	rec, err := marshalFileIndexRecord(m)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(bucketFileOwners).Put(ownerFileKey(m.Owner, m.CreatedAt, m.ID), rec)
 }
 
 // deleteFileManifest はマニフェストと所有者索引を同一トランザクションで消す。
 func deleteFileManifest(tx *bolt.Tx, m *FileManifest) error {
-	if err := tx.Bucket(bucketFileOwners).Delete(ownerFileKey(m.Owner, m.ID)); err != nil {
+	if err := tx.Bucket(bucketFileOwners).Delete(ownerFileKey(m.Owner, m.CreatedAt, m.ID)); err != nil {
 		return err
 	}
 	return tx.Bucket(bucketFiles).Delete([]byte(m.ID))
 }
 
-// ownerFileKey は fileowners バケットのキー(所有者キー + 0x1F + ファイルID)。
+// fileIndexRecord は fileowners 索引の値(一覧表示に必要な最小限)。
+// マニフェスト本体(チャンク列・precomp レシピ込み)を読まずに一覧を
+// 返すためのもの。所有者はキー側にあるので持たない。
+type fileIndexRecord struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Size      int64     `json:"size"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func marshalFileIndexRecord(m *FileManifest) ([]byte, error) {
+	return json.Marshal(fileIndexRecord{ID: m.ID, Name: m.Name, Size: m.Size, CreatedAt: m.CreatedAt})
+}
+
+// ownerFileKey は fileowners バケットのキー:
+// 所有者キー + 0x1F + 反転UnixNano(8B BigEndian) + ファイルID。
 // 区切りの 0x1F により、ある所有者IDが別の所有者IDの接頭辞であっても
-// プレフィックス走査が混ざらない(例: "u" と "u2")。
-func ownerFileKey(owner, id string) []byte {
+// プレフィックス走査が混ざらない(例: "u" と "u2")。反転タイムスタンプに
+// より昇順走査 = 作成日時の降順(新しい順)になり、ソート不要で
+// カーソルページングできる。末尾の ID は同時刻の衝突を一意化する。
+func ownerFileKey(owner string, created time.Time, id string) []byte {
 	ok := ownerKey(owner)
-	key := make([]byte, 0, len(ok)+1+len(id))
+	key := make([]byte, 0, len(ok)+1+8+len(id))
 	key = append(key, ok...)
 	key = append(key, 0x1F)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], ^uint64(created.UnixNano()))
+	key = append(key, ts[:]...)
 	return append(key, id...)
 }
 
@@ -199,24 +228,37 @@ func ownerFilePrefix(owner string) []byte {
 	return append(ok, 0x1F)
 }
 
-// migrateFileOwners は fileowners 索引が未構築なら全ファイルから一度だけ
-// 構築する(索引導入前に作られたストアの移行)。以降はフラグで飛ばす。
+// migrateFileOwners は fileowners 索引が現行形式(v2)でなければ全ファイル
+// から一度だけ再構築する(索引導入前・旧形式ストアの移行)。
 func migrateFileOwners(tx *bolt.Tx) error {
 	settings := tx.Bucket(bucketSettings)
 	if settings.Get(keyFileOwnersMigrated) != nil {
 		return nil
 	}
-	idx := tx.Bucket(bucketFileOwners)
-	err := tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
+	// 旧形式のエントリが残っていても混ざらないよう、作り直す。
+	if err := tx.DeleteBucket(bucketFileOwners); err != nil && err != bolt.ErrBucketNotFound {
+		return err
+	}
+	idx, err := tx.CreateBucket(bucketFileOwners)
+	if err != nil {
+		return err
+	}
+	err = tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
 		var m FileManifest
 		if err := json.Unmarshal(v, &m); err != nil {
 			return err
 		}
-		return idx.Put(ownerFileKey(m.Owner, m.ID), nil)
+		rec, err := marshalFileIndexRecord(&m)
+		if err != nil {
+			return err
+		}
+		return idx.Put(ownerFileKey(m.Owner, m.CreatedAt, m.ID), rec)
 	})
 	if err != nil {
 		return err
 	}
+	// 旧フラグは掃除する(あってもなくても動作は同じ)。
+	settings.Delete([]byte("fileowners_migrated_v1"))
 	return settings.Put(keyFileOwnersMigrated, []byte{1})
 }
 
