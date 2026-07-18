@@ -31,11 +31,19 @@ func IsJPEG(head []byte) bool {
 	return len(head) >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF
 }
 
+// JPEG 係数コーダ種別(JPEGRecipe.Coder)。
+const (
+	jpegCoderPlanes = 0 // 係数平面 varint(store の zstd/dedup/デルタが効く)
+	jpegCoderArith  = 1 // 文脈モデル+レンジ符号(単画像が最も縮む)
+)
+
 // JPEGRecipe は JPEG 再構成レシピ(チャンク化内容の分割情報)。
-// チャンク化内容 = prefix(SOSヘッダまでの原文)+ 係数平面。
+// チャンク化内容 = prefix(SOSヘッダまでの原文)+ ペイロード(Coder に応じて
+// 係数平面 or 文脈算術符号)。
 type JPEGRecipe struct {
 	PrefixLen int    `json:"prefix_len"` // チャンク化内容の先頭を占めるヘッダ部の長さ
 	Suffix    []byte `json:"suffix"`     // EOI 以降の原文(通常 FFD9 の2バイト)
+	Coder     int    `json:"coder"`      // ペイロードの係数コーダ(planes | arith)
 }
 
 // JPEGUnwrapped は分解結果。

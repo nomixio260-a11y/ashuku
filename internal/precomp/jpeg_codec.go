@@ -273,23 +273,64 @@ func TryUnwrapJPEG(orig []byte, maxPlain int64) (*JPEGUnwrapped, bool) {
 	if !bytes.Equal(reenc, entropy) {
 		return nil, false
 	}
+	prefix := orig[:entropyStart]
+
+	// 2つのコーダを見積もって小さい方を選ぶ:
+	//  (a) 係数平面 varint → store の zstd-19 が圧縮(スクショ・図で強い。
+	//      さらに近似重複画像の dedup/デルタが効く)
+	//  (b) 文脈モデル+レンジ符号(実写真で -22〜-27%。lepton 級)
 	planes := serializePlanes(frame, coeff)
 	if int64(len(planes)) > maxPlain {
 		return nil, false
 	}
-	// 採用判定: 平面を zstd 圧縮した見込みが元以下か(単画像で悪化させない)
 	probe := jpegProbeEncoder.EncodeAll(planes, make([]byte, 0, len(planes)/2))
-	if len(probe) >= len(orig) {
+	planesTotal := len(prefix) + len(probe)
+
+	arith := frame.encodeCoefficients(coeff)
+	// 安全ガード: この係数で算術符号が完全往復することを保存前に検証する
+	// (エンコード/デコードの非対称バグを採用しない=読み出し不能を防ぐ)。
+	arithOK := coeffEqual(coeff, frame.decodeCoefficients(arith))
+	arithTotal := len(prefix) + len(arith)
+
+	var payload []byte
+	var coder int
+	if arithOK && arithTotal <= planesTotal {
+		payload, coder = arith, jpegCoderArith
+	} else {
+		payload, coder = planes, jpegCoderPlanes
+	}
+	// 悪化回避: 選んだ見込みサイズが元 JPEG 未満のときだけ採用。
+	chosenTotal := planesTotal
+	if coder == jpegCoderArith {
+		chosenTotal = arithTotal
+	}
+	if chosenTotal >= len(orig) {
 		return nil, false
 	}
-	prefix := orig[:entropyStart]
-	chunked := make([]byte, 0, len(prefix)+len(planes))
+	chunked := make([]byte, 0, len(prefix)+len(payload))
 	chunked = append(chunked, prefix...)
-	chunked = append(chunked, planes...)
+	chunked = append(chunked, payload...)
 	return &JPEGUnwrapped{
 		Chunked: chunked,
-		Recipe:  &JPEGRecipe{PrefixLen: len(prefix), Suffix: append([]byte(nil), orig[idxEOI:]...)},
+		Recipe:  &JPEGRecipe{PrefixLen: len(prefix), Suffix: append([]byte(nil), orig[idxEOI:]...), Coder: coder},
 	}, true
+}
+
+func coeffEqual(a, b [][]int16) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for ci := range a {
+		if len(a[ci]) != len(b[ci]) {
+			return false
+		}
+		for i := range a[ci] {
+			if a[ci][i] != b[ci][i] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ReconstructJPEG はレシピとチャンク化内容から元の JPEG をビット単位で戻す。
@@ -298,7 +339,7 @@ func ReconstructJPEG(recipe *JPEGRecipe, chunked []byte) ([]byte, error) {
 		return nil, errors.New("JPEG レシピが不正です")
 	}
 	prefix := chunked[:recipe.PrefixLen]
-	planes := chunked[recipe.PrefixLen:]
+	payload := chunked[recipe.PrefixLen:]
 	frame, entropyStart, err := parseFrame(prefix)
 	if err != nil {
 		return nil, err
@@ -306,9 +347,15 @@ func ReconstructJPEG(recipe *JPEGRecipe, chunked []byte) ([]byte, error) {
 	if entropyStart != len(prefix) {
 		return nil, errors.New("JPEG prefix が SOS で終わっていません")
 	}
-	coeff, err := deserializePlanes(frame, planes)
-	if err != nil {
-		return nil, err
+	var coeff [][]int16
+	switch recipe.Coder {
+	case jpegCoderArith:
+		coeff = frame.decodeCoefficients(payload)
+	default:
+		coeff, err = deserializePlanes(frame, payload)
+		if err != nil {
+			return nil, err
+		}
 	}
 	entropy := frame.encodeScan(coeff)
 	out := make([]byte, 0, len(prefix)+len(entropy)+len(recipe.Suffix))
