@@ -299,3 +299,66 @@ func TestNameLengthLimit(t *testing.T) {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// ルートで Web コンソール(自己完結 HTML)が配信される。
+func TestConsoleServed(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "ashuku") || !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
+		t.Fatal("コンソールページが返っていません")
+	}
+	if resp.Header.Get("Content-Security-Policy") == "" {
+		t.Fatal("CSP ヘッダがありません")
+	}
+	// ルート以外の未知パスは 404 のまま
+	resp2, err := http.Get(srv.URL + "/unknown-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("未知パスの status = %d, want 404", resp2.StatusCode)
+	}
+}
+
+// 認証失敗を繰り返す送信元は 429 でレート制限される。
+func TestAuthFailureRateLimit(t *testing.T) {
+	st, err := store.Open(t.TempDir(), store.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(st, Options{Users: map[string]User{"good-key": {}}}))
+	t.Cleanup(func() { srv.Close(); st.Close() })
+
+	call := func(key string) int {
+		req, _ := http.NewRequest("GET", srv.URL+"/api/v1/files", nil)
+		req.Header.Set("X-API-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// しきい値まで失敗を積む
+	for i := 0; i < authFailureLimit; i++ {
+		if got := call("wrong-key"); got != http.StatusUnauthorized {
+			t.Fatalf("失敗 %d 回目 = %d, want 401", i+1, got)
+		}
+	}
+	// しきい値超過後は正しいキーでも 429(同一IPからの総当たりを遮断)
+	if got := call("wrong-key"); got != http.StatusTooManyRequests {
+		t.Fatalf("しきい値超過後 = %d, want 429", got)
+	}
+	if got := call("good-key"); got != http.StatusTooManyRequests {
+		t.Fatalf("制限中の正キー = %d, want 429(IP単位の遮断)", got)
+	}
+}

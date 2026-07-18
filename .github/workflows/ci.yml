@@ -29,3 +29,8 @@ jobs:
         run: go test ./...
       - name: race detector(並行系パッケージ)
         run: go test -race ./internal/api/ ./internal/client/
+      - name: ファジング(precomp パーサ、各10秒)
+        run: |
+          for f in FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzReconstructContainer; do
+            go test ./internal/precomp/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
+          done

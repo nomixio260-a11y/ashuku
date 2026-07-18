@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ashuku — 圧縮ストレージ</title>
+<style>
+:root{--bg:#0f1420;--panel:#1a2233;--line:#2a3550;--text:#e7ecf5;--dim:#8fa0bd;--acc:#4f8cff;--ok:#3fbf7f;--err:#ff6b6b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.6}
+.wrap{max-width:980px;margin:0 auto;padding:24px 16px}
+h1{font-size:20px;display:flex;align-items:center;gap:10px}
+h1 .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:1px 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card .k{font-size:12px;color:var(--dim)}
+.card .v{font-size:22px;font-weight:600;margin-top:2px}
+.card .v small{font-size:12px;color:var(--dim);font-weight:400}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:14px 0}
+input[type=password],input[type=text]{background:#0c111c;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;min-width:260px}
+button{background:var(--acc);border:0;border-radius:8px;color:#fff;padding:8px 16px;cursor:pointer;font-size:14px}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+button.danger{background:transparent;border:1px solid var(--err);color:var(--err);padding:4px 10px;font-size:12px}
+button.small{padding:4px 10px;font-size:12px}
+button:disabled{opacity:.5;cursor:default}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500;font-size:12px}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:26px;text-align:center;color:var(--dim);margin:14px 0;transition:.15s}
+#drop.hover{border-color:var(--acc);color:var(--text)}
+#msg{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:8px;padding:10px 14px;font-size:13px;max-width:360px}
+.toast.err{border-left-color:var(--err)}
+.bar{height:6px;background:#0c111c;border-radius:99px;overflow:hidden;margin-top:6px}
+.bar>div{height:100%;background:var(--acc);width:0%}
+.dim{color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ashuku <span class="tag">重複排除 + 圧縮ストレージ</span></h1>
+
+  <div class="row">
+    <input type="password" id="key" placeholder="APIキー(認証なしサーバーでは空のまま)">
+    <button id="saveKey">接続</button>
+    <span id="who" class="dim"></span>
+  </div>
+
+  <div class="grid" id="stats"></div>
+  <div id="quota"></div>
+
+  <div id="drop">ここにファイルをドロップ、またはクリックして選択(複数可)
+    <input type="file" id="file" multiple style="display:none">
+    <div class="bar" id="upbar" style="display:none"><div></div></div>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    <b>ファイル</b>
+    <span><button class="ghost small" id="refresh">更新</button>
+          <button class="ghost small" id="more" style="display:none">さらに読み込む</button></span>
+  </div>
+  <table><thead><tr><th>名前</th><th class="num">サイズ</th><th>作成日時</th><th></th></tr></thead>
+  <tbody id="files"></tbody></table>
+  <p class="dim" id="empty" style="display:none;margin-top:10px">ファイルはまだありません。上のエリアからアップロードしてください。</p>
+</div>
+<div id="msg"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let cursor = "";
+
+function headers() {
+  const h = {};
+  const k = localStorage.getItem("ashuku_key") || "";
+  if (k) h["X-API-Key"] = k;
+  return h;
+}
+function toast(text, err) {
+  const d = document.createElement("div");
+  d.className = "toast" + (err ? " err" : "");
+  d.textContent = text;
+  $("msg").appendChild(d);
+  setTimeout(() => d.remove(), 5000);
+}
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign(headers(), opts.headers || {});
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let m = "HTTP " + r.status;
+    try { m = (await r.json()).error || m; } catch (e) {}
+    throw new Error(m);
+  }
+  return r;
+}
+const fmt = n => {
+  if (n >= 1<<30) return (n/(1<<30)).toFixed(2) + " GiB";
+  if (n >= 1<<20) return (n/(1<<20)).toFixed(1) + " MiB";
+  if (n >= 1<<10) return (n/(1<<10)).toFixed(1) + " KiB";
+  return n + " B";
+};
+
+async function loadStats() {
+  try {
+    const s = await (await api("/api/v1/stats")).json();
+    $("stats").innerHTML = [
+      ["保存データ(論理)", fmt(s.logical_bytes)],
+      ["実ディスク使用量", fmt(s.physical_bytes)],
+      ["削減倍率", s.total_ratio.toFixed(1) + "<small>x</small>"],
+      ["節約できた容量", fmt(Math.max(0, s.saved_bytes))],
+      ["ファイル数", s.file_count.toLocaleString()],
+    ].map(([k,v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  } catch (e) { $("stats").innerHTML = ""; }
+  try {
+    const me = await (await api("/api/v1/me")).json();
+    $("who").textContent = me.name ? `${me.name} としてログイン中` : "";
+    if (me.quota_bytes > 0) {
+      const pct = Math.min(100, 100 * me.used_bytes / me.quota_bytes);
+      $("quota").innerHTML = `<div class="dim">使用量 ${fmt(me.used_bytes)} / ${fmt(me.quota_bytes)}</div>
+        <div class="bar"><div style="width:${pct}%"></div></div>`;
+    } else {
+      $("quota").innerHTML = me.used_bytes ? `<div class="dim">使用量 ${fmt(me.used_bytes)}(クォータなし)</div>` : "";
+    }
+  } catch (e) { $("quota").innerHTML = ""; }
+}
+
+function fileRow(f) {
+  const tr = document.createElement("tr");
+  const dt = new Date(f.created_at).toLocaleString("ja-JP");
+  tr.innerHTML = `<td></td><td class="num">${fmt(f.size)}</td><td class="dim">${dt}</td><td></td>`;
+  tr.children[0].textContent = f.name;
+  const act = tr.children[3];
+  const dl = document.createElement("button");
+  dl.className = "ghost small"; dl.textContent = "DL";
+  dl.onclick = async () => {
+    try {
+      const r = await api("/api/v1/files/" + f.id);
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = f.name; a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) { toast("ダウンロード失敗: " + e.message, true); }
+  };
+  const del = document.createElement("button");
+  del.className = "danger"; del.textContent = "削除"; del.style.marginLeft = "6px";
+  del.onclick = async () => {
+    if (!confirm(`「${f.name}」を削除しますか?`)) return;
+    try {
+      await api("/api/v1/files/" + f.id, { method: "DELETE" });
+      tr.remove(); toast("削除しました"); loadStats();
+    } catch (e) { toast("削除失敗: " + e.message, true); }
+  };
+  act.append(dl, del);
+  return tr;
+}
+
+async function loadFiles(append) {
+  try {
+    let url = "/api/v1/files?limit=100";
+    if (append && cursor) url += "&after=" + encodeURIComponent(cursor);
+    const data = await (await api(url)).json();
+    if (!append) $("files").innerHTML = "";
+    for (const f of data.files) $("files").appendChild(fileRow(f));
+    cursor = data.next_cursor || "";
+    $("more").style.display = cursor ? "" : "none";
+    $("empty").style.display = $("files").children.length ? "none" : "";
+  } catch (e) { toast("一覧の取得に失敗: " + e.message, true); }
+}
+
+async function upload(files) {
+  const bar = $("upbar"); bar.style.display = ""; const fill = bar.firstElementChild;
+  let done = 0;
+  for (const f of files) {
+    try {
+      await api("/api/v1/files", { method: "POST", body: f,
+        headers: { "X-File-Name": f.name } });
+      toast(`${f.name} をアップロードしました`);
+    } catch (e) { toast(`${f.name} の保存失敗: ${e.message}`, true); }
+    done++; fill.style.width = (100 * done / files.length) + "%";
+  }
+  setTimeout(() => { bar.style.display = "none"; fill.style.width = "0%"; }, 800);
+  cursor = ""; loadFiles(false); loadStats();
+}
+
+$("saveKey").onclick = () => {
+  localStorage.setItem("ashuku_key", $("key").value.trim());
+  toast("接続しました"); cursor = ""; loadFiles(false); loadStats();
+};
+$("refresh").onclick = () => { cursor = ""; loadFiles(false); loadStats(); };
+$("more").onclick = () => loadFiles(true);
+$("drop").onclick = e => { if (e.target.id === "drop" || e.target.parentNode.id === "drop") $("file").click(); };
+$("file").onchange = () => { if ($("file").files.length) upload([...$("file").files]); $("file").value = ""; };
+$("drop").ondragover = e => { e.preventDefault(); $("drop").classList.add("hover"); };
+$("drop").ondragleave = () => $("drop").classList.remove("hover");
+$("drop").ondrop = e => {
+  e.preventDefault(); $("drop").classList.remove("hover");
+  if (e.dataTransfer.files.length) upload([...e.dataTransfer.files]);
+};
+
+$("key").value = localStorage.getItem("ashuku_key") || "";
+loadFiles(false); loadStats();
+</script>
+</body>
+</html>

@@ -40,6 +40,8 @@ func main() {
 	metaBackupEvery := flag.Duration("meta-backup-every", time.Hour,
 		"メタデータ(bbolt)の自動バックアップ間隔。0 で無効")
 	metaBackupKeep := flag.Int("meta-backup-keep", 24, "保持するメタバックアップ世代数")
+	metaBackupDir := flag.String("meta-backup-dir", "",
+		"メタバックアップの保存先(空=データディレクトリ配下。別ボリューム推奨)")
 	precompFlag := flag.Bool("precomp", true,
 		"gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ")
 	precompMax := flag.String("precomp-max", "64M",
@@ -170,7 +172,7 @@ func main() {
 	// 定期メタバックアップ: meta.db は単一障害点なので一貫スナップショットを
 	// 別ディレクトリへ取り、世代保持する。
 	startJob("メタバックアップ", *metaBackupEvery, func() {
-		path, n, err := st.BackupMetaRotating(time.Now(), *metaBackupKeep)
+		path, n, err := st.BackupMetaRotating(*metaBackupDir, time.Now(), *metaBackupKeep)
 		if err != nil {
 			log.Printf("メタバックアップに失敗: %v", err)
 			return

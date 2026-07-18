@@ -162,6 +162,9 @@ type Store struct {
 	// writeWaiters は進行中の書き込みトランザクション要求数(batchUpdate の
 	// 適応判定に使う: 並行書き込みがあるときだけグループコミットに切り替える)。
 	writeWaiters atomic.Int64
+	// txSolo / txBatched はグループコミット合流率のメトリクス用。
+	txSolo    atomic.Int64
+	txBatched atomic.Int64
 }
 
 // checkDiskSpace はディスク予約を検査する(取得失敗時は書き込みを止めない)。
@@ -193,9 +196,30 @@ func (s *Store) batchUpdate(fn func(*bolt.Tx) error) error {
 	n := s.writeWaiters.Add(1)
 	defer s.writeWaiters.Add(-1)
 	if n > 1 {
+		s.txBatched.Add(1)
 		return s.db.Batch(fn)
 	}
+	s.txSolo.Add(1)
 	return s.db.Update(fn)
+}
+
+// RuntimeStats は可観測性用の内部カウンタ(キャッシュヒット率・
+// グループコミット合流率)。
+type RuntimeStats struct {
+	CacheHits   int64 `json:"cache_hits"`
+	CacheMisses int64 `json:"cache_misses"`
+	TxSolo      int64 `json:"tx_solo"`
+	TxBatched   int64 `json:"tx_batched"`
+}
+
+// Runtime は現在の内部カウンタを返す。
+func (s *Store) Runtime() RuntimeStats {
+	return RuntimeStats{
+		CacheHits:   s.cache.hits.Load(),
+		CacheMisses: s.cache.misses.Load(),
+		TxSolo:      s.txSolo.Load(),
+		TxBatched:   s.txBatched.Load(),
+	}
 }
 
 // Open は dataDir 配下にストアを開く(なければ作成)。

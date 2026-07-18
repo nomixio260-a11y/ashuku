@@ -46,10 +46,12 @@
   バックグラウンドの Optimize が本家 level 19 で後追い再圧縮します
   (取り込みは軽く、保管効率は最強レベルに収束)。
 - **リージョン(ソリッド)圧縮**: チャンクを独立に圧縮するとチャンクをまたぐ
-  冗長性を失います。Optimize がファイル内の連続チャンクを8個ずつまとめて1本の
-  zstd-19 で再圧縮し、この冗長性を回収します(実測: 実データで +7.6%)。
-  読み出しはリージョン単位でキャッシュされ、削除・低生存率リージョンの回収も
-  自動です。
+  冗長性を失います。Optimize がファイル内の連続チャンクを16個ずつまとめて1本の
+  zstd(level 22 + 大窓 + long-distance matching)で再圧縮し、この冗長性を
+  回収します(実測: 実データで独立圧縮比 11.35% 削減)。小さなファイル
+  (単一チャンク)は**ファイルをまたいで**内容の近いもの同士を束ねてソリッド
+  圧縮します(実測: 同種の小ファイル200個で −47%)。読み出しはリージョン単位で
+  キャッシュされ、削除・低生存率リージョンの回収も自動です。
 - **raw フォールバック**: 画像・動画など既に圧縮済みのデータは zstd では縮まないため、
   自動的に無圧縮で保存し、サイズ・CPU の無駄を防ぎます。
 - **参照カウント GC**: ファイル削除時、どのファイルからも参照されなくなったチャンク
@@ -64,8 +66,11 @@
   (gzip のままでは中身が少し違うだけで全バイトが変わり、何も効きません)。
   対応形式: 単一メンバー gzip(Python/Java/nginx 等)、マルチメンバー gzip
   (ローテートログの連結等、1024メンバーまで)、生 zlib ストリーム
-  (git loose object・PDF FlateDecode 等)、**PNG**(IDAT の zlib を展開して
-  スキャンラインを dedup/デルタ/zstd-19 の対象に)。
+  (git loose object 等)、**PNG**(IDAT の zlib を展開)、
+  **ZIP コンテナ**(docx/xlsx/jar 等。zlib 産 deflate メンバーを展開し、
+  スケルトンごとチャンク化。一致しないメンバーが混ざっていても一致分だけ
+  適用される部分適用方式。実測: テキスト系 zip 25.8x、世代違い zip の物理
+  増分 −82%)、**PDF**(FlateDecode の zlib ストリームを展開)。
   分解は保存時にビット一致を検証してからのみ採用され、zlib 産でないストリーム
   (GNU gzip / zopfli / Go 等)は安全に素通しされます。復元時も SHA-256 で
   最終検証します。zip bomb 対策として展開は 1GiB で打ち切ります。
@@ -115,14 +120,18 @@ go build -o ashuku ./cmd/ashuku
 | `-chunk-avg` | `0`(=1MiB) | 平均チャンクサイズ(バイト)。初回起動時のみ有効。小さくすると重複排除が細かく効くがメタデータが増える |
 | `-delta-depth` | `0`(=32) | デルタチェーンの深さ上限。深いほど多世代バックアップが縮む(読み出しコストはキャッシュが吸収) |
 | `-cache-mb` | `0`(=128) | 伸長済みチャンクキャッシュ容量(MiB)。デルタチェーンの読み出しを高速化(実測: 深さ32チェーンの読み出しが771ms→30ms) |
-| `-optimize-every` | `1h` | chain repack(チェーン再編成)の自動実行間隔。長期世代保持のドリフト蓄積を回収(100世代実測: 82.7x→142.1x)。`0` で無効 |
-| `-scrub-every` | `24h` | データ完全性スクラブ(bit rot 検出)の自動実行間隔。`0` で無効 |
-| `-meta-backup-every` | `1h` | メタデータ(bbolt)の自動バックアップ間隔。`0` で無効 |
+| `-optimize-every` | `1h` | インクリメンタル最適化(新着データのみ・O(新着))の間隔。`0` で無効 |
+| `-optimize-full-every` | `24h` | フル最適化(全走査: chain repack・ゾンビ救出・staged 掃除。100世代実測: 82.7x→142.1x)の間隔。`0` で無効 |
+| `-scrub-every` | `24h` | ローリングスクラブ(bit rot 検出)の間隔。`0` で無効 |
+| `-scrub-batch` | `100000` | 1回のスクラブで検証するチャンク数(進捗カーソルで数回に分けて一周)。`0` で毎回全チャンク |
+| `-meta-backup-every` | `1h` | メタデータ(bbolt)の自動バックアップ間隔(書き出し後に開けるか検証)。`0` で無効 |
 | `-meta-backup-keep` | `24` | 保持するメタバックアップ世代数 |
+| `-meta-backup-dir` | (データ配下) | バックアップ保存先。**別ボリューム/NFS を推奨**(データディスクと同時に失わないため) |
+| `-max-concurrent` | `512` | 同時処理リクエスト数の上限(超過は 503+Retry-After)。/healthz と /metrics は制限外 |
 | `-precomp` | `true` | gzip precompression(zlib産gzipを展開して保存、ビット一致復元)。CGO無効ビルドでは自動オフ |
 | `-precomp-max` | `64M` | precompression が扱う展開データの上限。この値×並行数がメモリ上限(超過は素通しで安全に保存) |
 | `-precomp-parallel` | `2` | precompression の同時実行数。超過分は素通し(多人数同時アップロードでのメモリ爆発防止) |
-| `-auth-keys` | (なし) | APIキーファイル(1行: `<キー> [クォータ 例:10G] [名前]`)。未指定なら認証なし(開発用)。**公開運用では必須** |
+| `-auth-keys` | (なし) | APIキーファイル(1行: `<キー> [クォータ 例:10G] [id=ユーザーID] [@admin] [名前]`)。未指定なら認証なし(開発用)。**公開運用では必須** |
 | `-max-upload` | `0` | 1アップロードのサイズ上限(例: `50G`)。超過は 413 |
 | `-server-side-uploads` | `full` | サーバー側圧縮経路(`/api/v1/files`)の扱い: `full` \| `fast`(軽量圧縮のみ) \| `off`(ashuku-cli 専用。圧縮・展開を完全にクライアント側へ) |
 | `-min-free` | `1G` | ディスク空きがこの値を下回ったらアップロードを 507 で拒否(枯渇によるサービス停止・破損を防止) |
@@ -133,15 +142,16 @@ go build -o ashuku ./cmd/ashuku
 
 | メソッド | パス | 説明 |
 |---|---|---|
-| `POST` | `/api/v1/files` | アップロード(ボディ=生データ)。名前は `X-File-Name` ヘッダか `?name=` |
-| `GET` | `/api/v1/files` | ファイル一覧 |
+| `GET` | `/` | **Web コンソール**(ブラウザからアップロード/一覧/DL/削除/統計。自己完結ページ) |
+| `POST` | `/api/v1/files` | アップロード(ボディ=生データ)。名前は `X-File-Name` ヘッダか `?name=`(最大255バイト) |
+| `GET` | `/api/v1/files` | ファイル一覧(新しい順)。`?limit=N` と `?after=<next_cursor>` でページング |
 | `GET` | `/api/v1/files/{id}` | ダウンロード |
 | `DELETE` | `/api/v1/files/{id}` | 削除(不要チャンクは自動GC) |
 | `GET` | `/api/v1/stats` | 容量統計(10秒TTLキャッシュ) |
 | `GET` | `/api/v1/me` | 呼び出しユーザーの使用量とクォータ |
-| `POST` | `/api/v1/optimize` | chain repack を即時実行(通常は `-optimize-every` の自動実行で十分) |
-| `POST` | `/api/v1/scrub` | データ完全性検証(全チャンクをハッシュ照合、破損・欠損を報告) |
-| `POST` | `/api/v1/fsck` | メタデータ整合性検証(`?repair=1` で修復)。参照カウント・孤児・壊れた参照・使用量の不整合を検出 |
+| `POST` | `/api/v1/optimize` | 最適化を即時実行(既定=インクリメンタル、`?full=1` で全走査)。**@admin キー専用** |
+| `POST` | `/api/v1/scrub` | データ完全性検証(全チャンクをディスクから読み直してハッシュ照合)。**@admin キー専用** |
+| `POST` | `/api/v1/fsck` | メタデータ整合性検証(`?repair=1` で修復)。参照カウント・孤児・索引・維持カウンタの不整合を検出。**@admin キー専用** |
 | `GET` | `/healthz` | ヘルス/レディネス(認証不要。ディスク低下時は 503) |
 | `GET` | `/metrics` | Prometheus メトリクス(認証不要) |
 
@@ -169,13 +179,21 @@ ashuku-cli ... ls / rm <ID> / stats / me
 ### 多人数運用(認証・クォータ)
 
 ```sh
-# keys.txt — 1行1キー: <キー> [クォータ] [名前]
-#   alice-secret-key 100G Alice
-#   bob-secret-key   10G  Bob
+# keys.txt — 1行1キー: <キー> [クォータ] [id=ユーザーID] [@admin] [名前]
+#   admin-secret-key  0     id=admin  @admin  管理者
+#   alice-secret-key  100G  id=alice  Alice
+#   alice-new-key     100G  id=alice  Alice(ローテーション後)
 ./ashuku -auth-keys keys.txt -max-upload 50G
 ```
 
 - キーは `X-API-Key: <キー>` または `Authorization: Bearer <キー>` で渡します
+- **キーローテーション**: `id=` を付けると所有者IDがキーから分離され、同じ id で
+  複数キーを発行できます。漏洩時は新キーの行を足して旧キーの行を消すだけで、
+  ファイルへのアクセスを失いません(id なしのキーはキー自身が所有者ID)
+- **管理者権限**: `@admin` 付きのキーだけが optimize / scrub / fsck を実行できます
+  (重い管理操作を一般ユーザーの DoS ベクタにしない)
+- **総当たり対策**: キー照合は定時間比較で、認証失敗が多い送信元IPは
+  1分間 429 で遮断されます(20回/分)
 - **所有者分離**: ファイルは所有キーごとに分離され、他人のファイルは一覧に出ず、
   取得・削除も 404 になります(存在も漏れない)。チャンクの重複排除は全体で
   共有され、複数ユーザーが同じデータを上げても物理は1回分です
@@ -254,10 +272,19 @@ curl http://localhost:8080/api/v1/stats
   壊れた参照・所有者使用量の不整合を検出し、`?repair=1` で修復します
   (`POST /api/v1/fsck` / `ashuku-cli fsck [--repair]`)。スクラブがデータの、
   fsck がメタデータの整合性を担当します。
-- **メタデータバックアップ**: `meta.db` は単一障害点(壊れると全チャンクが無事でも
-  全マニフェスト・索引を失う)なので、一貫スナップショットを定期的に別ディレクトリへ
-  取り世代保持します(`-meta-backup-every`、既定1h)。理想的には別ボリューム/
-  オフサイトへコピーしてください。
+- **メタデータバックアップ(検証付き)**: `meta.db` は単一障害点(壊れると全チャンクが
+  無事でも全マニフェスト・索引を失う)なので、一貫スナップショットを定期的に取り
+  世代保持します(`-meta-backup-every`、既定1h)。各バックアップは書き出し後に
+  bbolt として開いて検証してから確定します。`-meta-backup-dir` で別ボリュームを
+  指定してください。
+
+  **復旧手順**(meta.db 破損時):
+  1. サーバー停止 → 壊れた `data/meta.db` を退避
+  2. 最新バックアップをコピー: `cp <backup-dir>/meta-<最新>.db data/meta.db`
+  3. サーバー起動 → `POST /api/v1/fsck?repair=1` で整合性を修復
+     (バックアップ時点以降のアップロードぶんのチャンクは孤児として回収され、
+     その間のファイルは失われます。RPO = バックアップ間隔)
+  4. `POST /api/v1/scrub` でデータ完全性を確認
 - **パニック分離**: 1リクエストや1回のバックグラウンドジョブ(Optimize/Scrub)が
   想定外にパニックしても、サーバー全体は落ちず 500 を返して稼働を続けます。
 - **起動時の孤児掃除**: クラッシュで取り残された temp ファイルを起動時に回収します。
@@ -287,7 +314,12 @@ curl http://localhost:8080/api/v1/stats
 go test ./...              # テスト実行
 go vet ./...               # 静的チェック
 go run ./cmd/ashuku-bench  # 削減率ベンチマーク(合成データセット × 全設定)
+go test ./internal/store/ -run XXX -bench SmallPut   # 書き込み性能ベンチ
+go test ./internal/precomp/ -run '^$' -fuzz FuzzTryUnwrapZip -fuzztime 30s  # ファジング
 ```
+
+CI(GitHub Actions)が push ごとに gofmt / vet / cgo あり・なし両ビルド /
+全テスト / race / ファジング(短時間)を検証します。
 
 プロジェクト全体の総括は [REPORT.md](REPORT.md)、削減率の実測データ・設計判断の
 根拠・文献調査・今後のロードマップは [RESEARCH.md](RESEARCH.md) を参照してください。
@@ -295,11 +327,17 @@ go run ./cmd/ashuku-bench  # 削減率ベンチマーク(合成データセッ�
 ### 構成
 
 ```
-cmd/ashuku/          エントリポイント
+cmd/ashuku/          サーバー エントリポイント
+cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(github.com/jotfs/fastcdc-go)
-internal/store/      ストレージエンジン(dedup / 類似デルタ / zstd / refcount GC / bbolt)
-internal/api/        REST API ハンドラ
+internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF 分解、cgo: zlib)
+internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
+internal/client/     クライアント支援プロトコル実装
+internal/api/        REST API ハンドラ + Web コンソール + メトリクス
 ```
 
-依存はすべて純 Go(CGO 不要)で、シングルバイナリにビルドできます。
+コア依存は純 Go(bbolt / klauspost-zstd / fastcdc)で、`CGO_ENABLED=0` でも
+全機能(precompression と libzstd 経路を除く)が動くシングルバイナリになります。
+CGO ビルドではシステムの zlib / libzstd.so.1 に直接リンクします(開発ヘッダ不要)。

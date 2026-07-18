@@ -88,6 +88,8 @@ type Server struct {
 	metrics *metrics
 	// sem は同時リクエスト数の制限(nil = 無制限)。
 	sem chan struct{}
+	// limiter は認証失敗のレート制限(総当たり対策)。
+	limiter *authLimiter
 
 	statsMu   sync.Mutex
 	statsAt   time.Time
@@ -105,10 +107,11 @@ func New(st *store.Store, opts Options) *Server {
 	if opts.MaxConcurrent == 0 {
 		opts.MaxConcurrent = DefaultMaxConcurrent
 	}
-	s := &Server{store: st, mux: http.NewServeMux(), opts: opts, metrics: newMetrics()}
+	s := &Server{store: st, mux: http.NewServeMux(), opts: opts, metrics: newMetrics(), limiter: newAuthLimiter()}
 	if opts.MaxConcurrent > 0 {
 		s.sem = make(chan struct{}, opts.MaxConcurrent)
 	}
+	s.mux.HandleFunc("GET /{$}", s.handleConsole) // Web コンソール(ルートのみ)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/v1/files", s.auth(s.handleUpload))
 	s.mux.HandleFunc("GET /api/v1/files", s.auth(s.handleList))
@@ -143,7 +146,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable,
 				"サーバーが混雑しています。少し待って再試行してください")
 			if s.metrics != nil {
-				s.metrics.observeRequest(r.Method, http.StatusServiceUnavailable)
+				s.metrics.throttled.Add(1)
+				s.metrics.observeRequest(r.Method, http.StatusServiceUnavailable, 0)
 			}
 			return
 		}
@@ -163,7 +167,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(sw, http.StatusInternalServerError, "内部エラーが発生しました")
 		}
 		if s.metrics != nil {
-			s.metrics.observeRequest(r.Method, sw.status)
+			s.metrics.observeRequest(r.Method, sw.status, time.Since(start).Seconds())
 		}
 		if s.opts.AccessLog {
 			log.Printf("%s %s %d %s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond))
@@ -206,6 +210,13 @@ func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) htt
 			next(w, r, authed{})
 			return
 		}
+		ip := remoteIP(r.RemoteAddr)
+		if s.limiter.blocked(ip) {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests,
+				"認証失敗が多すぎます。しばらく待って再試行してください")
+			return
+		}
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
 			if h := r.Header.Get("Authorization"); len(h) > 7 && h[:7] == "Bearer " {
@@ -214,6 +225,8 @@ func (s *Server) auth(next func(http.ResponseWriter, *http.Request, authed)) htt
 		}
 		u, ok := s.lookupUser(key)
 		if !ok {
+			s.limiter.fail(ip)
+			s.metrics.authFailures.Add(1)
 			writeError(w, http.StatusUnauthorized, "APIキーが無効です")
 			return
 		}
@@ -495,6 +508,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		gauges["ashuku_chunk_count"] = int64(st.ChunkCount)
 		gauges["ashuku_file_count"] = int64(st.FileCount)
 	}
+	rt := s.store.Runtime()
+	gauges["ashuku_cache_hits_total"] = rt.CacheHits
+	gauges["ashuku_cache_misses_total"] = rt.CacheMisses
+	gauges["ashuku_tx_solo_total"] = rt.TxSolo
+	gauges["ashuku_tx_batched_total"] = rt.TxBatched
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Write([]byte(s.metrics.render(gauges)))
 }

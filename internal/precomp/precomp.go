@@ -101,6 +101,11 @@ func parseHeaderLen(data []byte) (int, error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 		n += 2 + int(binary.LittleEndian.Uint16(data[n:]))
+		if n > len(data) {
+			// XLEN がデータ長を超えている(壊れた/細工されたヘッダ)。
+			// ここで止めないと後続の data[n:] が範囲外になる(fuzz で検出)。
+			return 0, io.ErrUnexpectedEOF
+		}
 	}
 	for _, f := range []byte{flagName, flagComment} {
 		if flags&f == 0 {

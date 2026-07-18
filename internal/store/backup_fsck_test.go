@@ -53,7 +53,7 @@ func TestMetaBackupRotation(t *testing.T) {
 
 	base := time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 5; i++ {
-		if _, _, err := s.BackupMetaRotating(base.Add(time.Duration(i)*time.Second), 3); err != nil {
+		if _, _, err := s.BackupMetaRotating("", base.Add(time.Duration(i)*time.Second), 3); err != nil {
 			t.Fatal(err)
 		}
 	}

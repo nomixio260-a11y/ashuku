@@ -3,6 +3,7 @@ package store
 import (
 	"container/list"
 	"sync"
+	"sync/atomic"
 )
 
 // chunkCache は伸長済みチャンクの LRU キャッシュ。
@@ -20,6 +21,9 @@ type chunkCache struct {
 	curBytes int64
 	order    *list.List               // 先頭が最近使用
 	entries  map[string]*list.Element // hash → element(value は cacheEntry)
+	// hits / misses はヒット率メトリクス用(可観測性)。
+	hits   atomic.Int64
+	misses atomic.Int64
 }
 
 type cacheEntry struct {
@@ -40,8 +44,10 @@ func (c *chunkCache) get(hash string) ([]byte, bool) {
 	defer c.mu.Unlock()
 	el, ok := c.entries[hash]
 	if !ok {
+		c.misses.Add(1)
 		return nil, false
 	}
+	c.hits.Add(1)
 	c.order.MoveToFront(el)
 	return el.Value.(cacheEntry).data, true
 }
