@@ -13,6 +13,8 @@ import (
 	"image/jpeg"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -486,5 +488,39 @@ func TestMJPEGVideoEndToEnd(t *testing.T) {
 		100*(1-float64(st.PhysicalBytes)/float64(len(orig))))
 	if st.PhysicalBytes >= int64(len(orig)) {
 		t.Fatal("MJPEG 動画が縮んでいない")
+	}
+}
+
+func TestProgressiveJPEGEndToEnd(t *testing.T) {
+	files, _ := filepath.Glob("../precomp/testdata/progjpeg/*.jpg")
+	if len(files) == 0 {
+		t.Skip("progjpeg testdata なし")
+	}
+	s := newTestStore(t)
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := putBytes(t, s, filepath.Base(fn), orig)
+		if m.Encoding != EncodingJPEGV1 {
+			t.Fatalf("%s: progressive JPEG が分解されていない: %q", fn, m.Encoding)
+		}
+		got := getBytes(t, s, m.ID)
+		if !bytes.Equal(got, orig) {
+			t.Fatalf("%s: 読み戻しがビット一致しない", fn)
+		}
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	// Optimize 後も全ファイル一致
+	list, _, _ := s.ListPage("", "", 0)
+	for _, fm := range list {
+		orig, _ := os.ReadFile("../precomp/testdata/progjpeg/" + fm.Name)
+		got := getBytes(t, s, fm.ID)
+		if !bytes.Equal(got, orig) {
+			t.Fatalf("%s: Optimize 後にビット一致しない", fm.Name)
+		}
 	}
 }

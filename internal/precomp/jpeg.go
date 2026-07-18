@@ -44,6 +44,9 @@ type JPEGRecipe struct {
 	PrefixLen int    `json:"prefix_len"` // チャンク化内容の先頭を占めるヘッダ部の長さ
 	Suffix    []byte `json:"suffix"`     // EOI 以降の原文(通常 FFD9 の2バイト)
 	Coder     int    `json:"coder"`      // ペイロードの係数コーダ(planes | arith)
+	// Progressive が真なら、Chunked = skeleton(全ヘッダ)|| ペイロードで、
+	// PrefixLen = skeleton 長。エントロピーはスキャンごとに再生成する。
+	Progressive bool `json:"prog,omitempty"`
 }
 
 // JPEGUnwrapped は分解結果。

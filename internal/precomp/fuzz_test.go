@@ -18,6 +18,8 @@ import (
 	"image/color"
 	"image/gif"
 	"image/jpeg"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -275,4 +277,29 @@ func makePhotoFuzz(w, h int) []byte {
 	var buf bytes.Buffer
 	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85})
 	return buf.Bytes()
+}
+
+// FuzzTryUnwrapProgressive は攻撃者制御の progressive JPEG での分解が
+// panic せず、採用された入力は必ずビット一致で戻ることを検証する。
+func FuzzTryUnwrapProgressive(f *testing.F) {
+	files, _ := filepath.Glob("testdata/progjpeg/*.jpg")
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			f.Add(b)
+		}
+	}
+	f.Add([]byte("\xFF\xD8\xFF\xC2 progressive-ish garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapJPEG(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructJPEG(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した JPEG の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した JPEG がビット一致で戻らない")
+		}
+	})
 }

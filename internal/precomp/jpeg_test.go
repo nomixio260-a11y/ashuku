@@ -6,6 +6,8 @@ import (
 	"image/jpeg"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -110,5 +112,47 @@ func TestJPEGRejectsNonBaseline(t *testing.T) {
 	}
 	if _, ok := TryUnwrapJPEG(mangled, 0); ok {
 		t.Fatal("非 baseline を受理してしまいました")
+	}
+}
+
+// makeProgressivePhoto は Go の image/jpeg でベースラインを作り、それを
+// パースして自前でプログレッシブ相当の... は作れないため、テストは
+// PIL 生成物(store 側)に委ね、ここでは isProgressiveJPEG の判定のみ確認。
+func TestIsProgressiveDetection(t *testing.T) {
+	base := makePhoto(t, 64, 64, 85, 1)
+	if isProgressiveJPEG(base) {
+		t.Fatal("baseline を progressive と誤判定")
+	}
+	if !IsJPEG(base) {
+		t.Fatal("JPEG 判定失敗")
+	}
+}
+
+func TestProgressiveRoundTripTestdata(t *testing.T) {
+	files, _ := filepath.Glob("testdata/progjpeg/*.jpg")
+	if len(files) == 0 {
+		t.Skip("progjpeg testdata なし")
+	}
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !isProgressiveJPEG(orig) {
+			t.Fatalf("%s: progressive と判定されない", fn)
+		}
+		u, ok := TryUnwrapJPEG(orig, 0)
+		if !ok {
+			t.Fatalf("%s: 分解されない", fn)
+		}
+		back, err := ReconstructJPEG(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("%s: 再構成失敗: %v", fn, err)
+		}
+		if !bytes.Equal(back, orig) {
+			t.Fatalf("%s: ビット一致しない", fn)
+		}
+		t.Logf("%s: orig=%d chunked=%d (%.1f%%)", fn, len(orig), len(u.Chunked),
+			100*float64(len(u.Chunked)-len(orig))/float64(len(orig)))
 	}
 }

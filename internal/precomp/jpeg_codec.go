@@ -238,6 +238,10 @@ func TryUnwrapJPEG(orig []byte, maxPlain int64) (*JPEGUnwrapped, bool) {
 	if len(orig) < 128 || !IsJPEG(orig) {
 		return nil, false
 	}
+	// プログレッシブ(SOF2)は専用経路へ委譲する。
+	if isProgressiveJPEG(orig) {
+		return TryUnwrapJPEGProgressive(orig, maxPlain)
+	}
 	// 末尾の EOI(FF D9)を探す
 	idxEOI := -1
 	for i := len(orig) - 2; i >= 2; i-- {
@@ -337,6 +341,9 @@ func coeffEqual(a, b [][]int16) bool {
 func ReconstructJPEG(recipe *JPEGRecipe, chunked []byte) ([]byte, error) {
 	if recipe == nil || recipe.PrefixLen < 0 || recipe.PrefixLen > len(chunked) {
 		return nil, errors.New("JPEG レシピが不正です")
+	}
+	if recipe.Progressive {
+		return ReconstructJPEGProgressive(recipe, chunked)
 	}
 	prefix := chunked[:recipe.PrefixLen]
 	payload := chunked[recipe.PrefixLen:]
