@@ -1,0 +1,98 @@
+# デモ公開: GitHub Actions 上で実サーバーを起動し、Cloudflare クイックトンネル
+# (trycloudflare.com)で一時公開する。手動トリガー(workflow_dispatch)専用。
+#
+# 注意:
+# - ジョブが終わるとデータごと消える一時デモ(最大でも指定時間で自動停止)
+# - リポジトリが Public の間は、ログ/サマリーの URL・キーも公開される
+#   (クォータ・アップロード上限・時間制限つきの使い捨てインスタンスとして設計)
+name: demo
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: '公開する時間(分、最大300)'
+        default: '60'
+
+permissions:
+  contents: write   # デモ用の使い捨てブランチ demo-status に URL を書き出すため
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cgo 依存
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
+      - name: ビルド
+        run: go build -trimpath -ldflags "-s -w" -o ashuku ./cmd/ashuku
+      - name: サーバー起動(認証・クォータつき)
+        run: |
+          ADMIN=$(openssl rand -hex 24)
+          DEMO=$(openssl rand -hex 24)
+          printf '%s 0 id=admin @admin Actions管理者\n%s 5G id=demo デモユーザー\n' "$ADMIN" "$DEMO" > keys.txt
+          ./ashuku -addr 127.0.0.1:8080 -data ./demo-data \
+            -auth-keys keys.txt -max-upload 1G -access-log > server.log 2>&1 &
+          echo "ADMIN_KEY=$ADMIN" >> "$GITHUB_ENV"
+          echo "DEMO_KEY=$DEMO" >> "$GITHUB_ENV"
+          for i in $(seq 1 50); do
+            curl -sf -o /dev/null http://127.0.0.1:8080/healthz && exit 0
+            sleep 0.2
+          done
+          echo "サーバーが起動しません"; cat server.log; exit 1
+      - name: トンネル起動(Cloudflare quick tunnel)
+        run: |
+          curl -sL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          if [ -z "$URL" ]; then echo "トンネルURLを取得できません"; cat tunnel.log; exit 1; fi
+          echo "TUNNEL_URL=$URL"
+          {
+            echo "## 🗜️ ashuku デモ公開中"
+            echo ""
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| URL | $URL |"
+            echo "| デモ用APIキー(クォータ5G) | \`$DEMO_KEY\` |"
+            echo "| 管理キー(optimize/scrub/fsck) | \`$ADMIN_KEY\` |"
+            echo "| 公開時間 | ${{ inputs.minutes }} 分(ジョブ終了でデータごと消えます) |"
+            echo ""
+            echo "ブラウザで URL を開き、APIキー欄にデモ用キーを入れて「接続」。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=デモ公開URL::$URL (demo key: $DEMO_KEY)"
+          # 使い捨てブランチ demo-status に URL を書き出す(実行中でも API から読めるように)
+          END=$(date -u -d "+${{ inputs.minutes }} min" +%Y-%m-%dT%H:%MZ 2>/dev/null || echo "?")
+          mkdir -p /tmp/status && cd /tmp/status
+          {
+            echo "url: $URL"
+            echo "demo_key: $DEMO_KEY"
+            echo "admin_key: $ADMIN_KEY"
+            echo "expires_utc: $END"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > demo-url.txt
+          git init -q
+          git config user.name "ashuku-demo-bot"
+          git config user.email "demo@localhost"
+          git add demo-url.txt
+          git commit -q -m "demo url $(date -u +%H:%M)"
+          git branch -M demo-status
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" demo-status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 公開時間だけ稼働
+        run: |
+          M=${{ inputs.minutes }}
+          [ "$M" -gt 300 ] && M=300
+          echo "$M 分間公開します(その後自動停止)"
+          sleep $(( M * 60 ))
+          echo "公開時間が終了しました。停止します。"

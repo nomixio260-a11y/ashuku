@@ -1,0 +1,41 @@
+# CI: push / PR ごとに ビルド・整形・vet・全テスト・race を検証する。
+# cgo 経路(zlib precomp / libzstd-19)と CGO 無効ビルド(スタブ経路)の
+# 両方をビルドし、どちらの構成でも壊れないことを保証する。
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cgo 依存(zlib ヘッダ・libzstd ランタイム)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
+      - name: gofmt チェック
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: ビルド(cgo あり)
+        run: go build ./...
+      - name: ビルド(CGO_ENABLED=0 スタブ経路)
+        run: CGO_ENABLED=0 go build ./...
+      - name: 全テスト
+        run: go test -timeout 30m ./...
+      - name: race detector(並行系パッケージ)
+        run: go test -race ./internal/api/ ./internal/client/
+      - name: ファジング(precomp パーサ、各10秒)
+        run: |
+          for f in FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzReconstructContainer; do
+            go test ./internal/precomp/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
+          done
+      - name: ファジング(store コーデック、各10秒)
+        run: |
+          for f in FuzzBCJRoundTrip FuzzBrotliDecode; do
+            go test ./internal/store/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
+          done
