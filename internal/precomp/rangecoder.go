@@ -22,6 +22,9 @@ func newModels(n int) []bitModel {
 
 const rcTopValue = 1 << 24
 
+// moveBits は適応速度(小さいほど速く適応、大きいほど滑らか)。
+const moveBits = 5
+
 // rangeEncoder は算術符号のエンコーダ。
 type rangeEncoder struct {
 	low       uint64
@@ -57,11 +60,11 @@ func (e *rangeEncoder) encodeBit(p *bitModel, bit int) {
 	bound := (e.rng >> 11) * uint32(*p)
 	if bit == 0 {
 		e.rng = bound
-		*p += (2048 - *p) >> 5
+		*p += (2048 - *p) >> moveBits
 	} else {
 		e.low += uint64(bound)
 		e.rng -= bound
-		*p -= *p >> 5
+		*p -= *p >> moveBits
 	}
 	for e.rng < rcTopValue {
 		e.rng <<= 8
@@ -119,12 +122,12 @@ func (d *rangeDecoder) decodeBit(p *bitModel) int {
 	var bit int
 	if d.code < bound {
 		d.rng = bound
-		*p += (2048 - *p) >> 5
+		*p += (2048 - *p) >> moveBits
 		bit = 0
 	} else {
 		d.code -= bound
 		d.rng -= bound
-		*p -= *p >> 5
+		*p -= *p >> moveBits
 		bit = 1
 	}
 	for d.rng < rcTopValue {

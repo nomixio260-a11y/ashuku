@@ -340,6 +340,9 @@ func parseFrame(orig []byte) (*jpegFrame, int, error) {
 				cid := int(seg[1+s*2])
 				td := int(seg[2+s*2] >> 4)
 				ta := int(seg[2+s*2] & 0x0F)
+				if td > 3 || ta > 3 {
+					return nil, 0, errors.New("スキャンのテーブルセレクタが不正")
+				}
 				for ci := range f.comps {
 					if f.comps[ci].id == cid {
 						f.comps[ci].dcTable = td
