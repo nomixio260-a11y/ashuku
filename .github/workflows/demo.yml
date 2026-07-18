@@ -13,6 +13,9 @@ on:
         description: '公開する時間(分、最大300)'
         default: '60'
 
+permissions:
+  contents: write   # デモ用の使い捨てブランチ demo-status に URL を書き出すため
+
 jobs:
   demo:
     runs-on: ubuntu-latest
@@ -66,6 +69,26 @@ jobs:
             echo ""
             echo "ブラウザで URL を開き、APIキー欄にデモ用キーを入れて「接続」。"
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=デモ公開URL::$URL (demo key: $DEMO_KEY)"
+          # 使い捨てブランチ demo-status に URL を書き出す(実行中でも API から読めるように)
+          END=$(date -u -d "+${{ inputs.minutes }} min" +%Y-%m-%dT%H:%MZ 2>/dev/null || echo "?")
+          mkdir -p /tmp/status && cd /tmp/status
+          {
+            echo "url: $URL"
+            echo "demo_key: $DEMO_KEY"
+            echo "admin_key: $ADMIN_KEY"
+            echo "expires_utc: $END"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > demo-url.txt
+          git init -q
+          git config user.name "ashuku-demo-bot"
+          git config user.email "demo@localhost"
+          git add demo-url.txt
+          git commit -q -m "demo url $(date -u +%H:%M)"
+          git branch -M demo-status
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" demo-status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: 公開時間だけ稼働
         run: |
           M=${{ inputs.minutes }}
