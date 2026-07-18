@@ -487,7 +487,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
 		zlibFmt := s.precomp && (precomp.IsGzip(head) || precomp.IsZlib(head) ||
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
-		jpegFmt := s.precompJPEG && precomp.IsJPEG(head)
+		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head))
 		if n == 5 && (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -604,6 +604,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingJPEGV1
 		m.PrecompJPEG = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsGIF(buf):
+		u, ok := precomp.TryUnwrapGIF(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingGIFV1
+		m.PrecompGIF = u.Recipe
 		m.precompPlain = u.Chunked
 	default:
 		return false
@@ -1212,6 +1220,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructContainer(m.PrecompContainer, plain.Bytes())
 	case EncodingJPEGV1:
 		orig, err = precomp.ReconstructJPEG(m.PrecompJPEG, plain.Bytes())
+	case EncodingGIFV1:
+		orig, err = precomp.ReconstructGIF(m.PrecompGIF, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}

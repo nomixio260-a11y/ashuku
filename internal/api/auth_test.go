@@ -2,12 +2,15 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/nomixio260-a11y/ashuku/internal/store"
@@ -366,4 +369,51 @@ func TestHealthzHidesDiskBytes(t *testing.T) {
 	if m["status"] == nil {
 		t.Fatal("status がない")
 	}
+}
+
+// TestManifestDoesNotLeakInternals はマニフェスト/一覧 API が内部表現
+// (再構成レシピ・符号化方式名・分解後チャンク構造)を漏らさないことを検証。
+func TestManifestDoesNotLeakInternals(t *testing.T) {
+	srv := newAuthServer(t, Options{})
+	// zlib 産 gzip をサーバー経路でアップロード(precomp 適用対象)
+	var gz bytes.Buffer
+	zw, _ := zlibNewGzip(&gz)
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(zw, "line %d of highly compressible content\n", i)
+	}
+	zw.Close()
+	resp := req(t, "POST", srv.URL+"/api/v1/files?name=a.gz", "", gz.Bytes())
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload: %d", resp.StatusCode)
+	}
+	var up map[string]any
+	json.NewDecoder(resp.Body).Decode(&up)
+	id := up["id"].(string)
+
+	for _, path := range []string{"/api/v1/manifests/" + id, "/api/v1/files"} {
+		resp = req(t, "GET", srv.URL+path, "", nil)
+		body, _ := io.ReadAll(resp.Body)
+		low := strings.ToLower(string(body))
+		for _, banned := range []string{"precomp", "zlib", "jpeg", "recipe", "coder", "prefix", "suffix", "gzip-"} {
+			if strings.Contains(low, banned) {
+				t.Fatalf("%s の応答に内部情報 %q が含まれる: %s", path, banned, body[:min(len(body), 400)])
+			}
+		}
+		// エンコード済みファイルのマニフェストはチャンク列も返さない
+		if strings.HasPrefix(path, "/api/v1/manifests/") {
+			var m map[string]any
+			json.Unmarshal(body, &m)
+			if enc, _ := m["encoding"].(string); enc != "" && enc != "server" {
+				t.Fatalf("encoding が不透明でない: %q", enc)
+			}
+			if _, has := m["chunks"]; has && m["encoding"] == "server" {
+				t.Fatal("エンコード済みファイルのチャンク列が露出")
+			}
+		}
+	}
+}
+
+// zlibNewGzip は zlib 産 gzip 相当のライタ(Go 標準は zlib ベース)。
+func zlibNewGzip(w io.Writer) (io.WriteCloser, error) {
+	return gzip.NewWriterLevel(w, 6)
 }

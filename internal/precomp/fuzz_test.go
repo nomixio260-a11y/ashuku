@@ -15,6 +15,8 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"image"
+	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"testing"
 )
@@ -192,6 +194,36 @@ func FuzzTryUnwrapJPEG(f *testing.F) {
 		got, err := ReconstructJPEG(u.Recipe, u.Chunked)
 		if err != nil || !bytes.Equal(got, data) {
 			t.Fatalf("受理した JPEG の再構成が一致しません (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapGIF は攻撃者制御の GIF での分解が panic せず、採用された
+// 入力は必ずビット一致で再構成できることを検証する。
+func FuzzTryUnwrapGIF(f *testing.F) {
+	pal := make(color.Palette, 4)
+	for i := range pal {
+		pal[i] = color.RGBA{uint8(i * 80), uint8(i * 60), uint8(i * 40), 255}
+	}
+	img := image.NewPaletted(image.Rect(0, 0, 32, 32), pal)
+	for i := range img.Pix {
+		img.Pix[i] = uint8(i % 4)
+	}
+	var buf bytes.Buffer
+	gif.Encode(&buf, img, nil)
+	f.Add(buf.Bytes())
+	f.Add([]byte("GIF89a garbage not a real gif but has the magic"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapGIF(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructGIF(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した GIF の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した GIF がビット一致で戻らない")
 		}
 	})
 }

@@ -464,10 +464,18 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
 		internalError(w, err)
 		return
 	}
-	if files == nil {
-		files = []*store.FileManifest{}
+	// 技術流出防止: 一覧にも内部表現(チャンク列・レシピ・符号化方式名)は
+	// 出さない。表示に必要なメタデータだけを返す。
+	list := make([]map[string]any, 0, len(files))
+	for _, m := range files {
+		list = append(list, map[string]any{
+			"id":         m.ID,
+			"name":       m.Name,
+			"size":       m.Size,
+			"created_at": m.CreatedAt,
+		})
 	}
-	resp := map[string]any{"files": files}
+	resp := map[string]any{"files": list}
 	if next != "" {
 		resp["next_cursor"] = next
 	}
@@ -795,7 +803,22 @@ func (s *Server) handleManifestGet(w http.ResponseWriter, r *http.Request, a aut
 		writeStoreError(w, store.ErrNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, m)
+	// 技術流出防止: マニフェストの内部表現(再構成レシピ・符号化方式名)は
+	// 返さない。サーバー側変換が適用されたファイルは不透明な "server" だけを
+	// 返し(クライアントはこれを見てサーバー経路 DL に切り替える)、その場合
+	// チャンク列も返さない(分解後の構造を推定させない)。
+	view := map[string]any{
+		"id":         m.ID,
+		"name":       m.Name,
+		"size":       m.Size,
+		"created_at": m.CreatedAt,
+	}
+	if m.Encoding != "" {
+		view["encoding"] = "server"
+	} else {
+		view["chunks"] = m.Chunks
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {

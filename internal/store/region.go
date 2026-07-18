@@ -255,7 +255,7 @@ func (s *Store) buildRegionsForChunkLists(lists [][]string, res *OptimizeResult)
 const smallChunkMax = 512 << 10
 
 // smallRegionMaxMembers は小チャンクリージョンの最大メンバー数。
-const smallRegionMaxMembers = 64
+const smallRegionMaxMembers = 256
 
 // smallRegionRawMax は小チャンクリージョンの生バイト上限。1メンバーの
 // 読み出しでこのサイズまで伸長しうる(読み出し増幅の上限)。テストから調整可能。

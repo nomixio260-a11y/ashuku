@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"image"
+	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"math"
 	"math/rand"
@@ -356,5 +358,44 @@ func TestPrecompJPEGDedup(t *testing.T) {
 	added := after.PhysicalBytes - before.PhysicalBytes
 	if added > int64(len(jpg))/10 {
 		t.Fatalf("2枚目の物理増分 = %d(重複排除が効いていない)", added)
+	}
+}
+
+func TestGIFPrecompEndToEnd(t *testing.T) {
+	s := newTestStore(t)
+	// Go 産 GIF(アニメ)を作る
+	pal := make(color.Palette, 256)
+	for i := 0; i < 256; i++ {
+		pal[i] = color.RGBA{uint8(i), uint8(i * 3), uint8(i * 7), 255}
+	}
+	g := &gif.GIF{}
+	for f := 0; f < 4; f++ {
+		img := image.NewPaletted(image.Rect(0, 0, 160, 120), pal)
+		for y := 0; y < 120; y++ {
+			for x := 0; x < 160; x++ {
+				img.SetColorIndex(x, y, uint8((x/8*13+y/8*5+f*11+(x*y)%3)%256))
+			}
+		}
+		g.Image = append(g.Image, img)
+		g.Delay = append(g.Delay, 10)
+	}
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		t.Fatal(err)
+	}
+	orig := buf.Bytes()
+	m := putBytes(t, s, "anim.gif", orig)
+	if m.Encoding != EncodingGIFV1 {
+		t.Fatalf("GIF が分解されていない: encoding=%q", m.Encoding)
+	}
+	got := getBytes(t, s, m.ID)
+	if !bytes.Equal(got, orig) {
+		t.Fatal("GIF の読み戻しがビット一致しない")
+	}
+	st, _ := s.Stats()
+	t.Logf("GIF: logical=%d physical=%d (%.1fx)", st.LogicalBytes, st.PhysicalBytes,
+		float64(st.LogicalBytes)/float64(st.PhysicalBytes))
+	if st.PhysicalBytes >= int64(len(orig)) {
+		t.Fatalf("GIF が縮んでいない: %d -> %d", len(orig), st.PhysicalBytes)
 	}
 }
