@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -300,5 +302,68 @@ func TestBearerToken(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Bearer: status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestHashedAPIKey(t *testing.T) {
+	// キーファイルに sha256:<hex> 形式で置いたキーで認証できること
+	rawKey := "secret-key-12345"
+	sum := sha256.Sum256([]byte(rawKey))
+	hashed := "sha256:" + hex.EncodeToString(sum[:])
+	srv := newAuthServer(t, Options{Users: map[string]User{
+		hashed: {Name: "hashed-user", ID: "u1"},
+	}})
+	// 生キーで認証成功
+	resp := req(t, "GET", srv.URL+"/api/v1/stats", rawKey, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("生キー認証が失敗: %d", resp.StatusCode)
+	}
+	// ハッシュ文字列そのものでは認証できない(ハッシュはキーではない)
+	resp = req(t, "GET", srv.URL+"/api/v1/stats", hashed, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("ハッシュ文字列で認証できてしまった: %d", resp.StatusCode)
+	}
+	// 誤ったキーは拒否
+	resp = req(t, "GET", srv.URL+"/api/v1/stats", "wrong", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("誤ったキーが通った: %d", resp.StatusCode)
+	}
+}
+
+func TestMetricsRequiresAdmin(t *testing.T) {
+	srv := newAuthServer(t, Options{Users: map[string]User{
+		"adminkey": {Name: "op", Admin: true},
+		"userkey":  {Name: "user"},
+	}})
+	// 無認証は 403
+	resp := req(t, "GET", srv.URL+"/metrics", "", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("無認証で metrics が見えた: %d", resp.StatusCode)
+	}
+	// 一般ユーザーも 403
+	resp = req(t, "GET", srv.URL+"/metrics", "userkey", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("一般キーで metrics が見えた: %d", resp.StatusCode)
+	}
+	// 管理者は 200
+	resp = req(t, "GET", srv.URL+"/metrics", "adminkey", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("管理者キーで metrics が見えない: %d", resp.StatusCode)
+	}
+}
+
+func TestHealthzHidesDiskBytes(t *testing.T) {
+	srv := newAuthServer(t, Options{})
+	resp := req(t, "GET", srv.URL+"/healthz", "", nil)
+	body, _ := io.ReadAll(resp.Body)
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := m["free_bytes"]; leaked {
+		t.Fatal("healthz が free_bytes を漏らしている")
+	}
+	if m["status"] == nil {
+		t.Fatal("status がない")
 	}
 }

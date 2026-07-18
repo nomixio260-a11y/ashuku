@@ -275,6 +275,10 @@ type ChunkMeta struct {
 	// 小チャンクを Optimize のたびに再試行してディスクを空回りさせないため)。
 	// リージョン化に成功したチャンクは RegionID が非空になるので別途区別できる。
 	RegionTried bool `json:"rt,omitempty"`
+	// RecompressTried はオフライン最強再圧縮(ベストオブ)の判定を済ませた
+	// ことを示す(リージョンに入らなかったチャンクへの適用漏れを塞ぐ独立
+	// パスが、同じチャンクを繰り返し brotli 圧縮して空回りしないため)。
+	RecompressTried bool `json:"rct,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
 }

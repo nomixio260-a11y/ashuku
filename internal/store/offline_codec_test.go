@@ -149,3 +149,54 @@ func TestOptimizeAdoptsBrotli(t *testing.T) {
 		t.Fatalf("スクラブで破損検出: %+v", sr)
 	}
 }
+
+// TestRecompressPassCoversNonRegionChunks は「リージョンに入らない単独
+// チャンク」もオフライン最強再圧縮の対象になることを検証する(適用漏れ修正)。
+func TestRecompressPassCoversNonRegionChunks(t *testing.T) {
+	s := newTestStore(t)
+	// 単一チャンク(1チャンク=リージョン束不可、類似相手もなし)の
+	// ログ様テキスト(brotli が決定的に勝つ種別)
+	rng := rand.New(rand.NewSource(9))
+	var sb bytes.Buffer
+	paths := []string{"/api/v1/files", "/api/v1/stats", "/healthz", "/console"}
+	for sb.Len() < 400<<10 {
+		fmt.Fprintf(&sb, "2026-07-%02dT%02d:%02d:%02dZ web%02d ashuku[%d]: GET %s status=%d bytes=%d dur=%.3fs\n",
+			rng.Intn(28)+1, rng.Intn(24), rng.Intn(60), rng.Intn(60), rng.Intn(20),
+			rng.Intn(900)+100, paths[rng.Intn(len(paths))], []int{200, 200, 200, 404, 500}[rng.Intn(5)],
+			rng.Intn(99999), rng.Float64()*2)
+	}
+	data := sb.Bytes()
+	m := putBytes(t, s, "single.txt", data)
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	got := getBytes(t, s, m.ID)
+	if !bytes.Equal(got, data) {
+		t.Fatal("読み戻し不一致")
+	}
+	// 単独チャンクが brotli 表現へ昇格していること
+	comps := map[string]int{}
+	s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
+			var cm ChunkMeta
+			if err := json.Unmarshal(v, &cm); err != nil {
+				return err
+			}
+			if cm.RefCount > 0 {
+				comps[cm.Compression]++
+			}
+			return nil
+		})
+	})
+	if comps[compressionBr] == 0 && comps[compressionBrBCJ] == 0 {
+		t.Fatalf("単独チャンクが最強再圧縮されていない: %v", comps)
+	}
+	// 2回目の Optimize は再評価しない(RecompressTried)ことも確認
+	res2, err := s.Optimize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Recompressed != 0 {
+		t.Fatalf("再評価が発生: %+v", res2)
+	}
+}

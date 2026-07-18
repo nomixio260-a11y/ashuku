@@ -133,6 +133,13 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 	if err := s.buildSmallChunkRegions(res); err != nil {
 		return res, err
 	}
+	// リージョンに入らなかった独立チャンクへ最強ベストオブ再圧縮を適用する
+	// (リージョン構築の後=リージョン行きへの空振り防止)。
+	if cand, err := s.collectRecompressCandidates(); err != nil {
+		return res, err
+	} else if err := s.offlineRecompressPass(cand, res); err != nil {
+		return res, err
+	}
 	// repack・救出で解放された領域を含め、live 率の低いパックを回収する。
 	if err := s.compactPacks(res); err != nil {
 		return res, err
@@ -255,6 +262,11 @@ func (s *Store) OptimizeIncremental() (*OptimizeResult, error) {
 		return res, err
 	}
 
+	// 3b) 新チャンクのうちリージョンに入らなかったものへ最強再圧縮を適用
+	if err := s.offlineRecompressPass(dirtyChunks, res); err != nil {
+		return res, err
+	}
+
 	// 4) 解放済み領域の回収(どちらも小さなメタバケット走査で安価)
 	if err := s.compactRegions(res); err != nil {
 		return res, err
@@ -325,6 +337,69 @@ type deltaCand struct {
 	features []uint64
 }
 
+// offlineRecompressPass はリージョンに入らなかった独立チャンク全てに最強
+// ベストオブ再圧縮(libzstd-22 / brotli-11 / BCJ)を一度だけ適用する。
+// サーバー取り込みチャンクは DeltaTried=true で登録されるためデルタパス経由
+// の再圧縮が走らず、リージョン化もされなかったチャンク(中サイズの単独
+// チャンク等)が zstd-19 のまま残る適用漏れを塞ぐ。リージョン構築の後に
+// 呼ぶこと(リージョン行きのチャンクへ brotli を空振りさせない)。
+func (s *Store) offlineRecompressPass(hashes []string, res *OptimizeResult) error {
+	for _, hash := range hashes {
+		var eligible bool
+		err := s.db.View(func(tx *bolt.Tx) error {
+			meta, err := getChunkMeta(tx, hash)
+			if err != nil {
+				return err
+			}
+			eligible = meta != nil && !meta.RecompressTried && meta.RegionID == "" &&
+				independentComp(meta.Compression) && meta.RefCount > 0
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if !eligible {
+			continue
+		}
+		done, err := s.recompressChunk(hash, res)
+		if err != nil {
+			return err
+		}
+		if done {
+			res.Recompressed++
+		}
+		// 成否にかかわらず判定済みを記録(再評価しない)
+		err = s.db.Update(func(tx *bolt.Tx) error {
+			meta, err := getChunkMeta(tx, hash)
+			if err != nil || meta == nil {
+				return err
+			}
+			meta.RecompressTried = true
+			return putChunkMeta(tx, hash, meta)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectRecompressCandidates は全チャンク走査で再圧縮パスの候補を集める
+// (フルパス用。インクリメンタルは dirtyChunks をそのまま渡す)。
+func (s *Store) collectRecompressCandidates() ([]string, error) {
+	var hashes []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
+			if !meta.RecompressTried && meta.RegionID == "" &&
+				independentComp(meta.Compression) && meta.RefCount > 0 {
+				hashes = append(hashes, hash)
+			}
+			return nil
+		})
+	})
+	return hashes, err
+}
+
 // processDeltaCandidates は候補チャンク列に対して類似デルタ→最強再圧縮を
 // 試み、成否にかかわらず DeltaTried を記録する(フルパス・インクリメンタル
 // パス共通の本体)。
@@ -375,6 +450,8 @@ func (s *Store) processDeltaCandidates(todo []deltaCand, res *OptimizeResult) er
 				return err
 			}
 			meta.DeltaTried = true
+			// このパスで最強再圧縮も試行済み(独立再圧縮パスの二重適用防止)
+			meta.RecompressTried = true
 			return putChunkMeta(tx, c.hash, meta)
 		})
 		if err != nil {

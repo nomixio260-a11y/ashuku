@@ -44,7 +44,7 @@ h1 .tag{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radi
 .iconbtn{background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--text);
   width:38px;height:38px;font-size:16px;cursor:pointer;box-shadow:var(--shadow)}
 .conn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 14px}
-input[type=password],input[type=search]{background:var(--panel);border:1px solid var(--line);
+input[type=password],input[type=search],select{background:var(--panel);border:1px solid var(--line);
   border-radius:10px;color:var(--text);padding:10px 12px;font-size:15px;box-shadow:var(--shadow);min-width:0}
 #key{flex:1;min-width:180px}
 button{background:var(--acc);border:0;border-radius:10px;color:#fff;padding:10px 18px;
@@ -132,6 +132,12 @@ button:disabled{opacity:.5;cursor:default}
   <div class="toolbar">
     <b>ファイル</b>
     <input type="search" id="search" placeholder="名前で絞り込み" aria-label="名前で絞り込み">
+    <select id="sort" aria-label="並び替え">
+      <option value="new">新しい順</option>
+      <option value="old">古い順</option>
+      <option value="name">名前順</option>
+      <option value="size">サイズ順</option>
+    </select>
     <button class="ghost small" id="refresh">更新</button>
   </div>
   <div class="list" id="files"></div>
@@ -236,6 +242,8 @@ function fileRow(f) {
   const d = document.createElement("div");
   d.className = "file";
   d.dataset.name = f.name.toLowerCase();
+  d.dataset.size = f.size;
+  d.dataset.at = f.created_at || "";
   const abs = new Date(f.created_at).toLocaleString("ja-JP");
   d.innerHTML = `<div class="name"><span class="ic"></span></div>
     <div class="meta">${fmt(f.size)} ・ <span title="${abs}">${rel(f.created_at)}</span></div>
@@ -249,12 +257,22 @@ function fileRow(f) {
     dl.disabled = true;
     try {
       const r = await api("/api/v1/files/" + f.id);
-      const blob = await r.blob();
+      // 進捗表示つきストリーム読み(Content-Length があるとき)
+      const total = +r.headers.get("Content-Length") || f.size || 0;
+      const reader = r.body.getReader();
+      const parts = []; let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value); got += value.length;
+        if (total) dl.textContent = Math.min(99, Math.round(100 * got / total)) + "%";
+      }
+      const blob = new Blob(parts);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob); a.download = f.name; a.click();
       URL.revokeObjectURL(a.href);
     } catch (e) { toast("ダウンロード失敗: " + e.message, true); }
-    dl.disabled = false;
+    dl.textContent = "保存"; dl.disabled = false;
   };
   const del = document.createElement("button");
   del.className = "danger small"; del.textContent = "削除";
@@ -271,6 +289,20 @@ function fileRow(f) {
 function updateEmpty() {
   const any = [...$("files").children].some(x => x.style.display !== "none");
   $("empty").style.display = any ? "none" : "";
+}
+function applySort() {
+  const mode = $("sort").value;
+  const box = $("files");
+  const rows = [...box.children];
+  rows.sort((a, b) => {
+    switch (mode) {
+      case "name": return a.dataset.name.localeCompare(b.dataset.name, "ja");
+      case "size": return (+b.dataset.size) - (+a.dataset.size);
+      case "old": return a.dataset.at.localeCompare(b.dataset.at);
+      default: return b.dataset.at.localeCompare(a.dataset.at);
+    }
+  });
+  rows.forEach(r => box.appendChild(r));
 }
 function applyFilter() {
   const q = $("search").value.trim().toLowerCase();
@@ -289,6 +321,7 @@ async function loadFiles(append) {
     for (const f of data.files) $("files").appendChild(fileRow(f));
     cursor = data.next_cursor || "";
     $("more").style.display = cursor ? "" : "none";
+    applySort();
     applyFilter();
   } catch (e) { toast("一覧の取得に失敗: " + e.message, true); }
   $("loading").style.display = "none";
@@ -338,8 +371,17 @@ function uploadOne(f) {
   });
 }
 async function upload(files) {
+  // 3並列のプールでアップロード(多数の小ファイルで大幅に速い)
+  const queue = [...files];
   let ok = 0;
-  for (const f of files) if (await uploadOne(f)) ok++;
+  const worker = async () => {
+    for (;;) {
+      const f = queue.shift();
+      if (!f) return;
+      if (await uploadOne(f)) ok++;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, queue.length) }, worker));
   if (ok) toast(`${ok} 件アップロードしました`);
   cursor = ""; loadFiles(false); loadStats();
 }
@@ -353,6 +395,7 @@ $("key").addEventListener("keydown", e => { if (e.key === "Enter") $("saveKey").
 $("refresh").onclick = () => { cursor = ""; loadFiles(false); loadStats(); };
 $("more").onclick = () => loadFiles(true);
 $("search").addEventListener("input", applyFilter);
+$("sort").onchange = applySort;
 $("drop").onclick = () => $("file").click();
 $("drop").addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } });
 $("file").onchange = () => { if ($("file").files.length) upload([...$("file").files]); $("file").value = ""; };

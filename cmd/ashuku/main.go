@@ -59,6 +59,8 @@ func main() {
 	minFree := flag.String("min-free", "1G",
 		"ディスク空きがこの値を下回ったらアップロードを 507 で拒否(枯渇によるサービス停止防止)")
 	accessLog := flag.Bool("access-log", false, "リクエストごとのアクセスログを出力する")
+	metricsPublic := flag.Bool("metrics-public", false,
+		"/metrics を無認証で公開する(既定は認証あり運用では管理者キーを要求)")
 	tlsCert := flag.String("tls-cert", "", "TLS 証明書ファイル(PEM)。tls-key と併せて指定で HTTPS")
 	tlsKey := flag.String("tls-key", "", "TLS 秘密鍵ファイル(PEM)")
 	flag.Parse()
@@ -186,6 +188,7 @@ func main() {
 		ServerSideUploads: *serverSide,
 		MinFreeBytes:      minFreeBytes,
 		AccessLog:         *accessLog,
+		MetricsPublic:     *metricsPublic,
 		MaxConcurrent:     *maxConcurrent,
 	})
 	// タイムアウト: 大容量のアップロード/ダウンロードは何分もかかりうるので

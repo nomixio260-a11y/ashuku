@@ -6,7 +6,9 @@
 package api
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +58,9 @@ type Options struct {
 	MinFreeBytes int64
 	// AccessLog を true にすると1リクエストごとにアクセスログを出力する。
 	AccessLog bool
+	// MetricsPublic を true にすると /metrics を従来どおり無認証で公開する
+	// (デフォルトは認証あり運用では管理者キーを要求)。
+	MetricsPublic bool
 	// ServerSideUploads はサーバー側で圧縮・展開を行う従来経路
 	// (POST/GET /api/v1/files)の扱い:
 	//   "full"(デフォルト) = 従来どおり(auto圧縮・precomp あり)
@@ -153,6 +159,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// セキュリティヘッダ(全応答共通)。実装情報の推定・クリックジャッキング・
+	// MIME スニッフィングを防ぐ。
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 	// パニック分離: 1リクエストのパニックがサーバー全体を落とさないように、
@@ -254,10 +266,19 @@ func (s *Server) requireAdmin(w http.ResponseWriter, a authed) bool {
 // 比較時間がキー内容に依存しないため、応答時間からキーを1文字ずつ
 // 推測するタイミング攻撃が成立しない(全登録キーと必ず比較する)。
 func (s *Server) lookupUser(key string) (User, bool) {
+	// キーファイルには生キーの代わりに "sha256:<hex>" 形式でハッシュを
+	// 置ける(ファイル漏洩時にキー自体が漏れない)。照合は提示キーの
+	// ハッシュと定時間比較する。
+	sum := sha256.Sum256([]byte(key))
+	hashed := "sha256:" + hex.EncodeToString(sum[:])
 	var found User
 	ok := false
 	for k, u := range s.opts.Users {
-		if subtle.ConstantTimeCompare([]byte(k), []byte(key)) == 1 {
+		probe := key
+		if strings.HasPrefix(k, "sha256:") {
+			probe = hashed
+		}
+		if subtle.ConstantTimeCompare([]byte(k), []byte(probe)) == 1 {
 			found, ok = u, true
 		}
 	}
@@ -357,7 +378,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, a authed) 
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("アップロードサイズが上限(%d bytes)を超えています", s.opts.MaxUploadBytes))
 		default:
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存に失敗しました: %v", err))
+			internalError(w, err)
 		}
 		return
 	}
@@ -440,7 +461,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
 	}
 	files, next, err := s.store.ListPage(a.owner, r.URL.Query().Get("after"), limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	if files == nil {
@@ -470,7 +491,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, a authed) 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a authed) {
 	used, err := s.store.OwnerUsage(a.owner)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -494,11 +515,28 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = "low_disk"
 		code = http.StatusServiceUnavailable
 	}
-	writeJSON(w, code, map[string]any{"status": status, "free_bytes": free})
+	// 空き容量の実数は返さない(無認証エンドポイントからサーバー規模を
+	// 推定されないため。運用者は認証付き /stats か /metrics で見られる)。
+	writeJSON(w, code, map[string]any{"status": status})
 }
 
-// handleMetrics は Prometheus 形式でメトリクスを返す(認証不要)。
+// handleMetrics は Prometheus 形式でメトリクスを返す。
+// 認証あり運用ではストアの規模(ファイル数・容量・削減率)が外部に漏れない
+// よう管理者キーを要求する(-metrics-public で従来どおり無認証公開に戻せる)。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if len(s.opts.Users) > 0 && !s.opts.MetricsPublic {
+		key := r.Header.Get("X-API-Key")
+		if key == "" {
+			if h := r.Header.Get("Authorization"); len(h) > 7 && h[:7] == "Bearer " {
+				key = h[7:]
+			}
+		}
+		u, ok := s.lookupUser(key)
+		if !ok || !u.Admin {
+			writeError(w, http.StatusForbidden, "メトリクスには管理者キーが必要です")
+			return
+		}
+	}
 	gauges := map[string]int64{}
 	if free, err := s.store.FreeBytes(); err == nil {
 		gauges["ashuku_disk_free_bytes"] = free
@@ -526,7 +564,7 @@ func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, a authed) {
 	}
 	res, err := s.store.Scrub()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -540,7 +578,7 @@ func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, a authed) {
 	repair := r.URL.Query().Get("repair") == "1"
 	res, err := s.store.Fsck(repair)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -559,7 +597,7 @@ func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, a authed
 	}
 	res, err := run()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -590,7 +628,7 @@ func (s *Server) cachedStats() (*store.Stats, error) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, _ authed) {
 	st, err := s.cachedStats()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
@@ -681,7 +719,7 @@ func (s *Server) handleChunkGet(w http.ResponseWriter, r *http.Request, a authed
 	hash := r.PathValue("hash")
 	ok, err := s.store.OwnerHasChunk(a.owner, hash)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 	if !ok {
@@ -737,7 +775,7 @@ func (s *Server) handleManifestCommit(w http.ResponseWriter, r *http.Request, a 
 		case errors.Is(err, store.ErrTooLarge):
 			writeError(w, http.StatusRequestEntityTooLarge, "アップロードサイズが上限を超えています")
 		default:
-			writeError(w, http.StatusInternalServerError, err.Error())
+			internalError(w, err)
 		}
 		return
 	}
@@ -765,7 +803,14 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "ファイルが見つかりません")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, err.Error())
+	internalError(w, err)
+}
+
+// internalError は 500 を返す。内部エラーの詳細(ファイルパス・使用
+// ライブラリ名など実装情報)はクライアントに返さずログにだけ残す。
+func internalError(w http.ResponseWriter, err error) {
+	log.Printf("内部エラー: %v", err)
+	writeError(w, http.StatusInternalServerError, "内部エラーが発生しました")
 }
 
 func contentType(name string) string {

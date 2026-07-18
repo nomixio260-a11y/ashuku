@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -158,6 +159,7 @@ type Store struct {
 	precompJPEG bool          // JPEG(純Go、cgo 不要)
 	precompMax  int64         // precompression の展開上限
 	precompSem  chan struct{} // precompression の同時実行制限
+	cpuSem      chan struct{} // 取り込み圧縮の並列度(全アップロード共有)
 	optMu       sync.Mutex    // Optimize の同時実行を直列化
 	minFree     int64         // ディスク予約(0 = ガードなし)
 	// writeWaiters は進行中の書き込みトランザクション要求数(batchUpdate の
@@ -324,6 +326,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		precompJPEG: !cfg.DisablePrecomp, // JPEG は純Goなので常に可能
 		precompMax:  precompMax,
 		precompSem:  make(chan struct{}, precompPar),
+		cpuSem:      make(chan struct{}, max(1, runtime.GOMAXPROCS(0))),
 		minFree:     cfg.MinFreeBytes,
 	}
 	// クラッシュで取り残された temp ファイル(.tmp-*)を掃除する。
@@ -641,27 +644,70 @@ func readUpTo(r io.Reader, max int) ([]byte, io.Reader, error) {
 // する上、クォータ超過時もチャンクが一切コミットされない完全な原子性になる)。
 // 大きなファイルは従来どおりストリーミングで逐次確定する(メモリ一定)。
 // pending が nil のときはチャンクは確定済み(ストリーミング経路)。
+// chunkFuture は非同期で準備中(圧縮・類似検索)のチャンク。
+type chunkFuture struct {
+	pc   *preparedChunk
+	err  error
+	done chan struct{}
+}
+
+// prepareAsync はチャンクの準備(CPU の重い部分)をバックグラウンドで行う。
+// 並列度はストア全体で cpuSem(コア数)に制限され、適用順は呼び出し側が
+// future の待ち合わせ順で保存する。
+func (s *Store) prepareAsync(hash string, data []byte, mode string) *chunkFuture {
+	f := &chunkFuture{done: make(chan struct{})}
+	go func() {
+		defer close(f.done)
+		s.cpuSem <- struct{}{}
+		defer func() { <-s.cpuSem }()
+		f.pc, f.err = s.prepareChunk(hash, data, mode)
+	}()
+	return f
+}
+
+func (f *chunkFuture) wait() (*preparedChunk, error) {
+	<-f.done
+	return f.pc, f.err
+}
+
 func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes int64) ([]*preparedChunk, error) {
 	ck, err := chunker.New(r, s.chunkSize)
 	if err != nil {
 		return nil, err
 	}
 	bufLimit := int64(s.chunkSize) * 4 // 最大チャンクサイズ = 必ず1チャンクは収まる
-	pending := []*preparedChunk{}
+	// 圧縮・類似検索はチャンクごとに独立なので、ウィンドウ付きの並列
+	// パイプラインで行う(確定はストリーム順のまま)。ウィンドウは
+	// コア数までに制限し、保持メモリ(チャンク生データ+圧縮出力)を
+	// アップロードあたり最大 ~window×2×チャンクサイズに抑える。
+	window := max(2, min(8, runtime.GOMAXPROCS(0)))
+	pending := []*chunkFuture{} // 小ファイル: グループコミット候補
 	var buffered int64
-	var committed []string // 逐次確定済みのチャンク(エラー時のロールバック対象)
+	inflight := []*chunkFuture{} // 大ファイル: 準備中チャンクの順序付き列
+	var committed []string       // 逐次確定済みのチャンク(エラー時のロールバック対象)
 	fail := func(err error) ([]*preparedChunk, error) {
+		// 進行中の準備はバックグラウンドで完了して破棄される(リークなし)
 		s.rollbackChunks(committed)
 		return nil, err
 	}
-	// flush は pending を諦めて逐次確定に切り替える(大きなファイルと判明)。
-	flush := func() error {
-		for _, pc := range pending {
-			if err := s.applyPrepared(pc); err != nil {
-				return err
-			}
-			committed = append(committed, pc.hash)
+	// applyHead は inflight の先頭を待って確定する。
+	applyHead := func() error {
+		head := inflight[0]
+		inflight = inflight[1:]
+		pc, err := head.wait()
+		if err != nil {
+			return err
 		}
+		if err := s.applyPrepared(pc); err != nil {
+			return err
+		}
+		committed = append(committed, pc.hash)
+		return nil
+	}
+	// flush は pending を諦めて逐次確定パイプラインに切り替える
+	// (大きなファイルと判明)。
+	flush := func() error {
+		inflight = append(inflight, pending...)
 		pending = nil
 		return nil
 	}
@@ -686,15 +732,12 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 		}
 		hash := sha256.Sum256(chunk.Data)
 		hexHash := hex.EncodeToString(hash[:])
+		// チャンカーのバッファは再利用されるためコピーして保持する。
+		data := append([]byte(nil), chunk.Data...)
+		f := s.prepareAsync(hexHash, data, mode)
 		switch {
-		case pending != nil && buffered+int64(len(chunk.Data)) <= bufLimit:
-			// チャンカーのバッファは再利用されるためコピーして保持する。
-			data := append([]byte(nil), chunk.Data...)
-			pc, err := s.prepareChunk(hexHash, data, mode)
-			if err != nil {
-				return fail(err)
-			}
-			pending = append(pending, pc)
+		case pending != nil && buffered+int64(len(data)) <= bufLimit:
+			pending = append(pending, f)
 			buffered += int64(len(data))
 		default:
 			if pending != nil {
@@ -702,15 +745,35 @@ func (s *Store) putStream(m *FileManifest, r io.Reader, mode string, maxBytes in
 					return fail(err)
 				}
 			}
-			if err := s.storeChunk(hexHash, chunk.Data, mode); err != nil {
-				return fail(err)
+			inflight = append(inflight, f)
+			for len(inflight) >= window {
+				if err := applyHead(); err != nil {
+					return fail(err)
+				}
 			}
-			committed = append(committed, hexHash)
 		}
 		m.Chunks = append(m.Chunks, hexHash)
 		m.Size += int64(len(chunk.Data))
 	}
-	return pending, nil
+	// 大ファイル経路: 残りの準備済みチャンクを順に確定
+	for len(inflight) > 0 {
+		if err := applyHead(); err != nil {
+			return fail(err)
+		}
+	}
+	// 小ファイル経路: 準備完了を待って呼び出し側のグループコミットへ渡す
+	out := make([]*preparedChunk, 0, len(pending))
+	for _, f := range pending {
+		pc, err := f.wait()
+		if err != nil {
+			return fail(err)
+		}
+		out = append(out, pc)
+	}
+	if pending == nil {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // applyPrepared は準備済みチャンク1つを単独トランザクションで確定する
