@@ -64,18 +64,62 @@ func getRegionMeta(tx *bolt.Tx, id string) (*regionMeta, error) {
 	return &rm, nil
 }
 
+// putRegionMeta はリージョンメタを保存し、維持カウンタを差分更新する。
 func putRegionMeta(tx *bolt.Tx, id string, rm *regionMeta) error {
+	b := tx.Bucket(bucketRegions)
+	var old regionMeta
+	hadOld := false
+	if raw := b.Get([]byte(id)); raw != nil {
+		if err := json.Unmarshal(raw, &old); err != nil {
+			return err
+		}
+		hadOld = true
+	}
 	raw, err := json.Marshal(rm)
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(bucketRegions).Put([]byte(id), raw)
+	if err := b.Put([]byte(id), raw); err != nil {
+		return err
+	}
+	return adjustCounters(tx, func(sc *storeCounters) {
+		if !hadOld {
+			sc.RegionCount++
+			sc.RegionBytes += rm.StoredSize
+			return
+		}
+		sc.RegionBytes += rm.StoredSize - old.StoredSize
+	})
 }
 
-// readRegionRaw はリージョンを伸長した生バイト全体を返す(キャッシュ付き)。
-func (s *Store) readRegionRaw(id string, rawTotal int64) ([]byte, error) {
-	if data, ok := s.cache.get(regionCacheKey(id)); ok {
-		return data, nil
+// deleteRegionMeta はリージョンメタを削除し、維持カウンタを減算する。
+func deleteRegionMeta(tx *bolt.Tx, id string) error {
+	b := tx.Bucket(bucketRegions)
+	raw := b.Get([]byte(id))
+	if raw == nil {
+		return nil
+	}
+	var old regionMeta
+	if err := json.Unmarshal(raw, &old); err != nil {
+		return err
+	}
+	if err := b.Delete([]byte(id)); err != nil {
+		return err
+	}
+	return adjustCounters(tx, func(sc *storeCounters) {
+		sc.RegionCount--
+		sc.RegionBytes -= old.StoredSize
+	})
+}
+
+// readRegionRaw はリージョンを伸長した生バイト全体を返す。
+// useCache が偽ならキャッシュを見ず・入れず、ディスク上のバイトを検証する
+// (スクラブ用)。
+func (s *Store) readRegionRaw(id string, rawTotal int64, useCache bool) ([]byte, error) {
+	if useCache {
+		if data, ok := s.cache.get(regionCacheKey(id)); ok {
+			return data, nil
+		}
 	}
 	stored, err := os.ReadFile(s.regionPath(id))
 	if err != nil {
@@ -85,14 +129,16 @@ func (s *Store) readRegionRaw(id string, rawTotal int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("リージョン伸長に失敗: %w", err)
 	}
-	s.cache.put(regionCacheKey(id), raw)
+	if useCache {
+		s.cache.put(regionCacheKey(id), raw)
+	}
 	return raw, nil
 }
 
 // readChunkFromRegion はリージョン内チャンクを取り出して検証する。
-func (s *Store) readChunkFromRegion(hash string, meta *ChunkMeta) ([]byte, error) {
+func (s *Store) readChunkFromRegion(hash string, meta *ChunkMeta, useCache bool) ([]byte, error) {
 	// リージョンの生合計サイズは伸長時に確定するので、まず十分な見積りで伸長。
-	raw, err := s.readRegionRaw(meta.RegionID, meta.RegionOff+meta.RawSize)
+	raw, err := s.readRegionRaw(meta.RegionID, meta.RegionOff+meta.RawSize, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +153,10 @@ func (s *Store) readChunkFromRegion(hash string, meta *ChunkMeta) ([]byte, error
 	return data, nil
 }
 
-// buildRegions はファイル順に連続する独立圧縮チャンクをリージョンにまとめる。
+// buildRegions は全ファイルを対象に、ファイル順に連続する独立圧縮チャンクを
+// リージョンにまとめる(フルパス)。
 func (s *Store) buildRegions(res *OptimizeResult) error {
-	// 対象ファイルのチャンク列を収集(順序が必要なのでマニフェストから)。
-	type fileChunks struct {
-		chunks []string
-	}
-	var files []fileChunks
+	var lists [][]string
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
 			var m FileManifest
@@ -121,7 +164,7 @@ func (s *Store) buildRegions(res *OptimizeResult) error {
 				return err
 			}
 			if len(m.Chunks) >= 2 {
-				files = append(files, fileChunks{chunks: m.Chunks})
+				lists = append(lists, m.Chunks)
 			}
 			return nil
 		})
@@ -129,9 +172,14 @@ func (s *Store) buildRegions(res *OptimizeResult) error {
 	if err != nil {
 		return err
 	}
+	return s.buildRegionsForChunkLists(lists, res)
+}
 
+// buildRegionsForChunkLists はチャンク列(ファイル順)の集合をリージョンに
+// まとめる本体(フルパス・インクリメンタルパス共通)。
+func (s *Store) buildRegionsForChunkLists(lists [][]string, res *OptimizeResult) error {
 	placed := make(map[string]bool) // このパスで既にリージョン化したチャンク
-	for _, f := range files {
+	for _, chunks := range lists {
 		var run []string
 		flush := func() error {
 			if len(run) >= 2 {
@@ -145,7 +193,7 @@ func (s *Store) buildRegions(res *OptimizeResult) error {
 			run = run[:0]
 			return nil
 		}
-		for _, h := range f.chunks {
+		for _, h := range chunks {
 			ok, err := s.regionEligible(h, placed)
 			if err != nil {
 				return err
@@ -209,22 +257,11 @@ var smallRegionRawMax int64 = 4 << 20
 // 束ねてもソリッド圧縮は効かず、リージョンファイルの書き捨てを増やすだけ
 // だからである。
 func (s *Store) buildSmallChunkRegions(res *OptimizeResult) error {
-	type smallChunk struct {
-		hash    string
-		raw     int64
-		feature uint64
-	}
 	var chunks []smallChunk
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
-			if meta.RegionID == "" && !meta.RegionTried &&
-				meta.Compression == compressionZstd && meta.RefCount > 0 &&
-				meta.RawSize > 0 && meta.RawSize <= smallChunkMax {
-				var f uint64
-				if len(meta.Features) > 0 {
-					f = meta.Features[0]
-				}
-				chunks = append(chunks, smallChunk{hash: hash, raw: meta.RawSize, feature: f})
+			if sc, ok := smallChunkCandidate(hash, meta); ok {
+				chunks = append(chunks, sc)
 			}
 			return nil
 		})
@@ -232,6 +269,32 @@ func (s *Store) buildSmallChunkRegions(res *OptimizeResult) error {
 	if err != nil {
 		return err
 	}
+	return s.buildSmallChunkRegionsFrom(chunks, res)
+}
+
+type smallChunk struct {
+	hash    string
+	raw     int64
+	feature uint64
+}
+
+// smallChunkCandidate はメタが小チャンクソリッド圧縮の対象かを判定する。
+func smallChunkCandidate(hash string, meta *ChunkMeta) (smallChunk, bool) {
+	if meta.RegionID == "" && !meta.RegionTried &&
+		meta.Compression == compressionZstd && meta.RefCount > 0 &&
+		meta.RawSize > 0 && meta.RawSize <= smallChunkMax {
+		var f uint64
+		if len(meta.Features) > 0 {
+			f = meta.Features[0]
+		}
+		return smallChunk{hash: hash, raw: meta.RawSize, feature: f}, true
+	}
+	return smallChunk{}, false
+}
+
+// buildSmallChunkRegionsFrom は候補列を束ねてソリッド圧縮する本体
+// (フルパス・インクリメンタルパス共通)。
+func (s *Store) buildSmallChunkRegionsFrom(chunks []smallChunk, res *OptimizeResult) error {
 	if len(chunks) < 2 {
 		return nil
 	}
@@ -439,7 +502,7 @@ func (s *Store) releaseRegionMember(tx *bolt.Tx, regionID string) (string, error
 	if rm.LiveCount > 0 {
 		return "", putRegionMeta(tx, regionID, rm)
 	}
-	if err := tx.Bucket(bucketRegions).Delete([]byte(regionID)); err != nil {
+	if err := deleteRegionMeta(tx, regionID); err != nil {
 		return "", err
 	}
 	return s.regionPath(regionID), nil
@@ -525,7 +588,7 @@ func (s *Store) dissolveRegion(regionID string, res *OptimizeResult) error {
 	// リージョンを削除
 	var path string
 	err = s.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(bucketRegions).Delete([]byte(regionID)); err != nil {
+		if err := deleteRegionMeta(tx, regionID); err != nil {
 			return err
 		}
 		path = s.regionPath(regionID)

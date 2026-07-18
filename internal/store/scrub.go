@@ -14,6 +14,7 @@ package store
 // 破損も先回りで見つけられる点が価値。
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -34,6 +35,9 @@ type ScrubResult struct {
 	Missing []string `json:"missing,omitempty"`
 	// AffectedFiles は破損/欠損チャンクを参照するファイルの (id, name)。
 	AffectedFiles []AffectedFile `json:"affected_files,omitempty"`
+	// Completed はこのバッチでストア全体の1周が完了したか
+	// (ローリングスクラブの進捗表示用)。
+	Completed bool `json:"completed"`
 }
 
 // AffectedFile は破損の影響を受けるファイル。
@@ -47,16 +51,48 @@ func (r *ScrubResult) Healthy() bool {
 	return len(r.Corrupt) == 0 && len(r.Missing) == 0
 }
 
+// keyScrubCursor はローリングスクラブの進捗カーソル(最後に検証した
+// チャンクハッシュ)。
+var keyScrubCursor = []byte("scrub_cursor")
+
 // Scrub は全チャンクの完全性を検証する。実行中も読み書きは可能
 // (View スナップショットで走査するため、途中の変更は次回に回る)。
 func (s *Store) Scrub() (*ScrubResult, error) {
-	// 走査対象のハッシュを収集(検証は重いのでロック外で行う)
+	return s.ScrubSome(0)
+}
+
+// ScrubSome は最大 maxChunks 個(0 = 全チャンク)をカーソル位置から検証する
+// ローリングスクラブ。進捗カーソルは永続化され、次回はその続きから検証する
+// (末尾に達したら先頭へ戻る)。巨大ストアの定期スクラブを「毎回全走査で
+// 数時間ディスクを飽和」から「毎回一定量ずつ、数日で一周」に変える。
+//
+// 検証読みはチャンク/リージョンキャッシュを見ず・入れない: キャッシュ経由
+// ではディスクの bit rot を検出できず(以前の実装の検証漏れ)、また走査が
+// ホットなキャッシュを洗い流すのも防ぐ。
+func (s *Store) ScrubSome(maxChunks int) (*ScrubResult, error) {
+	// カーソルの次から最大 maxChunks 個を収集する(検証は重いのでロック外で
+	// 行う)。バケット末尾に達したらその時点で「1周完了」とし、次回は先頭から
+	// 新しい周を始める(周回をバッチ内で跨がないことで進捗管理を単純にする)。
 	var hashes []string
+	completed := false // このバッチで1周が完了したか
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketChunks).ForEach(func(k, _ []byte) error {
+		cursor := tx.Bucket(bucketSettings).Get(keyScrubCursor)
+		c := tx.Bucket(bucketChunks).Cursor()
+		k, _ := c.First()
+		if cursor != nil {
+			k, _ = c.Seek(cursor)
+			if k != nil && bytes.Equal(k, cursor) {
+				k, _ = c.Next() // カーソル自身は前回検証済み
+			}
+		}
+		for ; k != nil; k, _ = c.Next() {
+			if maxChunks > 0 && len(hashes) >= maxChunks {
+				return nil // 枠いっぱい(続きは次回)
+			}
 			hashes = append(hashes, string(k))
-			return nil
-		})
+		}
+		completed = true // 末尾まで走り切った
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -64,9 +100,10 @@ func (s *Store) Scrub() (*ScrubResult, error) {
 
 	res := &ScrubResult{}
 	bad := make(map[string]bool)
+	var last string
 	for _, hash := range hashes {
-		// readChunk は伸長 + SHA-256 照合を行うので、成功=完全性OK。
-		data, err := s.readChunk(hash)
+		// readChunkVerify は伸長 + SHA-256 照合をキャッシュ迂回で行う。
+		data, err := s.readChunkVerify(hash)
 		if err != nil {
 			// メタは存在するが読めない/検証失敗 → 破損 or 欠損
 			if isMissing(err) {
@@ -75,10 +112,28 @@ func (s *Store) Scrub() (*ScrubResult, error) {
 				res.Corrupt = append(res.Corrupt, hash)
 			}
 			bad[hash] = true
+			last = hash
 			continue
 		}
 		res.ChunksChecked++
 		res.BytesChecked += int64(len(data))
+		last = hash
+	}
+	res.Completed = completed
+
+	// 進捗カーソルを保存(1周完了ならリセットして次回は先頭から)
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		if completed {
+			return b.Delete(keyScrubCursor)
+		}
+		if last == "" {
+			return nil
+		}
+		return b.Put(keyScrubCursor, []byte(last))
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	if len(bad) > 0 {

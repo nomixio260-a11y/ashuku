@@ -301,3 +301,41 @@ func TestDiskGuardBlocksWrites(t *testing.T) {
 		t.Fatalf("Optimize err = %v, want ErrDiskFull", err)
 	}
 }
+
+// 維持カウンタ(Stats O(1)化)が、あらゆる経路(取り込み・重複・削除・
+// リージョン化・repack・パック回収)の後も全走査と一致し続ける。
+func TestCountersStayConsistent(t *testing.T) {
+	s := newTestStore(t)
+	// 多様なワークロード
+	m1 := putBytes(t, s, "text", repetitiveData(6<<20))
+	putBytes(t, s, "rand", randomData(t, 3<<20))
+	putBytes(t, s, "dup", repetitiveData(6<<20)) // 全チャンク重複
+	var smalls []*FileManifest
+	for i := 0; i < 20; i++ {
+		smalls = append(smalls, putBytes(t, s, "small", randomDataSeed(t, 30<<10, int64(1000+i))))
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(m1.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range smalls[:10] {
+		if err := s.Delete(m.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Optimize(); err != nil { // リージョン解体・パック回収も踏む
+		t.Fatal(err)
+	}
+	res, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.CounterMismatches != 0 {
+		t.Fatalf("維持カウンタが全走査と食い違っています: %d フィールド", res.CounterMismatches)
+	}
+	if !res.Healthy() {
+		t.Fatalf("fsck が不健全: %+v", res)
+	}
+}

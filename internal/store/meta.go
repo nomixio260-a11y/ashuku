@@ -29,6 +29,12 @@ var (
 	bucketOwnerChunks = []byte("ownerchunks")
 	// bucketRegions はリージョンごとの使用量(圧縮後サイズ・メンバー数・生存数)。
 	bucketRegions = []byte("regions")
+	// bucketDirtyChunks / bucketDirtyFiles はインクリメンタル最適化の
+	// 作業キュー: 前回の最適化以降に追加されたチャンク/ファイルだけを積む。
+	// これにより毎時の Optimize が全メタ走査 O(ストア全体)ではなく
+	// O(新着データ)で済む(全走査の完全パスは低頻度で別途実行する)。
+	bucketDirtyChunks = []byte("dirtychunks")
+	bucketDirtyFiles  = []byte("dirtyfiles")
 	// bucketFileOwners は「所有者 → ファイル」の二次索引。
 	// キーは ownerKey(owner) + 0x1F + 反転UnixNano(8B) + fileID で、
 	// プレフィックス走査が自然に作成日時の降順(新しい順)になる。
@@ -42,6 +48,130 @@ var (
 )
 
 var keyAvgChunkSize = []byte("avg_chunk_size")
+
+// keyCounters は維持カウンタ(storeCounters)の settings キー。
+// Stats() をチャンク全走査 O(N) から O(1) にするため、ファイル/チャンク/
+// リージョンの各メタ書き込みヘルパが同一トランザクション内で差分更新する
+// (クラッシュ整合)。全走査による照合・修復は fsck が担う。
+var keyCounters = []byte("counters_v1")
+
+// storeCounters は Stats の主要値の維持カウンタ。
+type storeCounters struct {
+	FileCount     int64
+	LogicalBytes  int64
+	ChunkedBytes  int64 // チャンク化視点の論理サイズ(precomp は展開データ)
+	ChunkCount    int64
+	DeltaChunks   int64
+	UniqueBytes   int64
+	ChunkPhysical int64 // チャンク表現の StoredSize 合計
+	RegionCount   int64
+	RegionBytes   int64 // リージョン表現の StoredSize 合計
+}
+
+func loadCounters(tx *bolt.Tx) (*storeCounters, bool) {
+	raw := tx.Bucket(bucketSettings).Get(keyCounters)
+	if len(raw) != 9*8 {
+		return nil, false
+	}
+	var c storeCounters
+	for i, p := range []*int64{&c.FileCount, &c.LogicalBytes, &c.ChunkedBytes,
+		&c.ChunkCount, &c.DeltaChunks, &c.UniqueBytes, &c.ChunkPhysical,
+		&c.RegionCount, &c.RegionBytes} {
+		*p = int64(binary.BigEndian.Uint64(raw[i*8:]))
+	}
+	return &c, true
+}
+
+func saveCounters(tx *bolt.Tx, c *storeCounters) error {
+	var raw [9 * 8]byte
+	for i, v := range []int64{c.FileCount, c.LogicalBytes, c.ChunkedBytes,
+		c.ChunkCount, c.DeltaChunks, c.UniqueBytes, c.ChunkPhysical,
+		c.RegionCount, c.RegionBytes} {
+		binary.BigEndian.PutUint64(raw[i*8:], uint64(v))
+	}
+	return tx.Bucket(bucketSettings).Put(keyCounters, raw[:])
+}
+
+// adjustCounters はカウンタを差分更新する。未初期化(移行前)なら何もしない
+// (Open 時の移行が全走査で初期化する)。
+func adjustCounters(tx *bolt.Tx, fn func(*storeCounters)) error {
+	c, ok := loadCounters(tx)
+	if !ok {
+		return nil
+	}
+	fn(c)
+	return saveCounters(tx, c)
+}
+
+// scanCounters は全走査でカウンタを計算する(移行・fsck の照合用)。
+func scanCounters(tx *bolt.Tx) (*storeCounters, error) {
+	c := &storeCounters{}
+	err := tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
+		var m FileManifest
+		if err := json.Unmarshal(v, &m); err != nil {
+			return err
+		}
+		c.FileCount++
+		c.LogicalBytes += m.Size
+		if m.ChunkedSize > 0 {
+			c.ChunkedBytes += m.ChunkedSize
+		} else {
+			c.ChunkedBytes += m.Size
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
+		var cm ChunkMeta
+		if err := unmarshalChunkMeta(v, &cm); err != nil {
+			return err
+		}
+		c.ChunkCount++
+		c.UniqueBytes += cm.RawSize
+		c.ChunkPhysical += cm.StoredSize
+		if cm.Compression == compressionDelta {
+			c.DeltaChunks++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = tx.Bucket(bucketRegions).ForEach(func(_, v []byte) error {
+		var rm regionMeta
+		if err := json.Unmarshal(v, &rm); err != nil {
+			return err
+		}
+		c.RegionCount++
+		c.RegionBytes += rm.StoredSize
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// migrateCounters はカウンタ未初期化のストアで一度だけ全走査から初期化する。
+func migrateCounters(tx *bolt.Tx) error {
+	if _, ok := loadCounters(tx); ok {
+		return nil
+	}
+	c, err := scanCounters(tx)
+	if err != nil {
+		return err
+	}
+	return saveCounters(tx, c)
+}
+
+func b2i(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // keyFileOwnersMigrated は fileowners 索引のバックフィル完了フラグ。
 // 索引導入前(または旧形式)のストアを開いたとき、一度だけ全ファイルから
@@ -149,7 +279,7 @@ func openMetaDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("メタデータDBを開けません: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks, bucketRegions, bucketFileOwners} {
+		for _, name := range [][]byte{bucketFiles, bucketChunks, bucketSketches, bucketSettings, bucketPacks, bucketUsers, bucketOwnerChunks, bucketRegions, bucketFileOwners, bucketDirtyChunks, bucketDirtyFiles} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -175,12 +305,23 @@ func getFileManifest(tx *bolt.Tx, id string) (*FileManifest, error) {
 	return &m, nil
 }
 
+// manifestSizes はカウンタ計上用の (論理, チャンク化視点) サイズを返す。
+func manifestSizes(m *FileManifest) (int64, int64) {
+	chunked := m.Size
+	if m.ChunkedSize > 0 {
+		chunked = m.ChunkedSize
+	}
+	return m.Size, chunked
+}
+
 func putFileManifest(tx *bolt.Tx, m *FileManifest) error {
+	b := tx.Bucket(bucketFiles)
+	isNew := b.Get([]byte(m.ID)) == nil
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	if err := tx.Bucket(bucketFiles).Put([]byte(m.ID), raw); err != nil {
+	if err := b.Put([]byte(m.ID), raw); err != nil {
 		return err
 	}
 	// 所有者→ファイルの二次索引を維持(値は一覧表示レコード)。
@@ -188,15 +329,39 @@ func putFileManifest(tx *bolt.Tx, m *FileManifest) error {
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(bucketFileOwners).Put(ownerFileKey(m.Owner, m.CreatedAt, m.ID), rec)
+	if err := tx.Bucket(bucketFileOwners).Put(ownerFileKey(m.Owner, m.CreatedAt, m.ID), rec); err != nil {
+		return err
+	}
+	if !isNew {
+		return nil // 実運用でマニフェストの上書きはない(防御のみ)
+	}
+	// 新規ファイルをインクリメンタル最適化の対象に積む。
+	if err := tx.Bucket(bucketDirtyFiles).Put([]byte(m.ID), nil); err != nil {
+		return err
+	}
+	logical, chunked := manifestSizes(m)
+	return adjustCounters(tx, func(sc *storeCounters) {
+		sc.FileCount++
+		sc.LogicalBytes += logical
+		sc.ChunkedBytes += chunked
+	})
 }
 
-// deleteFileManifest はマニフェストと所有者索引を同一トランザクションで消す。
+// deleteFileManifest はマニフェストと所有者索引を同一トランザクションで消し、
+// 維持カウンタを減算する。
 func deleteFileManifest(tx *bolt.Tx, m *FileManifest) error {
 	if err := tx.Bucket(bucketFileOwners).Delete(ownerFileKey(m.Owner, m.CreatedAt, m.ID)); err != nil {
 		return err
 	}
-	return tx.Bucket(bucketFiles).Delete([]byte(m.ID))
+	if err := tx.Bucket(bucketFiles).Delete([]byte(m.ID)); err != nil {
+		return err
+	}
+	logical, chunked := manifestSizes(m)
+	return adjustCounters(tx, func(sc *storeCounters) {
+		sc.FileCount--
+		sc.LogicalBytes -= logical
+		sc.ChunkedBytes -= chunked
+	})
 }
 
 // fileIndexRecord は fileowners 索引の値(一覧表示に必要な最小限)。
@@ -393,12 +558,60 @@ func unmarshalPackMeta(raw []byte, pm *packMeta) error {
 	return json.Unmarshal(raw, pm)
 }
 
+// putChunkMeta はチャンクメタを保存し、維持カウンタを新旧の差分で更新する
+// (全ミューテーションがここを通るため、カウンタ整合の一元点になる)。
 func putChunkMeta(tx *bolt.Tx, hash string, c *ChunkMeta) error {
+	b := tx.Bucket(bucketChunks)
+	var old ChunkMeta
+	hadOld := false
+	if raw := b.Get([]byte(hash)); raw != nil {
+		if err := unmarshalChunkMeta(raw, &old); err != nil {
+			return err
+		}
+		hadOld = true
+	}
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(bucketChunks).Put([]byte(hash), raw)
+	if err := b.Put([]byte(hash), raw); err != nil {
+		return err
+	}
+	return adjustCounters(tx, func(sc *storeCounters) {
+		if !hadOld {
+			sc.ChunkCount++
+			sc.UniqueBytes += c.RawSize
+			sc.ChunkPhysical += c.StoredSize
+			sc.DeltaChunks += b2i(c.Compression == compressionDelta)
+			return
+		}
+		sc.UniqueBytes += c.RawSize - old.RawSize
+		sc.ChunkPhysical += c.StoredSize - old.StoredSize
+		sc.DeltaChunks += b2i(c.Compression == compressionDelta) - b2i(old.Compression == compressionDelta)
+	})
+}
+
+// deleteChunkMeta はチャンクメタを削除し、維持カウンタを減算する。
+// 存在しなければ何もしない。
+func deleteChunkMeta(tx *bolt.Tx, hash string) error {
+	b := tx.Bucket(bucketChunks)
+	raw := b.Get([]byte(hash))
+	if raw == nil {
+		return nil
+	}
+	var old ChunkMeta
+	if err := unmarshalChunkMeta(raw, &old); err != nil {
+		return err
+	}
+	if err := b.Delete([]byte(hash)); err != nil {
+		return err
+	}
+	return adjustCounters(tx, func(sc *storeCounters) {
+		sc.ChunkCount--
+		sc.UniqueBytes -= old.RawSize
+		sc.ChunkPhysical -= old.StoredSize
+		sc.DeltaChunks -= b2i(old.Compression == compressionDelta)
+	})
 }
 
 // resolveAvgChunkSize はストアの平均チャンクサイズを確定する。

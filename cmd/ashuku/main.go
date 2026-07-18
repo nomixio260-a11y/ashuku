@@ -30,9 +30,13 @@ func main() {
 	deltaDepth := flag.Int("delta-depth", 0, "デルタチェーンの深さ上限(0=デフォルト32)。深いほど多世代バックアップが縮む")
 	cacheMB := flag.Int64("cache-mb", 0, "伸長済みチャンクキャッシュ容量 MiB(0=デフォルト128)")
 	optimizeEvery := flag.Duration("optimize-every", time.Hour,
-		"chain repack(デルタチェーン再編成)の自動実行間隔。0 で無効")
+		"インクリメンタル最適化(新着データのデルタ/リージョン化)の間隔。0 で無効")
+	optimizeFullEvery := flag.Duration("optimize-full-every", 24*time.Hour,
+		"フル最適化(全走査: 星形repack・ゾンビ救出・staged掃除を含む)の間隔。0 で無効")
 	scrubEvery := flag.Duration("scrub-every", 24*time.Hour,
 		"データ完全性スクラブ(bit rot 検出)の自動実行間隔。0 で無効")
+	scrubBatch := flag.Int("scrub-batch", 100000,
+		"1回のスクラブで検証するチャンク数(ローリング。0=毎回全チャンク)")
 	metaBackupEvery := flag.Duration("meta-backup-every", time.Hour,
 		"メタデータ(bbolt)の自動バックアップ間隔。0 で無効")
 	metaBackupKeep := flag.Int("meta-backup-keep", 24, "保持するメタバックアップ世代数")
@@ -119,23 +123,36 @@ func main() {
 		}()
 	}
 
-	// 自動最適化: ドリフトが蓄積した星形チェーンを定期的に再編成する。
-	// Optimize は改善がある場合のみ書き換えるので、何度呼んでも安全。
-	startJob("自動最適化", *optimizeEvery, func() {
-		res, err := st.Optimize()
+	// 自動最適化(2段): 高頻度のインクリメンタル(新着データのみ O(新着))と
+	// 低頻度のフルパス(全走査: 削除起因の再編成を含む)。どちらも改善がある
+	// 場合のみ書き換えるので、何度呼んでも安全。
+	startJob("インクリメンタル最適化", *optimizeEvery, func() {
+		res, err := st.OptimizeIncremental()
 		if err != nil {
-			log.Printf("自動最適化に失敗: %v", err)
+			log.Printf("インクリメンタル最適化に失敗: %v", err)
 			return
 		}
-		if res.ChunksRepacked > 0 || res.RegionsBuilt > 0 {
-			log.Printf("自動最適化: %d チャンク再編成 / %d リージョン化",
-				res.ChunksRepacked, res.RegionsBuilt)
+		if res.DeltaUpgraded > 0 || res.Recompressed > 0 || res.RegionsBuilt > 0 {
+			log.Printf("インクリメンタル最適化: デルタ %d / 再圧縮 %d / リージョン %d",
+				res.DeltaUpgraded, res.Recompressed, res.RegionsBuilt)
+		}
+	})
+	startJob("フル最適化", *optimizeFullEvery, func() {
+		res, err := st.Optimize()
+		if err != nil {
+			log.Printf("フル最適化に失敗: %v", err)
+			return
+		}
+		if res.ChunksRepacked > 0 || res.RegionsBuilt > 0 || res.ZombiesFreed > 0 {
+			log.Printf("フル最適化: %d チャンク再編成 / %d リージョン化 / %d ゾンビ解放",
+				res.ChunksRepacked, res.RegionsBuilt, res.ZombiesFreed)
 		}
 	})
 
-	// 定期スクラブ: 保存データの完全性(bit rot 等)を検証する。
+	// 定期スクラブ: 保存データの完全性(bit rot 等)をローリング検証する
+	// (毎回 -scrub-batch チャンクずつ、カーソルを進めながら数回で一周)。
 	startJob("スクラブ", *scrubEvery, func() {
-		res, err := st.Scrub()
+		res, err := st.ScrubSome(*scrubBatch)
 		if err != nil {
 			log.Printf("スクラブに失敗: %v", err)
 			return
@@ -143,8 +160,10 @@ func main() {
 		if !res.Healthy() {
 			log.Printf("⚠️ スクラブ: 破損 %d / 欠損 %d チャンク検出(影響ファイル %d 件)",
 				len(res.Corrupt), len(res.Missing), len(res.AffectedFiles))
+		} else if res.Completed {
+			log.Printf("スクラブ: %d チャンク検証、破損なし(全周完了)", res.ChunksChecked)
 		} else {
-			log.Printf("スクラブ: %d チャンク検証、破損なし", res.ChunksChecked)
+			log.Printf("スクラブ: %d チャンク検証、破損なし(継続中)", res.ChunksChecked)
 		}
 	})
 

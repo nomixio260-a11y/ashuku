@@ -166,6 +166,11 @@ func (s *Store) PutChunkVerified(hash string, stored []byte, compression string,
 		if err := registerSketches(tx, hash, features); err != nil {
 			return err
 		}
+		// 新チャンクをインクリメンタル最適化(オフラインデルタ・リージョン化)
+		// の対象に積む。
+		if err := tx.Bucket(bucketDirtyChunks).Put([]byte(hash), nil); err != nil {
+			return err
+		}
 		return putChunkMeta(tx, hash, newMeta)
 	})
 }
@@ -332,7 +337,7 @@ func (s *Store) sweepStagedChunks(res *OptimizeResult) error {
 			if meta == nil || meta.RefCount != 0 {
 				continue // 掃除の合間にコミットされた
 			}
-			if err := tx.Bucket(bucketChunks).Delete([]byte(hash)); err != nil {
+			if err := deleteChunkMeta(tx, hash); err != nil {
 				return err
 			}
 			if err := dropSketches(tx, hash, meta.Features); err != nil {

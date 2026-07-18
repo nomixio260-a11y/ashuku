@@ -168,3 +168,64 @@ func TestOptimizeOnEmptyStore(t *testing.T) {
 		t.Fatalf("空ストアで repack が発生: %+v", res)
 	}
 }
+
+// インクリメンタル最適化は新着データだけを対象に、フルパスと同等の
+// リージョン化・小チャンクソリッド圧縮を行う(作業キュー駆動)。
+func TestOptimizeIncremental(t *testing.T) {
+	s := newTestStore(t)
+	data := regionCorpus(t, 20<<20)
+	m := putBytes(t, s, "big", data)
+	for i := 0; i < 30; i++ {
+		putBytes(t, s, "small", smallVocabFile(int64(i), 40<<10))
+	}
+	before, _ := s.Stats()
+
+	res, err := s.OptimizeIncremental()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.Stats()
+	if res.RegionsBuilt == 0 {
+		t.Fatal("インクリメンタルパスがリージョンを作っていません")
+	}
+	if after.PhysicalBytes >= before.PhysicalBytes {
+		t.Fatalf("物理が減っていません: %d → %d", before.PhysicalBytes, after.PhysicalBytes)
+	}
+	// 往復
+	got := getBytes(t, s, m.ID)
+	if len(got) != len(data) {
+		t.Fatal("復元サイズ不一致")
+	}
+	// 2回目は作業キューが空なので何もしない(冪等・軽量)
+	res2, err := s.OptimizeIncremental()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.RegionsBuilt != 0 || res2.DeltaUpgraded != 0 {
+		t.Fatalf("空キューでの2回目に作業が発生: %+v", res2)
+	}
+	// カウンタ整合
+	fres, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fres.Healthy() {
+		t.Fatalf("fsck が不健全: %+v", fres)
+	}
+}
+
+// フルパスは作業キューを空にする(インクリメンタルとの引き継ぎ)。
+func TestOptimizeFullClearsQueues(t *testing.T) {
+	s := newTestStore(t)
+	putBytes(t, s, "a", repetitiveData(3<<20))
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.OptimizeIncremental()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RegionsBuilt != 0 {
+		t.Fatalf("フルパス後のインクリメンタルに残作業: %+v", res)
+	}
+}

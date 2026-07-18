@@ -40,6 +40,9 @@ type FsckResult struct {
 	// (存在しないファイルを指す孤児エントリ + 実在ファイルに対する欠損
 	// エントリ + マニフェストと食い違う表示レコード)。
 	FileIndexMismatches int `json:"file_index_mismatches"`
+	// CounterMismatches は維持カウンタ(Stats の O(1) 化用)と全走査の
+	// 食い違ったフィールド数。
+	CounterMismatches int `json:"counter_mismatches"`
 	// Repaired は修復が実行されたか。
 	Repaired bool `json:"repaired"`
 }
@@ -48,7 +51,7 @@ type FsckResult struct {
 func (r *FsckResult) Healthy() bool {
 	return r.RefcountMismatches == 0 && r.OrphanChunks == 0 &&
 		r.DanglingRefs == 0 && r.UsageMismatches == 0 &&
-		r.FileIndexMismatches == 0
+		r.FileIndexMismatches == 0 && r.CounterMismatches == 0
 }
 
 // Fsck はメタデータの整合性を検証する。repair が真なら、参照カウントの
@@ -201,6 +204,25 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 			}
 		}
 
+		// 3.6) 維持カウンタ(Stats O(1) 化用)の照合
+		if cur, ok := loadCounters(tx); ok {
+			want, err := scanCounters(tx)
+			if err != nil {
+				return err
+			}
+			for _, d := range []int64{
+				cur.FileCount - want.FileCount, cur.LogicalBytes - want.LogicalBytes,
+				cur.ChunkedBytes - want.ChunkedBytes, cur.ChunkCount - want.ChunkCount,
+				cur.DeltaChunks - want.DeltaChunks, cur.UniqueBytes - want.UniqueBytes,
+				cur.ChunkPhysical - want.ChunkPhysical, cur.RegionCount - want.RegionCount,
+				cur.RegionBytes - want.RegionBytes,
+			} {
+				if d != 0 {
+					res.CounterMismatches++
+				}
+			}
+		}
+
 		if !repair {
 			return nil
 		}
@@ -220,7 +242,7 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 				if path != "" {
 					orphanPaths = append(orphanPaths, path)
 				}
-				if err := chunks.Delete([]byte(f.hash)); err != nil {
+				if err := deleteChunkMeta(tx, f.hash); err != nil {
 					return err
 				}
 				if err := dropSketches(tx, f.hash, meta.Features); err != nil {
@@ -249,7 +271,13 @@ func (s *Store) Fsck(repair bool) (*FsckResult, error) {
 				return err
 			}
 		}
-		return nil
+		// 全修復の適用後に維持カウンタを全走査から再計算して確定する
+		// (修復自体もカウンタを動かすため、最後に一括で正す)。
+		fixed, err := scanCounters(tx)
+		if err != nil {
+			return err
+		}
+		return saveCounters(tx, fixed)
 	})
 	if err != nil {
 		return nil, err

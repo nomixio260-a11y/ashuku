@@ -139,7 +139,166 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 	if err := s.compactPacks(res); err != nil {
 		return res, err
 	}
+	// フルパスは全データを見たので、インクリメンタル用の作業キューは空にする。
+	if err := s.clearDirtyQueues(); err != nil {
+		return res, err
+	}
 	return res, nil
+}
+
+// OptimizeIncremental は前回以降に追加されたデータだけを対象にした軽量な
+// 最適化パス: 新チャンクのデルタ/再圧縮判定、新ファイルのリージョン化、
+// 新小チャンクのファイル横断ソリッド圧縮、およびパック/リージョンの回収。
+//
+// フルパス(Optimize)が全メタ走査 O(ストア全体)なのに対し、こちらは
+// O(新着データ)+O(パック/リージョン数)で済むため、高頻度(毎時)実行して
+// も大規模ストアの負荷にならない。削除起因の再編成(星形 repack・ゾンビ
+// 救出・staged 掃除)は低頻度のフルパスに任せる。
+func (s *Store) OptimizeIncremental() (*OptimizeResult, error) {
+	s.optMu.Lock()
+	defer s.optMu.Unlock()
+
+	res := &OptimizeResult{}
+	if err := s.checkDiskSpace(); err != nil {
+		return nil, err
+	}
+
+	// 作業キューのスナップショットを取る(処理中の新着は次回に回る)。
+	var dirtyChunks []string
+	var dirtyFiles []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketDirtyChunks).ForEach(func(k, _ []byte) error {
+			dirtyChunks = append(dirtyChunks, string(k))
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketDirtyFiles).ForEach(func(k, _ []byte) error {
+			dirtyFiles = append(dirtyFiles, string(k))
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 1) 新チャンクのデルタ/最強再圧縮判定(クライアント直接アップロード分)
+	if s.delta {
+		var todo []deltaCand
+		err := s.db.View(func(tx *bolt.Tx) error {
+			for _, hash := range dirtyChunks {
+				meta, err := getChunkMeta(tx, hash)
+				if err != nil {
+					return err
+				}
+				if meta != nil && !meta.DeltaTried && meta.Compression != compressionDelta &&
+					meta.RefCount > 0 && len(meta.Features) > 0 {
+					todo = append(todo, deltaCand{hash: hash, features: append([]uint64(nil), meta.Features...)})
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return res, err
+		}
+		if err := s.processDeltaCandidates(todo, res); err != nil {
+			return res, err
+		}
+	}
+
+	// 2) 新ファイルのリージョン化(ファイル内の連続チャンク)
+	if err := s.checkDiskSpace(); err != nil {
+		return res, err
+	}
+	var lists [][]string
+	err = s.db.View(func(tx *bolt.Tx) error {
+		for _, id := range dirtyFiles {
+			m, err := getFileManifest(tx, id)
+			if err == ErrNotFound {
+				continue // 既に削除された
+			}
+			if err != nil {
+				return err
+			}
+			if len(m.Chunks) >= 2 {
+				lists = append(lists, m.Chunks)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return res, err
+	}
+	if err := s.buildRegionsForChunkLists(lists, res); err != nil {
+		return res, err
+	}
+
+	// 3) 新しい小チャンクのファイル横断ソリッド圧縮
+	var smalls []smallChunk
+	err = s.db.View(func(tx *bolt.Tx) error {
+		for _, hash := range dirtyChunks {
+			meta, err := getChunkMeta(tx, hash)
+			if err != nil {
+				return err
+			}
+			if meta == nil {
+				continue
+			}
+			if sc, ok := smallChunkCandidate(hash, meta); ok {
+				smalls = append(smalls, sc)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return res, err
+	}
+	if err := s.buildSmallChunkRegionsFrom(smalls, res); err != nil {
+		return res, err
+	}
+
+	// 4) 解放済み領域の回収(どちらも小さなメタバケット走査で安価)
+	if err := s.compactRegions(res); err != nil {
+		return res, err
+	}
+	if err := s.compactPacks(res); err != nil {
+		return res, err
+	}
+
+	// 5) 処理済みの作業キューエントリを消す(スナップショット分のみ。
+	//    実行中に積まれた新着は残り、次回処理される)。
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		dc := tx.Bucket(bucketDirtyChunks)
+		for _, h := range dirtyChunks {
+			if err := dc.Delete([]byte(h)); err != nil {
+				return err
+			}
+		}
+		df := tx.Bucket(bucketDirtyFiles)
+		for _, id := range dirtyFiles {
+			if err := df.Delete([]byte(id)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return res, err
+}
+
+// clearDirtyQueues はインクリメンタル用の作業キューを空にする
+// (フルパスの後に呼ぶ)。
+func (s *Store) clearDirtyQueues() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, name := range [][]byte{bucketDirtyChunks, bucketDirtyFiles} {
+			if err := tx.DeleteBucket(name); err != nil {
+				return err
+			}
+			if _, err := tx.CreateBucket(name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // offlineDeltaPass はデルタ未判定(DeltaTried=false)の非デルタチャンクに
@@ -147,16 +306,12 @@ func (s *Store) Optimize() (*OptimizeResult, error) {
 // (サーバーは検証だけ)、圧縮率は背景で回収する、という分担のための機構。
 // 判定結果は成否にかかわらず DeltaTried に記録し、再評価しない。
 func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
-	type cand struct {
-		hash     string
-		features []uint64
-	}
-	var todo []cand
+	var todo []deltaCand
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return forEachChunkMeta(tx, func(hash string, meta *ChunkMeta) error {
 			if !meta.DeltaTried && meta.Compression != compressionDelta &&
 				meta.RefCount > 0 && len(meta.Features) > 0 {
-				todo = append(todo, cand{hash: hash, features: append([]uint64(nil), meta.Features...)})
+				todo = append(todo, deltaCand{hash: hash, features: append([]uint64(nil), meta.Features...)})
 			}
 			return nil
 		})
@@ -164,7 +319,18 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 	if err != nil {
 		return err
 	}
+	return s.processDeltaCandidates(todo, res)
+}
 
+type deltaCand struct {
+	hash     string
+	features []uint64
+}
+
+// processDeltaCandidates は候補チャンク列に対して類似デルタ→最強再圧縮を
+// 試み、成否にかかわらず DeltaTried を記録する(フルパス・インクリメンタル
+// パス共通の本体)。
+func (s *Store) processDeltaCandidates(todo []deltaCand, res *OptimizeResult) error {
 	for _, c := range todo {
 		// 類似候補を検索(自分自身は除く)
 		var base string
@@ -192,8 +358,8 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 				deltaDone = true
 			}
 		}
-		// デルタ化しなかったチャンクは、本家 libzstd(level 19)での
-		// 再圧縮を試す(クライアントの純Goエンコーダより 8〜10% 縮む)。
+		// デルタ化しなかったチャンクは、本家 libzstd での再圧縮を試す
+		// (クライアントの純Goエンコーダより 8〜10% 以上縮む)。
 		if !deltaDone && zstdc.Available() {
 			done, err := s.recompressChunk(c.hash, res)
 			if err != nil {
@@ -204,7 +370,7 @@ func (s *Store) offlineDeltaPass(res *OptimizeResult) error {
 			}
 		}
 		// 成否にかかわらず判定済みを記録
-		err = s.db.Update(func(tx *bolt.Tx) error {
+		err := s.db.Update(func(tx *bolt.Tx) error {
 			meta, err := getChunkMeta(tx, c.hash)
 			if err != nil || meta == nil {
 				return err

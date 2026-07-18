@@ -228,7 +228,11 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 			return err
 		}
 		// 所有者→ファイル索引を(未構築なら)一度だけ全ファイルから再構築する。
-		return migrateFileOwners(tx)
+		if err := migrateFileOwners(tx); err != nil {
+			return err
+		}
+		// 維持カウンタを(未初期化なら)一度だけ全走査から初期化する。
+		return migrateCounters(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -887,6 +891,10 @@ func (s *Store) applyChunk(tx *bolt.Tx, pc *preparedChunk, cleanup *[]string) er
 			return err
 		}
 	}
+	// 新チャンクをインクリメンタル最適化(リージョン化等)の対象に積む。
+	if err := tx.Bucket(bucketDirtyChunks).Put([]byte(pc.hash), nil); err != nil {
+		return err
+	}
 	return putChunkMeta(tx, pc.hash, newMeta)
 }
 
@@ -1119,16 +1127,29 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 // chain repack との競合(メタ読み後に旧表現ファイルが消える)は
 // 一度だけのリトライで回復する。
 func (s *Store) readChunk(hash string) ([]byte, error) {
-	data, err := s.readChunkOnce(hash)
+	data, err := s.readChunkOnce(hash, true)
 	if err != nil {
-		data, err = s.readChunkOnce(hash)
+		data, err = s.readChunkOnce(hash, true)
 	}
 	return data, err
 }
 
-func (s *Store) readChunkOnce(hash string) ([]byte, error) {
-	if data, ok := s.cache.get(hash); ok {
-		return data, nil
+// readChunkVerify はスクラブ用の読み出し: キャッシュを見ず・入れず、
+// 必ずディスク上のバイトを伸長・検証する(キャッシュ経由ではディスクの
+// bit rot を検出できず、さらに全チャンク走査がキャッシュを洗い流すため)。
+func (s *Store) readChunkVerify(hash string) ([]byte, error) {
+	data, err := s.readChunkOnce(hash, false)
+	if err != nil {
+		data, err = s.readChunkOnce(hash, false)
+	}
+	return data, err
+}
+
+func (s *Store) readChunkOnce(hash string, useCache bool) ([]byte, error) {
+	if useCache {
+		if data, ok := s.cache.get(hash); ok {
+			return data, nil
+		}
 	}
 	var meta *ChunkMeta
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -1145,11 +1166,13 @@ func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 
 	// リージョン(ソリッド圧縮)内のチャンクは専用パスで取り出す。
 	if meta.RegionID != "" {
-		data, err := s.readChunkFromRegion(hash, meta)
+		data, err := s.readChunkFromRegion(hash, meta, useCache)
 		if err != nil {
 			return nil, err
 		}
-		s.cache.put(hash, data)
+		if useCache {
+			s.cache.put(hash, data)
+		}
 		return data, nil
 	}
 
@@ -1171,6 +1194,9 @@ func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 		}
 	case compressionDelta:
 		// ベースチェーンをたどる。深さは maxDepth で制限されている。
+		// ベースはキャッシュ利用可(このチャンク自体の保存バイトは
+		// ディスクから読んでおり、ベースの完全性はベース自身のスクラブで
+		// 独立に検証される)。
 		base, err := s.readChunk(meta.BaseHash)
 		if err != nil {
 			return nil, fmt.Errorf("ベースチャンクの読み出しに失敗: %w", err)
@@ -1185,7 +1211,9 @@ func (s *Store) readChunkOnce(hash string) ([]byte, error) {
 	if hex.EncodeToString(sum[:]) != hash {
 		return nil, fmt.Errorf("チャンクが破損しています")
 	}
-	s.cache.put(hash, data)
+	if useCache {
+		s.cache.put(hash, data)
+	}
 	return data, nil
 }
 
@@ -1212,12 +1240,13 @@ func (s *Store) Manifest(id string) (*FileManifest, error) {
 }
 
 // Delete はファイルを削除し、参照されなくなったチャンクを物理削除する。
-// 所有者の使用量も減算する。
+// 所有者の使用量も減算する。マニフェスト削除と参照解放は単一トランザク
+// ションで行う(以前は2トランザクションで、間にクラッシュすると参照
+// カウントのリークが fsck まで残った)。
 func (s *Store) Delete(id string) error {
-	var m *FileManifest
+	var orphans []string
 	err := s.batchUpdate(func(tx *bolt.Tx) error {
-		var err error
-		m, err = getFileManifest(tx, id)
+		m, err := getFileManifest(tx, id)
 		if err != nil {
 			return err
 		}
@@ -1227,13 +1256,12 @@ func (s *Store) Delete(id string) error {
 		if err := addOwnerChunkRefs(tx, m.Owner, m.Chunks, -1); err != nil {
 			return err
 		}
-		return deleteFileManifest(tx, m)
-	})
-	if err != nil {
+		if err := deleteFileManifest(tx, m); err != nil {
+			return err
+		}
+		orphans, err = s.releaseChunksTx(tx, m.Chunks) // Batch 再実行時は再代入
 		return err
-	}
-
-	orphans, err := s.releaseChunks(m.Chunks)
+	})
 	if err != nil {
 		return err
 	}
@@ -1275,7 +1303,7 @@ func (s *Store) releaseChunksTx(tx *bolt.Tx, hashes []string) ([]string, error) 
 			}
 			continue
 		}
-		if err := tx.Bucket(bucketChunks).Delete([]byte(hash)); err != nil {
+		if err := deleteChunkMeta(tx, hash); err != nil {
 			return orphans, err
 		}
 		if err := dropSketches(tx, hash, meta.Features); err != nil {
@@ -1393,62 +1421,38 @@ type Stats struct {
 	chunkedLogical int64
 }
 
-// Stats は現在の容量統計を集計して返す。
+// Stats は現在の容量統計を返す。主要値は各メタ書き込みが同一トランザク
+// ションで維持するカウンタから O(1) で読む(以前はチャンク全走査 O(N) で、
+// 大規模ストアでは1回が秒単位だった)。パック使用量だけはパックバケットを
+// 走査する(パック数はチャンク数の数万分の1で安価)。
+// カウンタの照合・修復は fsck が全走査で行う。
 func (s *Store) Stats() (*Stats, error) {
 	st := &Stats{}
 	err := s.db.View(func(tx *bolt.Tx) error {
-		var chunkedLogical int64
-		if err := tx.Bucket(bucketFiles).ForEach(func(_, v []byte) error {
-			var m FileManifest
-			if err := json.Unmarshal(v, &m); err != nil {
+		c, ok := loadCounters(tx)
+		if !ok {
+			// 未初期化(通常は Open の移行で入るため起きない)
+			var err error
+			c, err = scanCounters(tx)
+			if err != nil {
 				return err
 			}
-			st.FileCount++
-			st.LogicalBytes += m.Size
-			if m.ChunkedSize > 0 {
-				chunkedLogical += m.ChunkedSize
-			} else {
-				chunkedLogical += m.Size
-			}
-			return nil
-		}); err != nil {
-			return err
 		}
-		st.chunkedLogical = chunkedLogical
-		if err := tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
-			var c ChunkMeta
-			if err := json.Unmarshal(v, &c); err != nil {
-				return err
-			}
-			st.ChunkCount++
-			if c.Compression == compressionDelta {
-				st.DeltaChunkCount++
-			}
-			st.UniqueBytes += c.RawSize
-			st.PhysicalBytes += c.StoredSize
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := tx.Bucket(bucketPacks).ForEach(func(_, v []byte) error {
+		st.FileCount = int(c.FileCount)
+		st.ChunkCount = int(c.ChunkCount)
+		st.DeltaChunkCount = int(c.DeltaChunks)
+		st.LogicalBytes = c.LogicalBytes
+		st.chunkedLogical = c.ChunkedBytes
+		st.UniqueBytes = c.UniqueBytes
+		st.PhysicalBytes = c.ChunkPhysical + c.RegionBytes
+		st.RegionCount = int(c.RegionCount)
+		return tx.Bucket(bucketPacks).ForEach(func(_, v []byte) error {
 			var pm packMeta
 			if err := unmarshalPackMeta(v, &pm); err != nil {
 				return err
 			}
 			st.PackCount++
 			st.PackGarbageBytes += pm.TotalBytes - pm.LiveBytes
-			return nil
-		}); err != nil {
-			return err
-		}
-		// リージョンチャンクは StoredSize=0 なので、圧縮後サイズはここで計上する。
-		return tx.Bucket(bucketRegions).ForEach(func(_, v []byte) error {
-			var rm regionMeta
-			if err := json.Unmarshal(v, &rm); err != nil {
-				return err
-			}
-			st.RegionCount++
-			st.PhysicalBytes += rm.StoredSize
 			return nil
 		})
 	})

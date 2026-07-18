@@ -527,14 +527,18 @@ func (s *Server) handleFsck(w http.ResponseWriter, r *http.Request, a authed) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// handleOptimize は chain repack(デルタチェーン再編成)を実行し、
-// 削減結果を返す。長期の世代保持でドリフトが蓄積したストアの物理容量を
-// 回収する。実行中も読み書きは可能。
+// handleOptimize は最適化を実行し、削減結果を返す。既定はインクリメンタル
+// (新着データのみ)、?full=1 で全走査のフルパス(星形repack・ゾンビ救出を
+// 含む)。実行中も読み書きは可能。
 func (s *Server) handleOptimize(w http.ResponseWriter, r *http.Request, a authed) {
 	if !s.requireAdmin(w, a) {
 		return
 	}
-	res, err := s.store.Optimize()
+	run := s.store.OptimizeIncremental
+	if r.URL.Query().Get("full") == "1" {
+		run = s.store.Optimize
+	}
+	res, err := run()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
