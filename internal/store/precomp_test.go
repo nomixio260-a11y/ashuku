@@ -524,3 +524,39 @@ func TestProgressiveJPEGEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestWAVPrecompEndToEnd(t *testing.T) {
+	files, _ := filepath.Glob("../precomp/testdata/wav/*.wav")
+	if len(files) == 0 {
+		t.Skip("wav testdata なし")
+	}
+	s := newTestStore(t)
+	adopted := 0
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := putBytes(t, s, filepath.Base(fn), orig)
+		if m.Encoding == EncodingWAVV1 {
+			adopted++
+		}
+		got := getBytes(t, s, m.ID)
+		if !bytes.Equal(got, orig) {
+			t.Fatalf("%s: 読み戻しがビット一致しない (encoding=%q)", fn, m.Encoding)
+		}
+	}
+	if adopted == 0 {
+		t.Fatal("WAV が1つも分解されなかった")
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	list, _, _ := s.ListPage("", "", 0)
+	for _, fm := range list {
+		orig, _ := os.ReadFile("../precomp/testdata/wav/" + fm.Name)
+		if !bytes.Equal(getBytes(t, s, fm.ID), orig) {
+			t.Fatalf("%s: Optimize 後にビット一致しない", fm.Name)
+		}
+	}
+}

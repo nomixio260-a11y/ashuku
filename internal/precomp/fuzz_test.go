@@ -303,3 +303,28 @@ func FuzzTryUnwrapProgressive(f *testing.F) {
 		}
 	})
 }
+
+// FuzzTryUnwrapWAV は攻撃者制御の WAV での分解が panic せず、採用された
+// 入力は必ずビット一致で戻ることを検証する。
+func FuzzTryUnwrapWAV(f *testing.F) {
+	files, _ := filepath.Glob("testdata/wav/*.wav")
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			f.Add(b)
+		}
+	}
+	f.Add([]byte("RIFF\x24\x00\x00\x00WAVEfmt garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapWAV(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructWAV(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した WAV の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した WAV がビット一致で戻らない")
+		}
+	})
+}
