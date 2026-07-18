@@ -362,3 +362,39 @@ func TestAuthFailureRateLimit(t *testing.T) {
 		t.Fatalf("制限中の正キー = %d, want 429(IP単位の遮断)", got)
 	}
 }
+
+// PWA マニフェストが配信され、コンソールにレスポンシブ/PWA の要素が含まれる。
+func TestConsoleResponsiveAndManifest(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Get(srv.URL + "/manifest.webmanifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "\"display\": \"standalone\"") {
+		t.Fatalf("manifest status=%d body=%s", resp.StatusCode, body[:min(len(body), 80)])
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "manifest+json") {
+		t.Fatalf("manifest content-type = %q", resp.Header.Get("Content-Type"))
+	}
+
+	resp2, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	for _, want := range []string{
+		"viewport-fit=cover",   // ノッチ端末対応
+		"prefers-color-scheme", // テーマ自動追従
+		"manifest.webmanifest", // PWA
+		"safe-area-inset",      // セーフエリア
+		"max-width:480px",      // モバイルレイアウト分岐
+		"XMLHttpRequest",       // アップロード進捗
+	} {
+		if !strings.Contains(string(page), want) {
+			t.Fatalf("コンソールに %q が含まれていません", want)
+		}
+	}
+}

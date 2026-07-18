@@ -112,6 +112,7 @@ func New(st *store.Store, opts Options) *Server {
 		s.sem = make(chan struct{}, opts.MaxConcurrent)
 	}
 	s.mux.HandleFunc("GET /{$}", s.handleConsole) // Web コンソール(ルートのみ)
+	s.mux.HandleFunc("GET /manifest.webmanifest", s.handleManifest)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/v1/files", s.auth(s.handleUpload))
 	s.mux.HandleFunc("GET /api/v1/files", s.auth(s.handleList))
