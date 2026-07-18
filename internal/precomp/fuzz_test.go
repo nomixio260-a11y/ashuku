@@ -227,3 +227,52 @@ func FuzzTryUnwrapGIF(f *testing.F) {
 		}
 	})
 }
+
+// FuzzTryUnwrapAVI は攻撃者制御の AVI での分解が panic せず、採用された
+// 入力は必ずビット一致で再構成できることを検証する。
+func FuzzTryUnwrapAVI(f *testing.F) {
+	frame := makePhotoFuzz(64, 64)
+	chunk := func(id string, body []byte) []byte {
+		out := append([]byte(nil), id...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], uint32(len(body)))
+		out = append(out, sz[:]...)
+		out = append(out, body...)
+		if len(body)%2 == 1 {
+			out = append(out, 0)
+		}
+		return out
+	}
+	movi := append([]byte("movi"), chunk("00dc", frame)...)
+	body := append([]byte("AVI "), chunk("LIST", movi)...)
+	f.Add(chunk("RIFF", body))
+	f.Add([]byte("RIFF\x10\x00\x00\x00AVI LIST garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapAVI(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructAVI(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した AVI の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した AVI がビット一致で戻らない")
+		}
+	})
+}
+
+// makePhotoFuzz はシード用の小さな baseline JPEG を作る。
+func makePhotoFuzz(w, h int) []byte {
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	for i := range img.Y {
+		img.Y[i] = byte(i * 13)
+	}
+	for i := range img.Cb {
+		img.Cb[i] = 128
+		img.Cr[i] = 128
+	}
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85})
+	return buf.Bytes()
+}

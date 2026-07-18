@@ -208,6 +208,8 @@ type FileManifest struct {
 	PrecompJPEG *precomp.JPEGRecipe `json:"precomp_jpeg,omitempty"`
 	// PrecompGIF は GIF の再構成レシピ(チャンク列 = スケルトン+生ピクセル)。
 	PrecompGIF *precomp.GIFRecipe `json:"precomp_gif,omitempty"`
+	// PrecompAVI は AVI/MJPEG の再構成レシピ。
+	PrecompAVI *precomp.MJPEGRecipe `json:"precomp_avi,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -239,6 +241,8 @@ const (
 	// EncodingGIFV1 は GIF の LZW を展開して保存(チャンク列 =
 	// スケルトン+生ピクセル列)。
 	EncodingGIFV1 = "gif-lzw-v1"
+	// EncodingAVIV1 は AVI/MJPEG の各 JPEG フレームを分解して保存。
+	EncodingAVIV1 = "avi-mjpeg-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

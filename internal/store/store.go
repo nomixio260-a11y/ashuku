@@ -482,13 +482,15 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 	// JPEG は純Go(cgo不要)なので precomp.Supported()=false でも扱える。
 	// zlib 系(gzip/zlib/png/zip/pdf)は cgo が要る。
 	if !opts.DisablePrecomp && (s.precomp || s.precompJPEG) {
-		head := make([]byte, 5)
+		head := make([]byte, 12) // AVI(RIFF)判定に12バイト必要
 		n, _ := io.ReadFull(r, head)
-		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
+		head = head[:n]
+		rest := io.MultiReader(bytes.NewReader(head), r)
 		zlibFmt := s.precomp && (precomp.IsGzip(head) || precomp.IsZlib(head) ||
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
-		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head))
-		if n == 5 && (zlibFmt || jpegFmt) && s.acquirePrecomp() {
+		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
+			precomp.IsAVI(head))
+		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
 				s.releasePrecomp()
@@ -612,6 +614,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingGIFV1
 		m.PrecompGIF = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsAVI(buf):
+		u, ok := precomp.TryUnwrapAVI(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingAVIV1
+		m.PrecompAVI = u.Recipe
 		m.precompPlain = u.Chunked
 	default:
 		return false
@@ -1222,6 +1232,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructJPEG(m.PrecompJPEG, plain.Bytes())
 	case EncodingGIFV1:
 		orig, err = precomp.ReconstructGIF(m.PrecompGIF, plain.Bytes())
+	case EncodingAVIV1:
+		orig, err = precomp.ReconstructAVI(m.PrecompAVI, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}

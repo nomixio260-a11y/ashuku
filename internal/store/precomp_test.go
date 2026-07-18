@@ -399,3 +399,92 @@ func TestGIFPrecompEndToEnd(t *testing.T) {
 		t.Fatalf("GIF が縮んでいない: %d -> %d", len(orig), st.PhysicalBytes)
 	}
 }
+
+// makeAVIStore は MJPEG AVI をテスト用に組み立てる(precomp パッケージの
+// makeAVI と同型)。frames は JPEG バイト列。
+func makeAVIStore(frames [][]byte) []byte {
+	chunk := func(id string, body []byte) []byte {
+		out := append([]byte(nil), id...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], uint32(len(body)))
+		out = append(out, sz[:]...)
+		out = append(out, body...)
+		if len(body)%2 == 1 {
+			out = append(out, 0)
+		}
+		return out
+	}
+	list := func(typ string, body []byte) []byte {
+		return chunk("LIST", append([]byte(typ), body...))
+	}
+	hdrl := list("hdrl", chunk("avih", make([]byte, 56)))
+	var movi []byte
+	for _, f := range frames {
+		movi = append(movi, chunk("00dc", f)...)
+	}
+	body := append([]byte("AVI "), hdrl...)
+	body = append(body, list("movi", movi)...)
+	return chunk("RIFF", body)
+}
+
+// makeVideoFrame は「前フレームと少しだけ違う」写真調 JPEG を作る
+// (実際の MJPEG 動画のフレーム間相関を模す)。
+func makeVideoFrame(t *testing.T, frame int) []byte {
+	t.Helper()
+	w, h := 320, 240
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	rng := rand.New(rand.NewSource(77)) // 全フレーム共通の背景
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			base := 40 + (x/16)*8 + (y/16)*5 + rng.Intn(6)
+			// 動く矩形(フレームごとに位置が少しずれる)
+			if x > 40+frame*6 && x < 100+frame*6 && y > 60 && y < 140 {
+				base += 80
+			}
+			img.Y[y*img.YStride+x] = uint8(base % 255)
+		}
+	}
+	for i := range img.Cb {
+		img.Cb[i] = 120
+		img.Cr[i] = 132
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestMJPEGVideoEndToEnd(t *testing.T) {
+	s := newTestStore(t)
+	var frames [][]byte
+	var frameTotal int
+	for i := 0; i < 12; i++ {
+		f := makeVideoFrame(t, i)
+		frameTotal += len(f)
+		frames = append(frames, f)
+	}
+	orig := makeAVIStore(frames)
+	m := putBytes(t, s, "video.avi", orig)
+	if m.Encoding != EncodingAVIV1 {
+		t.Fatalf("AVI が分解されていない: encoding=%q", m.Encoding)
+	}
+	got := getBytes(t, s, m.ID)
+	if !bytes.Equal(got, orig) {
+		t.Fatal("AVI の読み戻しがビット一致しない")
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	got = getBytes(t, s, m.ID)
+	if !bytes.Equal(got, orig) {
+		t.Fatal("Optimize 後の読み戻しがビット一致しない")
+	}
+	st, _ := s.Stats()
+	t.Logf("MJPEG動画: 元=%d 物理=%d (%.2fx = %.1f%%削減)", len(orig), st.PhysicalBytes,
+		float64(len(orig))/float64(st.PhysicalBytes),
+		100*(1-float64(st.PhysicalBytes)/float64(len(orig))))
+	if st.PhysicalBytes >= int64(len(orig)) {
+		t.Fatal("MJPEG 動画が縮んでいない")
+	}
+}
