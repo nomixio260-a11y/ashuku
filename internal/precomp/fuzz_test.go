@@ -378,3 +378,28 @@ func FuzzTryUnwrapBMP(f *testing.F) {
 		}
 	})
 }
+
+// FuzzTryUnwrapTIFF は攻撃者制御の TIFF での分解が panic せず、採用入力が
+// ビット一致で戻ることを検証する。
+func FuzzTryUnwrapTIFF(f *testing.F) {
+	files, _ := filepath.Glob("testdata/tiff/*.tiff")
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			f.Add(b)
+		}
+	}
+	f.Add([]byte("II*\x00\x08\x00\x00\x00 garbage tiff ifd data here"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapTIFF(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructTIFF(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した TIFF の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した TIFF がビット一致で戻らない")
+		}
+	})
+}
