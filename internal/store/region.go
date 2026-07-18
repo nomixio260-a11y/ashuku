@@ -112,10 +112,11 @@ func deleteRegionMeta(tx *bolt.Tx, id string) error {
 	})
 }
 
-// readRegionRaw はリージョンを伸長した生バイト全体を返す。
+// readRegionRaw はリージョンを伸長した生バイト全体を返す。codec はメンバー
+// メタの Compression(リージョン全体の圧縮形式。"" と zstd は zstd)。
 // useCache が偽ならキャッシュを見ず・入れず、ディスク上のバイトを検証する
 // (スクラブ用)。
-func (s *Store) readRegionRaw(id string, rawTotal int64, useCache bool) ([]byte, error) {
+func (s *Store) readRegionRaw(id, codec string, rawTotal int64, useCache bool) ([]byte, error) {
 	if useCache {
 		if data, ok := s.cache.get(regionCacheKey(id)); ok {
 			return data, nil
@@ -125,7 +126,23 @@ func (s *Store) readRegionRaw(id string, rawTotal int64, useCache bool) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.dec.DecodeAll(stored, make([]byte, 0, rawTotal))
+	var raw []byte
+	switch codec {
+	case compressionBr:
+		raw, err = brotliDecode(stored, rawTotal)
+	case compressionZstdBCJ:
+		raw, err = s.dec.DecodeAll(stored, make([]byte, 0, rawTotal))
+		if err == nil {
+			raw = bcjX86Decode(raw)
+		}
+	case compressionBrBCJ:
+		raw, err = brotliDecode(stored, rawTotal)
+		if err == nil {
+			raw = bcjX86Decode(raw)
+		}
+	default:
+		raw, err = s.dec.DecodeAll(stored, make([]byte, 0, rawTotal))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("リージョン伸長に失敗: %w", err)
 	}
@@ -138,7 +155,7 @@ func (s *Store) readRegionRaw(id string, rawTotal int64, useCache bool) ([]byte,
 // readChunkFromRegion はリージョン内チャンクを取り出して検証する。
 func (s *Store) readChunkFromRegion(hash string, meta *ChunkMeta, useCache bool) ([]byte, error) {
 	// リージョンの生合計サイズは伸長時に確定するので、まず十分な見積りで伸長。
-	raw, err := s.readRegionRaw(meta.RegionID, meta.RegionOff+meta.RawSize, useCache)
+	raw, err := s.readRegionRaw(meta.RegionID, meta.Compression, meta.RegionOff+meta.RawSize, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +298,8 @@ type smallChunk struct {
 // smallChunkCandidate はメタが小チャンクソリッド圧縮の対象かを判定する。
 func smallChunkCandidate(hash string, meta *ChunkMeta) (smallChunk, bool) {
 	if meta.RegionID == "" && !meta.RegionTried &&
-		meta.Compression == compressionZstd && meta.RefCount > 0 &&
+		independentComp(meta.Compression) && meta.Compression != compressionRaw &&
+		meta.RefCount > 0 &&
 		meta.RawSize > 0 && meta.RawSize <= smallChunkMax {
 		var f uint64
 		if len(meta.Features) > 0 {
@@ -345,7 +363,8 @@ func (s *Store) buildSmallChunkRegionsFrom(chunks []smallChunk, res *OptimizeRes
 			if err != nil {
 				return err
 			}
-			if meta == nil || meta.RegionID != "" || meta.Compression != compressionZstd {
+			if meta == nil || meta.RegionID != "" ||
+				!independentComp(meta.Compression) || meta.Compression == compressionRaw {
 				continue // 採用された or 状況が変わった
 			}
 			if meta.RegionTried {
@@ -372,8 +391,7 @@ func (s *Store) regionEligible(hash string, placed map[string]bool) (bool, error
 		if err != nil || meta == nil {
 			return err
 		}
-		ok = meta.RegionID == "" &&
-			(meta.Compression == compressionZstd || meta.Compression == compressionRaw) &&
+		ok = meta.RegionID == "" && independentComp(meta.Compression) &&
 			meta.RefCount > 0
 		return nil
 	})
@@ -402,10 +420,10 @@ func (s *Store) packRegion(run []string, res *OptimizeResult) error {
 	if len(members) < 2 {
 		return nil
 	}
-	// オフラインパスなので最強設定(level 22 + リージョン全体が窓に収まる
-	// 大窓)を使う。リージョンは複数チャンクの連結なので、大窓により
-	// チャンクをまたぐ遠距離の反復も1本のフレーム内で拾える。
-	compressed := s.maxCompress(buf)
+	// オフラインパスなので最強コーデック群のベストオブ(libzstd-22 大窓 /
+	// brotli-11 / BCJ 併用)。リージョンは複数チャンクの連結なので、大窓に
+	// よりチャンクをまたぐ遠距離の反復も1本のフレーム内で拾える。
+	compressed, regionComp, _ := s.offlineCompressBest(buf)
 
 	regionID := newID()
 	// メンバーの現表現サイズ合計を見積もる
@@ -439,8 +457,7 @@ func (s *Store) packRegion(run []string, res *OptimizeResult) error {
 			if err != nil {
 				return err
 			}
-			if meta == nil || meta.RegionID != "" ||
-				(meta.Compression != compressionZstd && meta.Compression != compressionRaw) {
+			if meta == nil || meta.RegionID != "" || !independentComp(meta.Compression) {
 				return nil // 状況が変わった → このリージョンは中止
 			}
 			metas[i] = meta
@@ -460,7 +477,7 @@ func (s *Store) packRegion(run []string, res *OptimizeResult) error {
 			if path != "" {
 				oldPaths = append(oldPaths, path)
 			}
-			meta.Compression = compressionZstd // リージョンは zstd ソリッド
+			meta.Compression = regionComp // リージョン全体の圧縮形式(ソリッド)
 			meta.RegionID = regionID
 			meta.RegionOff = m.off
 			meta.StoredSize = 0 // 容量はリージョン側に計上

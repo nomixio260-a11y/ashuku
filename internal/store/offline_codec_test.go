@@ -1,0 +1,151 @@
+package store
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"testing"
+
+	bolt "go.etcd.io/bbolt"
+)
+
+func TestBCJRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	// ランダム(E8/E9 が散在)・全E8・短入力・空で往復一致を確認
+	cases := [][]byte{
+		nil,
+		{0xE8},
+		{0xE8, 1, 2, 3, 4},
+		{0xE9, 0xE8, 0xFF, 0xFF, 0xFF, 0xFF, 0x00},
+		bytes.Repeat([]byte{0xE8, 0x10, 0x20, 0x30, 0x40}, 100),
+	}
+	for i := 0; i < 50; i++ {
+		buf := make([]byte, rng.Intn(8192))
+		rng.Read(buf)
+		cases = append(cases, buf)
+	}
+	for i, c := range cases {
+		enc := bcjX86Encode(c)
+		dec := bcjX86Decode(enc)
+		if !bytes.Equal(dec, c) {
+			t.Fatalf("case %d: BCJ 往復不一致", i)
+		}
+	}
+}
+
+func TestBrotliRoundTrip(t *testing.T) {
+	data := bytes.Repeat([]byte("hello ashuku compression research "), 4096)
+	br := brotliCompressMax(data)
+	if br == nil || len(br) >= len(data) {
+		t.Fatalf("brotli が縮んでいない: %d -> %d", len(data), len(br))
+	}
+	rt, err := brotliDecode(br, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rt, data) {
+		t.Fatal("brotli 往復不一致")
+	}
+}
+
+func TestOfflineCompressBestRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	rng := rand.New(rand.NewSource(2))
+	// テキスト様(brotli 有利)・ランダム・機械語風(BCJ 対象)の3種
+	text := bytes.Repeat([]byte("2026-07-18T10:00:00Z web01 ashuku[123]: GET /api/v1/files status=200\n"), 2000)
+	random := make([]byte, 64<<10)
+	rng.Read(random)
+	code := make([]byte, 64<<10)
+	rng.Read(code)
+	for i := 0; i+8 < len(code); i += 64 {
+		code[i] = 0xE8 // CALL 密度を機械語らしく
+		code[i+5] = 0x00
+		code[i+6] = 0x00
+	}
+	for name, data := range map[string][]byte{"text": text, "random": random, "code": code} {
+		out, comp, rep := s.offlineCompressBest(data)
+		if len(out) == 0 || rep == "" {
+			t.Fatalf("%s: 空の結果", name)
+		}
+		// 保存表現から readChunk 相当の復号で戻ることを検証
+		var raw []byte
+		var err error
+		switch comp {
+		case compressionZstd:
+			raw, err = s.dec.DecodeAll(out, nil)
+		case compressionBr:
+			raw, err = brotliDecode(out, int64(len(data)))
+		case compressionZstdBCJ:
+			raw, err = s.dec.DecodeAll(out, nil)
+			raw = bcjX86Decode(raw)
+		case compressionBrBCJ:
+			raw, err = brotliDecode(out, int64(len(data)))
+			raw = bcjX86Decode(raw)
+		default:
+			t.Fatalf("%s: 不明な comp %q", name, comp)
+		}
+		if err != nil {
+			t.Fatalf("%s: 復号失敗: %v", name, err)
+		}
+		if !bytes.Equal(raw, data) {
+			t.Fatalf("%s: 往復不一致 (comp=%s)", name, comp)
+		}
+		t.Logf("%s: %d -> %d (comp=%s rep=%s)", name, len(data), len(out), comp, rep)
+	}
+}
+
+// TestOptimizeAdoptsBrotli は Optimize 後にテキストチャンクが brotli 表現へ
+// 昇格し、内容がビット一致で読み戻せることを実ストアで検証する。
+func TestOptimizeAdoptsBrotli(t *testing.T) {
+	s := newTestStore(t)
+	// zstd 系より brotli が確実に勝つテキスト(実測根拠は RESEARCH §4.20)。
+	// 完全な繰り返しでは zstd の LZ だけで極小になり優劣が付かないため、
+	// フィールドが揺れる現実的なログ行を使う。
+	rng := rand.New(rand.NewSource(7))
+	var sb bytes.Buffer
+	paths := []string{"/api/v1/files", "/api/v1/stats", "/healthz", "/console"}
+	for sb.Len() < 3<<20 {
+		fmt.Fprintf(&sb, "2026-07-%02dT%02d:%02d:%02dZ web%02d ashuku[%d]: GET %s status=%d bytes=%d dur=%.3fs\n",
+			rng.Intn(28)+1, rng.Intn(24), rng.Intn(60), rng.Intn(60), rng.Intn(20),
+			rng.Intn(900)+100, paths[rng.Intn(len(paths))], []int{200, 200, 200, 404, 500}[rng.Intn(5)],
+			rng.Intn(99999), rng.Float64()*2)
+	}
+	data := sb.Bytes()
+	m := putBytes(t, s, "log.txt", data)
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	got := getBytes(t, s, m.ID)
+	if !bytes.Equal(got, data) {
+		t.Fatal("Optimize 後の読み戻しが一致しない")
+	}
+	// 少なくとも1チャンクが brotli 系表現になっていること
+	// (リージョン化された場合はメンバーの Compression がリージョン形式)
+	found := false
+	comps := map[string]int{}
+	s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketChunks).ForEach(func(_, v []byte) error {
+			var cm ChunkMeta
+			if err := json.Unmarshal(v, &cm); err != nil {
+				return err
+			}
+			comps[cm.Compression]++
+			if cm.Compression == compressionBr || cm.Compression == compressionBrBCJ {
+				found = true
+			}
+			return nil
+		})
+	})
+	if !found {
+		t.Fatalf("brotli 表現のチャンクが1つもない(best-of が機能していない): %v", comps)
+	}
+	// スクラブ(キャッシュ迂回のディスク検証)も全緑であること
+	sr, err := s.Scrub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Corrupt) != 0 || len(sr.Missing) != 0 {
+		t.Fatalf("スクラブで破損検出: %+v", sr)
+	}
+}

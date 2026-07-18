@@ -1232,6 +1232,23 @@ func (s *Store) readChunkOnce(hash string, useCache bool) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("伸長に失敗: %w", err)
 		}
+	case compressionBr:
+		data, err = brotliDecode(stored, meta.RawSize)
+		if err != nil {
+			return nil, fmt.Errorf("brotli 伸長に失敗: %w", err)
+		}
+	case compressionZstdBCJ:
+		data, err = s.dec.DecodeAll(stored, make([]byte, 0, meta.RawSize))
+		if err != nil {
+			return nil, fmt.Errorf("伸長に失敗: %w", err)
+		}
+		data = bcjX86Decode(data)
+	case compressionBrBCJ:
+		data, err = brotliDecode(stored, meta.RawSize)
+		if err != nil {
+			return nil, fmt.Errorf("brotli 伸長に失敗: %w", err)
+		}
+		data = bcjX86Decode(data)
 	case compressionDelta:
 		// ベースチェーンをたどる。深さは maxDepth で制限されている。
 		// ベースはキャッシュ利用可(このチャンク自体の保存バイトは

@@ -25,8 +25,6 @@ import (
 	"sort"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/nomixio260-a11y/ashuku/internal/zstdc"
 )
 
 // starChild は再編成候補(同一ベースを共有するデルタチャンク)。
@@ -54,8 +52,8 @@ type OptimizeResult struct {
 	// (クライアント直接アップロード分は取り込み時にデルタを試みないため、
 	// ここで後追い圧縮される)。
 	DeltaUpgraded int `json:"delta_upgraded"`
-	// Recompressed はオフライン再圧縮(本家 libzstd level 19)で表現が
-	// 縮んだチャンク数。
+	// Recompressed はオフライン再圧縮(libzstd-22 / brotli-11 / BCJ の
+	// ベストオブ)で表現が縮んだチャンク数。
 	Recompressed int `json:"recompressed"`
 	// StagedSwept は TTL 超過で掃除された未コミットチャンク数。
 	StagedSwept int `json:"staged_swept"`
@@ -358,9 +356,10 @@ func (s *Store) processDeltaCandidates(todo []deltaCand, res *OptimizeResult) er
 				deltaDone = true
 			}
 		}
-		// デルタ化しなかったチャンクは、本家 libzstd での再圧縮を試す
-		// (クライアントの純Goエンコーダより 8〜10% 以上縮む)。
-		if !deltaDone && zstdc.Available() {
+		// デルタ化しなかったチャンクは、最強コーデック群(libzstd-22 /
+		// brotli-11 / BCJ 併用)のベストオブで再圧縮を試す。brotli は
+		// 純Goなので cgo なしビルドでも利得がある。
+		if !deltaDone {
 			done, err := s.recompressChunk(c.hash, res)
 			if err != nil {
 				return err
@@ -393,15 +392,12 @@ func (s *Store) recompressChunk(hash string, res *OptimizeResult) (bool, error) 
 	if err != nil {
 		return false, nil // 並行削除など。スキップ
 	}
-	// オフラインなので最強設定(level 22)。旧 "z19" 表現もこの条件
-	// (厳密に縮む場合のみ)で自然にアップグレードされる。
-	out, err := zstdc.CompressMax(data)
-	if err != nil {
-		return false, nil
-	}
+	// オフラインなので最強設定のベストオブ(libzstd-22 / brotli-11 /
+	// BCJ 併用)。旧 "z19"・"z22" 表現もこの条件(厳密に縮む場合のみ)で
+	// 自然にアップグレードされる。
+	out, newComp, newRep := s.offlineCompressBest(data)
 
 	// 事前チェック(改善なしならファイルを書かない)
-	newRep := "z22"
 	improves := false
 	s.db.View(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)
@@ -437,7 +433,7 @@ func (s *Store) recompressChunk(hash string, res *OptimizeResult) (bool, error) 
 		if err != nil {
 			return err
 		}
-		meta.Compression = compressionZstd
+		meta.Compression = newComp
 		meta.StoredSize = int64(len(out))
 		if err := applyRepLocation(tx, meta, newRep, loc, int64(len(out))); err != nil {
 			return err
