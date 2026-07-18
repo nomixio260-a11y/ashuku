@@ -154,7 +154,8 @@ type Store struct {
 	maxDepth    int
 	cache       *chunkCache
 	pw          *packWriter
-	precomp     bool
+	precomp     bool          // zlib 系(gzip/zlib/png/zip/pdf、要 cgo)
+	precompJPEG bool          // JPEG(純Go、cgo 不要)
 	precompMax  int64         // precompression の展開上限
 	precompSem  chan struct{} // precompression の同時実行制限
 	optMu       sync.Mutex    // Optimize の同時実行を直列化
@@ -320,6 +321,7 @@ func Open(dataDir string, cfg Config) (*Store, error) {
 		cache:       newChunkCache(cacheBytes),
 		pw:          newPackWriter(filepath.Join(dataDir, "packs")),
 		precomp:     !cfg.DisablePrecomp && precomp.Supported(),
+		precompJPEG: !cfg.DisablePrecomp, // JPEG は純Goなので常に可能
 		precompMax:  precompMax,
 		precompSem:  make(chan struct{}, precompPar),
 		minFree:     cfg.MinFreeBytes,
@@ -474,12 +476,16 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 	// zstd の対象にする(ビット一致検証済みの場合のみ)。
 	// 該当しないストリーム・上限超過・同時実行枠の超過は通常経路へ素通し
 	// (多人数同時アップロードでのメモリ爆発を防ぐ)。
-	if s.precomp && !opts.DisablePrecomp {
+	// JPEG は純Go(cgo不要)なので precomp.Supported()=false でも扱える。
+	// zlib 系(gzip/zlib/png/zip/pdf)は cgo が要る。
+	if !opts.DisablePrecomp && (s.precomp || s.precompJPEG) {
 		head := make([]byte, 5)
 		n, _ := io.ReadFull(r, head)
 		rest := io.MultiReader(bytes.NewReader(head[:n]), r)
-		if n == 5 && (precomp.IsGzip(head) || precomp.IsZlib(head) || precomp.IsPNG(head) ||
-			precomp.IsZip(head) || precomp.IsPDF(head)) && s.acquirePrecomp() {
+		zlibFmt := s.precomp && (precomp.IsGzip(head) || precomp.IsZlib(head) ||
+			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
+		jpegFmt := s.precompJPEG && precomp.IsJPEG(head)
+		if n == 5 && (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
 				s.releasePrecomp()
@@ -588,6 +594,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		m.PrecompHeader = u.Header
 		m.PrecompLevel = u.Level
 		m.precompPlain = u.Plain
+	case precomp.IsJPEG(buf):
+		u, ok := precomp.TryUnwrapJPEG(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingJPEGV1
+		m.PrecompJPEG = u.Recipe
+		m.precompPlain = u.Chunked
 	default:
 		return false
 	}
@@ -1133,6 +1147,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructPNG(m.PrecompPNG, m.PrecompLevel, plain.Bytes())
 	case EncodingZipV1, EncodingPDFV1:
 		orig, err = precomp.ReconstructContainer(m.PrecompContainer, plain.Bytes())
+	case EncodingJPEGV1:
+		orig, err = precomp.ReconstructJPEG(m.PrecompJPEG, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}

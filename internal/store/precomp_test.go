@@ -7,6 +7,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"image"
+	"image/jpeg"
+	"math"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -284,4 +288,73 @@ func buildMinimalZip(t *testing.T, name string, plain, stream []byte) []byte {
 	w32(uint32(cdStart))
 	w16(0)
 	return out.Bytes()
+}
+
+// makeJPEG は写真風の合成画像を baseline JPEG で符号化して返す。
+func makeJPEG(t *testing.T, seed int64, quality int) []byte {
+	t.Helper()
+	const w, h = 640, 480
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	rng := rand.New(rand.NewSource(seed))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			v := 128 + 80*math.Sin(float64(x)/40) + 50*math.Cos(float64(y)/55) + float64(rng.Intn(14)-7)
+			img.Y[img.YOffset(x, y)] = clampU8(v)
+		}
+	}
+	for i := range img.Cb {
+		img.Cb[i] = clampU8(128 + 30*math.Sin(float64(i)/300))
+		img.Cr[i] = clampU8(128 + 28*math.Cos(float64(i)/260))
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func clampU8(v float64) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(v)
+}
+
+// JPEG は分解して保存され、ビット一致で復元でき、物理が元より小さくなる。
+func TestPrecompJPEGRoundTripAndGain(t *testing.T) {
+	s := newTestStore(t)
+	jpg := makeJPEG(t, 1, 85)
+	m := putBytes(t, s, "photo.jpg", jpg)
+	if m.Encoding != EncodingJPEGV1 {
+		t.Fatalf("encoding = %q, want %q(分解されていない)", m.Encoding, EncodingJPEGV1)
+	}
+	got := getBytes(t, s, m.ID)
+	if sha256.Sum256(got) != sha256.Sum256(jpg) {
+		t.Fatal("JPEG の復元がビット一致しません")
+	}
+	st, _ := s.Stats()
+	if st.PhysicalBytes >= int64(len(jpg)) {
+		t.Fatalf("physical %d >= jpeg %d: 分解で縮んでいません", st.PhysicalBytes, len(jpg))
+	}
+	t.Logf("JPEG %d → 物理 %d (%.1f%% 削減)", len(jpg), st.PhysicalBytes,
+		100*(1-float64(st.PhysicalBytes)/float64(len(jpg))))
+}
+
+// 同一 JPEG を2枚アップロードすると、係数平面が一致してチャンク重複排除が
+// 効き、2枚目の物理増分がほぼゼロになる(生 JPEG バイトでも exact dedup は
+// 効くが、分解形は near-dup にも効くための基盤)。
+func TestPrecompJPEGDedup(t *testing.T) {
+	s := newTestStore(t)
+	jpg := makeJPEG(t, 2, 88)
+	putBytes(t, s, "a.jpg", jpg)
+	before, _ := s.Stats()
+	putBytes(t, s, "b.jpg", jpg)
+	after, _ := s.Stats()
+	added := after.PhysicalBytes - before.PhysicalBytes
+	if added > int64(len(jpg))/10 {
+		t.Fatalf("2枚目の物理増分 = %d(重複排除が効いていない)", added)
+	}
 }

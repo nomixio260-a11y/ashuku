@@ -203,6 +203,9 @@ type FileManifest struct {
 	// PrecompContainer は ZIP / PDF コンテナの再構成レシピ
 	// (チャンク列 = スケルトン+展開データ列)。
 	PrecompContainer *precomp.ContainerRecipe `json:"precomp_container,omitempty"`
+	// PrecompJPEG は baseline JPEG の再構成レシピ
+	// (チャンク列 = ヘッダ+係数平面)。
+	PrecompJPEG *precomp.JPEGRecipe `json:"precomp_jpeg,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -228,6 +231,9 @@ const (
 	EncodingZipV1 = "zip-deflate-v1"
 	// EncodingPDFV1 は PDF コンテナ(FlateDecode の zlib を展開して保存)。
 	EncodingPDFV1 = "pdf-zlib-v1"
+	// EncodingJPEGV1 は baseline JPEG(Huffman を展開し量子化DCT係数を
+	// 平面化して保存。可逆・ビット一致)。
+	EncodingJPEGV1 = "jpeg-baseline-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

@@ -14,6 +14,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"image"
+	"image/jpeg"
 	"testing"
 )
 
@@ -163,5 +165,33 @@ func FuzzReconstructContainer(f *testing.F) {
 			{SkelPos: pos, PlainLen: plainLen, Level: level & 0xff},
 		}}
 		ReconstructContainer(recipe, chunked) // パニックしなければよい
+	})
+}
+
+// JPEG パーサ/トランスコーダのファジング(受理した入力は必ずビット一致で
+// 再構成できる、かつ壊れた入力でパニックしない)。
+func FuzzTryUnwrapJPEG(f *testing.F) {
+	// 正常な baseline JPEG をシードに
+	img := image.NewYCbCr(image.Rect(0, 0, 64, 64), image.YCbCrSubsampleRatio420)
+	for i := range img.Y {
+		img.Y[i] = byte(i * 7)
+	}
+	for i := range img.Cb {
+		img.Cb[i] = 128
+		img.Cr[i] = 128
+	}
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80})
+	f.Add(buf.Bytes())
+	f.Add([]byte("\xFF\xD8\xFF garbage not really a jpeg but has the magic bytes"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapJPEG(data, 8<<20)
+		if !ok {
+			return
+		}
+		got, err := ReconstructJPEG(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("受理した JPEG の再構成が一致しません (err=%v)", err)
+		}
 	})
 }
