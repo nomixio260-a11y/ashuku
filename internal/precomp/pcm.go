@@ -33,8 +33,9 @@ type WAVRecipe struct {
 	Channels  int     `json:"ch"`           // チャンネル数
 	Bytes     int     `json:"bps"`          // 1サンプルのバイト数(1..4)
 	Frames    int     `json:"fr"`           // フレーム数(= サンプル数/ch)
-	Orders    []uint8 `json:"ord"`          // チャンネルごとの固定予測次数
+	Orders    []uint8 `json:"ord"`          // 予測次数。BlockSize>0 なら [ch][block] を平坦化、0 ならチャンネルごと
 	BigEndian bool    `json:"be,omitempty"` // AIFF は真(サンプルがビッグエンディアン)
+	BlockSize int     `json:"bs,omitempty"` // ブロック適応次数のブロック長(0=チャンネル一律)
 }
 
 // WAVUnwrapped は分解結果。
@@ -96,10 +97,17 @@ func tryUnwrapPCM(orig []byte, ch, bps, dataOff, dataLen int, bigEndian bool, ma
 		}
 	}
 
-	orders := make([]uint8, ch)
+	// ブロック適応: チャンネルごとに blockSize サンプル区間で最良次数を選ぶ
+	// (連続履歴を保つのでブロック境界でも予測は途切れない)。無音/有音や
+	// 静→動で最適次数が変わる音声で縮む。
+	blockSize := pcmBlockSize
+	nbPerCh := (frames + blockSize - 1) / blockSize
+	orders := make([]uint8, 0, ch*nbPerCh)
 	resid := make([][]uint32, ch)
 	for c := 0; c < ch; c++ {
-		orders[c], resid[c] = bestFixedResidual(chans[c], mask)
+		ords, res := blockFixedResidual(chans[c], mask, blockSize)
+		orders = append(orders, ords...)
+		resid[c] = res
 	}
 
 	// 残差をバイト平面(チャンネル→バイト位置→フレーム)に並べる。
@@ -130,9 +138,13 @@ func tryUnwrapPCM(orig []byte, ch, bps, dataOff, dataLen int, bigEndian bool, ma
 		Recipe: &WAVRecipe{
 			PrefixLen: dataOff, Suffix: suffix,
 			Channels: ch, Bytes: bps, Frames: frames, Orders: orders, BigEndian: bigEndian,
+			BlockSize: blockSize,
 		},
 	}, true
 }
+
+// pcmBlockSize はブロック適応次数のブロック長(サンプル)。
+const pcmBlockSize = 4096
 
 // ReconstructWAV はレシピとチャンク化内容から元の WAV をビット単位で戻す。
 func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
@@ -146,9 +158,6 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 	payload := chunked[recipe.PrefixLen:]
 	if len(payload) != sampleBytes {
 		return nil, errors.New("WAV ペイロード長が不一致")
-	}
-	if len(recipe.Orders) != ch {
-		return nil, errors.New("WAV 予測次数が不一致")
 	}
 	mask := uint32(1)<<(uint(bps)*8) - 1
 
@@ -167,8 +176,21 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 	}
 	// 逆予測でサンプルを復元
 	chans := make([][]uint32, ch)
-	for c := 0; c < ch; c++ {
-		chans[c] = inverseFixed(int(recipe.Orders[c]), resid[c], mask)
+	if recipe.BlockSize > 0 {
+		nb := (frames + recipe.BlockSize - 1) / recipe.BlockSize
+		if len(recipe.Orders) != ch*nb {
+			return nil, errors.New("WAV ブロック次数の数が不一致")
+		}
+		for c := 0; c < ch; c++ {
+			chans[c] = inverseBlockFixed(resid[c], recipe.Orders[c*nb:(c+1)*nb], mask, recipe.BlockSize)
+		}
+	} else {
+		if len(recipe.Orders) != ch {
+			return nil, errors.New("WAV 予測次数が不一致")
+		}
+		for c := 0; c < ch; c++ {
+			chans[c] = inverseFixed(int(recipe.Orders[c]), resid[c], mask)
+		}
 	}
 	// インターリーブして data サンプルを組み立て
 	frameBytes := ch * bps
@@ -188,41 +210,57 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 
 // ---- 固定予測子(Shorten 系、特許フリー) ----
 
-// bestFixedResidual は次数0〜3を試し、残差の絶対値和が最小の次数を選ぶ。
-func bestFixedResidual(x []uint32, mask uint32) (uint8, []uint32) {
-	bestOrd := 0
-	var bestCost uint64 = ^uint64(0)
-	var bestRes []uint32
-	for ord := 0; ord <= wavMaxOrder; ord++ {
-		res := fixedResidual(ord, x, mask)
-		var cost uint64
-		half := (mask >> 1) + 1
-		for _, r := range res {
-			// 符号付き振幅で評価
-			if r >= half {
-				cost += uint64(mask - r + 1)
-			} else {
-				cost += uint64(r)
-			}
-			if cost >= bestCost {
-				break
-			}
+// blockFixedResidual はチャンネルを blockSize 区間に分け、各区間で最良次数を
+// 選ぶ(履歴は連続)。orders は区間ごとの次数、res は全体の残差。
+func blockFixedResidual(x []uint32, mask uint32, blockSize int) ([]uint8, []uint32) {
+	n := len(x)
+	res := make([]uint32, n)
+	var orders []uint8
+	half := (mask >> 1) + 1
+	cost := func(r uint32) uint64 {
+		if r >= half {
+			return uint64(mask - r + 1)
 		}
-		if cost < bestCost {
-			bestCost, bestOrd, bestRes = cost, ord, res
-		}
+		return uint64(r)
 	}
-	return uint8(bestOrd), bestRes
+	for s := 0; s < n; s += blockSize {
+		e := s + blockSize
+		if e > n {
+			e = n
+		}
+		bestOrd, bestCost := 0, ^uint64(0)
+		for ord := 0; ord <= wavMaxOrder; ord++ {
+			var cst uint64
+			for i := s; i < e; i++ {
+				cst += cost((x[i] - predictFixed(ord, x, i)) & mask)
+			}
+			if cst < bestCost {
+				bestCost, bestOrd = cst, ord
+			}
+		}
+		for i := s; i < e; i++ {
+			res[i] = (x[i] - predictFixed(bestOrd, x, i)) & mask
+		}
+		orders = append(orders, uint8(bestOrd))
+	}
+	return orders, res
 }
 
-// fixedResidual は次数 ord の固定予測残差(mod 2^b)を返す。
-// 予測子: pred = Σ c_k x[i-1-k]、係数は二項係数の交代和。
-func fixedResidual(ord int, x []uint32, mask uint32) []uint32 {
-	res := make([]uint32, len(x))
-	for i := range x {
-		res[i] = (x[i] - predictFixed(ord, x, i)) & mask
+// inverseBlockFixed は blockFixedResidual の逆。
+func inverseBlockFixed(res []uint32, orders []uint8, mask uint32, blockSize int) []uint32 {
+	n := len(res)
+	x := make([]uint32, n)
+	for bi, s := 0, 0; s < n; bi, s = bi+1, s+blockSize {
+		e := s + blockSize
+		if e > n {
+			e = n
+		}
+		ord := int(orders[bi])
+		for i := s; i < e; i++ {
+			x[i] = (res[i] + predictFixed(ord, x, i)) & mask
+		}
 	}
-	return res
+	return x
 }
 
 // inverseFixed は残差からサンプルを逐次復元する。
