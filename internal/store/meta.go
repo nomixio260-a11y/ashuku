@@ -247,6 +247,8 @@ const (
 	EncodingAVIV1 = "avi-mjpeg-v1"
 	// EncodingWAVV1 は WAV(PCM)を予測残差のバイト平面に分解して保存。
 	EncodingWAVV1 = "wav-pcm-v1"
+	// EncodingAIFFV1 は AIFF(ビッグエンディアン PCM)を同様に分解して保存。
+	EncodingAIFFV1 = "aiff-pcm-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

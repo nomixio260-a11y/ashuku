@@ -26,14 +26,15 @@ func IsWAV(head []byte) bool {
 		head[8] == 'W' && head[9] == 'A' && head[10] == 'V' && head[11] == 'E'
 }
 
-// WAVRecipe は WAV 再構成レシピ。
+// WAVRecipe は PCM(WAV/AIFF)再構成レシピ。
 type WAVRecipe struct {
-	PrefixLen int     `json:"pfx"` // data サンプル直前までのスケルトン長
-	Suffix    []byte  `json:"sfx"` // サンプル領域以降の原文(data パディング+後続チャンク)
-	Channels  int     `json:"ch"`  // チャンネル数
-	Bytes     int     `json:"bps"` // 1サンプルのバイト数(1..4)
-	Frames    int     `json:"fr"`  // フレーム数(= サンプル数/ch)
-	Orders    []uint8 `json:"ord"` // チャンネルごとの固定予測次数
+	PrefixLen int     `json:"pfx"`          // data サンプル直前までのスケルトン長
+	Suffix    []byte  `json:"sfx"`          // サンプル領域以降の原文(data パディング+後続チャンク)
+	Channels  int     `json:"ch"`           // チャンネル数
+	Bytes     int     `json:"bps"`          // 1サンプルのバイト数(1..4)
+	Frames    int     `json:"fr"`           // フレーム数(= サンプル数/ch)
+	Orders    []uint8 `json:"ord"`          // チャンネルごとの固定予測次数
+	BigEndian bool    `json:"be,omitempty"` // AIFF は真(サンプルがビッグエンディアン)
 }
 
 // WAVUnwrapped は分解結果。
@@ -46,9 +47,6 @@ const wavMaxOrder = 3
 
 // TryUnwrapWAV は WAV の PCM サンプルを予測残差のバイト平面に変換する。
 func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
-	if maxPlain <= 0 || maxPlain > maxPlainTotal {
-		maxPlain = maxPlainTotal
-	}
 	if len(orig) < 44 || !IsWAV(orig) {
 		return nil, false
 	}
@@ -56,17 +54,36 @@ func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
 	if !ok {
 		return nil, false
 	}
+	return tryUnwrapPCM(orig, ch, bps, dataOff, dataLen, false, maxPlain)
+}
+
+// TryUnwrapAIFF は AIFF(ビッグエンディアン PCM)を分解する。
+func TryUnwrapAIFF(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
+	if len(orig) < 44 || !IsAIFF(orig) {
+		return nil, false
+	}
+	ch, bps, dataOff, dataLen, ok := parseAIFFCommSsnd(orig)
+	if !ok {
+		return nil, false
+	}
+	return tryUnwrapPCM(orig, ch, bps, dataOff, dataLen, true, maxPlain)
+}
+
+// tryUnwrapPCM は WAV/AIFF 共通の変換本体。
+func tryUnwrapPCM(orig []byte, ch, bps, dataOff, dataLen int, bigEndian bool, maxPlain int64) (*WAVUnwrapped, bool) {
+	if maxPlain <= 0 || maxPlain > maxPlainTotal {
+		maxPlain = maxPlainTotal
+	}
 	frameBytes := ch * bps
-	if frameBytes == 0 {
+	if frameBytes == 0 || dataOff < 0 || dataOff+dataLen > len(orig) {
 		return nil, false
 	}
 	frames := dataLen / frameBytes
 	sampleBytes := frames * frameBytes
 	if frames < 16 || int64(sampleBytes) > maxPlain {
-		return nil, false // 小さすぎ or 大きすぎ
+		return nil, false
 	}
 
-	// チャンネルごとにサンプルを取り出す(b ビット無符号値として mod 2^b で扱う)。
 	mask := uint32(1)<<(uint(bps)*8) - 1
 	chans := make([][]uint32, ch)
 	for c := 0; c < ch; c++ {
@@ -75,11 +92,10 @@ func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
 	for f := 0; f < frames; f++ {
 		fo := dataOff + f*frameBytes
 		for c := 0; c < ch; c++ {
-			chans[c][f] = readLE(orig[fo+c*bps:], bps)
+			chans[c][f] = readSample(orig[fo+c*bps:], bps, bigEndian)
 		}
 	}
 
-	// 各チャンネルで最良の固定次数を選び、残差(mod 2^b)を求める。
 	orders := make([]uint8, ch)
 	resid := make([][]uint32, ch)
 	for c := 0; c < ch; c++ {
@@ -105,7 +121,6 @@ func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
 	chunked = append(chunked, prefix...)
 	chunked = append(chunked, payload...)
 
-	// 採用判定: バイト平面を zstd 最高レベルで probe し、元より小さい時だけ。
 	probe := jpegProbeEncoder.EncodeAll(chunked, make([]byte, 0, len(chunked)/2))
 	if len(probe)+len(suffix) >= len(orig) {
 		return nil, false
@@ -114,7 +129,7 @@ func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
 		Chunked: chunked,
 		Recipe: &WAVRecipe{
 			PrefixLen: dataOff, Suffix: suffix,
-			Channels: ch, Bytes: bps, Frames: frames, Orders: orders,
+			Channels: ch, Bytes: bps, Frames: frames, Orders: orders, BigEndian: bigEndian,
 		},
 	}, true
 }
@@ -163,7 +178,7 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 	for f := 0; f < frames; f++ {
 		fo := f * frameBytes
 		for c := 0; c < ch; c++ {
-			writeLE(sbuf[fo+c*bps:], chans[c][f], bps)
+			writeSample(sbuf[fo+c*bps:], chans[c][f], bps, recipe.BigEndian)
 		}
 	}
 	out = append(out, sbuf...)
@@ -289,16 +304,101 @@ func parseWAVFmtData(orig []byte) (ch, bps, dataOff, dataLen int, ok bool) {
 	return
 }
 
-func readLE(b []byte, n int) uint32 {
+// readSample はエンディアンに応じて n バイトを uint32 として読む。
+func readSample(b []byte, n int, bigEndian bool) uint32 {
 	var v uint32
-	for i := 0; i < n; i++ {
-		v |= uint32(b[i]) << uint(i*8)
+	if bigEndian {
+		for i := 0; i < n; i++ {
+			v = v<<8 | uint32(b[i])
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			v |= uint32(b[i]) << uint(i*8)
+		}
 	}
 	return v
 }
 
-func writeLE(b []byte, v uint32, n int) {
-	for i := 0; i < n; i++ {
-		b[i] = byte(v >> uint(i*8))
+// writeSample はエンディアンに応じて n バイトを書く。
+func writeSample(b []byte, v uint32, n int, bigEndian bool) {
+	if bigEndian {
+		for i := 0; i < n; i++ {
+			b[i] = byte(v >> uint((n-1-i)*8))
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			b[i] = byte(v >> uint(i*8))
+		}
 	}
+}
+
+// IsAIFF は FORM/AIFF(または AIFC)シグネチャを判定する。
+func IsAIFF(head []byte) bool {
+	return len(head) >= 12 &&
+		head[0] == 'F' && head[1] == 'O' && head[2] == 'R' && head[3] == 'M' &&
+		head[8] == 'A' && head[9] == 'I' && head[10] == 'F' &&
+		(head[11] == 'F' || head[11] == 'C')
+}
+
+// parseAIFFCommSsnd は COMM/SSND から (ch, bytesPerSample, sampleOffset,
+// sampleLen) を取り出す。非圧縮 PCM(AIFF、または AIFC の 'NONE'/'sowt')のみ。
+func parseAIFFCommSsnd(orig []byte) (ch, bps, dataOff, dataLen int, ok bool) {
+	aifc := orig[11] == 'C'
+	p := 12
+	var haveComm bool
+	var bits int
+	for p+8 <= len(orig) {
+		id := string(orig[p : p+4])
+		size := int(be32(orig[p+4:]))
+		body := p + 8
+		if size < 0 || body+size > len(orig) {
+			return
+		}
+		switch id {
+		case "COMM":
+			if size < 18 {
+				return
+			}
+			ch = int(be16(orig[body:]))
+			bits = int(be16(orig[body+6:]))
+			// AIFC は圧縮種別が続く(offset 18〜)。'NONE'/'sowt'(=LE PCM)のみ可。
+			if aifc {
+				if size < 22 {
+					return
+				}
+				comp := string(orig[body+18 : body+22])
+				if comp != "NONE" && comp != "sowt" && comp != "twos" {
+					return
+				}
+			}
+			if ch < 1 || ch > 8 || bits%8 != 0 || bits < 8 || bits > 32 {
+				return
+			}
+			bps = bits / 8
+			haveComm = true
+		case "SSND":
+			if !haveComm || size < 8 {
+				return
+			}
+			// SSND: offset(4) + blockSize(4) + サンプルデータ
+			off := int(be32(orig[body:]))
+			dataOff = body + 8 + off
+			dataLen = size - 8 - off
+			if dataLen < 0 || dataOff+dataLen > len(orig) {
+				return
+			}
+			ok = true
+			return
+		}
+		p = body + size
+		if size%2 == 1 {
+			p++
+		}
+	}
+	return
+}
+
+func be16(b []byte) uint16 { return uint16(b[0])<<8 | uint16(b[1]) }
+func be32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }

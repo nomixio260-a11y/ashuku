@@ -104,3 +104,35 @@ func TestWAVRejectsNonPCM(t *testing.T) {
 		}
 	}
 }
+
+func TestAIFFRoundTripTestdata(t *testing.T) {
+	files, _ := filepath.Glob("testdata/aiff/*.aiff")
+	if len(files) == 0 {
+		t.Skip("aiff testdata なし")
+	}
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !IsAIFF(orig) {
+			t.Fatalf("%s: AIFF と判定されない", fn)
+		}
+		u, ok := TryUnwrapAIFF(orig, 0)
+		if !ok {
+			t.Logf("%s: 不採用", fn)
+			continue
+		}
+		back, err := ReconstructWAV(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, orig) {
+			t.Fatalf("%s: ビット一致しない err=%v", fn, err)
+		}
+		if !u.Recipe.BigEndian {
+			t.Fatal("AIFF なのに BigEndian=false")
+		}
+		probe := jpegProbeEncoder.EncodeAll(u.Chunked, nil)
+		t.Logf("%s: orig=%d resid+zstd≈%d (%.1f%%)", filepath.Base(fn), len(orig),
+			len(probe)+len(u.Recipe.Suffix),
+			100*float64(len(probe)+len(u.Recipe.Suffix)-len(orig))/float64(len(orig)))
+	}
+}

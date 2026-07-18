@@ -527,6 +527,8 @@ func TestProgressiveJPEGEndToEnd(t *testing.T) {
 
 func TestWAVPrecompEndToEnd(t *testing.T) {
 	files, _ := filepath.Glob("../precomp/testdata/wav/*.wav")
+	aiffs, _ := filepath.Glob("../precomp/testdata/aiff/*.aiff")
+	files = append(files, aiffs...)
 	if len(files) == 0 {
 		t.Skip("wav testdata なし")
 	}
@@ -538,7 +540,7 @@ func TestWAVPrecompEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := putBytes(t, s, filepath.Base(fn), orig)
-		if m.Encoding == EncodingWAVV1 {
+		if m.Encoding == EncodingWAVV1 || m.Encoding == EncodingAIFFV1 {
 			adopted++
 		}
 		got := getBytes(t, s, m.ID)
@@ -554,9 +556,18 @@ func TestWAVPrecompEndToEnd(t *testing.T) {
 	}
 	list, _, _ := s.ListPage("", "", 0)
 	for _, fm := range list {
-		orig, _ := os.ReadFile("../precomp/testdata/wav/" + fm.Name)
+		orig, _ := readAudioTestdata(fm.Name)
 		if !bytes.Equal(getBytes(t, s, fm.ID), orig) {
 			t.Fatalf("%s: Optimize 後にビット一致しない", fm.Name)
 		}
 	}
+}
+
+func readAudioTestdata(name string) ([]byte, error) {
+	for _, d := range []string{"../precomp/testdata/wav/", "../precomp/testdata/aiff/"} {
+		if b, err := os.ReadFile(d + name); err == nil {
+			return b, nil
+		}
+	}
+	return nil, os.ErrNotExist
 }

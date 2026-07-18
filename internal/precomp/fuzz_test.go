@@ -328,3 +328,28 @@ func FuzzTryUnwrapWAV(f *testing.F) {
 		}
 	})
 }
+
+// FuzzTryUnwrapAIFF は攻撃者制御の AIFF での分解が panic せず、採用入力が
+// ビット一致で戻ることを検証する。
+func FuzzTryUnwrapAIFF(f *testing.F) {
+	files, _ := filepath.Glob("testdata/aiff/*.aiff")
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			f.Add(b)
+		}
+	}
+	f.Add([]byte("FORM\x00\x00\x00\x10AIFFCOMM garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapAIFF(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructWAV(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した AIFF の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した AIFF がビット一致で戻らない")
+		}
+	})
+}
