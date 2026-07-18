@@ -165,6 +165,12 @@ FuzzTryUnwrapProgressive を CI に追加。
 雑音は不採用で素通し。FuzzTryUnwrapWAV を CI に追加。6次元研究WFの最優先案。
 AIFF(ビッグエンディアン)も対応。残: ブロック単位次数・Rice残差符号・動画内 PCM。
 
+### 17f. ✅ 非圧縮 BMP の行予測フィルタ(実装済み、§4.26)
+BI_RGB の生ピクセルに PNG 型の行フィルタ(None/Sub/Up/Avg/Paeth を行ごとに
+最小残差で選択)をかけて zstd/brotli に載せる。フィルタ↔逆は 256 剰余環の
+全単射で安全。実測: 写真調 BMP -51%、合成 -35%。FuzzTryUnwrapBMP を CI 追加。
+残: 非圧縮 TIFF への同フィルタ流用、TIFF LZW/PackBits 剥がし。
+
 ### 19. ✅ リージョンの長距離マッチ(実装済み: level22+大窓+LDM、束16)
 実データ測定で 束8+19=9.97% → 束16+22=11.35% 改善を確認し採用。
 束32(12.26%)は読み出し増幅とのバランスで不採用(RESEARCH.md §4.15)。

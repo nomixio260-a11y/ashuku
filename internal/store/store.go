@@ -489,7 +489,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 		zlibFmt := s.precomp && (precomp.IsGzip(head) || precomp.IsZlib(head) ||
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
-			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head))
+			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -638,6 +638,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingAIFFV1
 		m.PrecompWAV = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsBMP(buf):
+		u, ok := precomp.TryUnwrapBMP(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingBMPV1
+		m.PrecompBMP = u.Recipe
 		m.precompPlain = u.Chunked
 	default:
 		return false
@@ -1252,6 +1260,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructAVI(m.PrecompAVI, plain.Bytes())
 	case EncodingWAVV1, EncodingAIFFV1:
 		orig, err = precomp.ReconstructWAV(m.PrecompWAV, plain.Bytes())
+	case EncodingBMPV1:
+		orig, err = precomp.ReconstructBMP(m.PrecompBMP, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}

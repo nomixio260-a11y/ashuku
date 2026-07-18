@@ -212,6 +212,8 @@ type FileManifest struct {
 	PrecompAVI *precomp.MJPEGRecipe `json:"precomp_avi,omitempty"`
 	// PrecompWAV は WAV(PCM)の再構成レシピ。
 	PrecompWAV *precomp.WAVRecipe `json:"precomp_wav,omitempty"`
+	// PrecompBMP は非圧縮 BMP の再構成レシピ。
+	PrecompBMP *precomp.BMPRecipe `json:"precomp_bmp,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -249,6 +251,8 @@ const (
 	EncodingWAVV1 = "wav-pcm-v1"
 	// EncodingAIFFV1 は AIFF(ビッグエンディアン PCM)を同様に分解して保存。
 	EncodingAIFFV1 = "aiff-pcm-v1"
+	// EncodingBMPV1 は非圧縮 BMP を行予測フィルタで分解して保存。
+	EncodingBMPV1 = "bmp-filter-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

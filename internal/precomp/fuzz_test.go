@@ -353,3 +353,28 @@ func FuzzTryUnwrapAIFF(f *testing.F) {
 		}
 	})
 }
+
+// FuzzTryUnwrapBMP は攻撃者制御の BMP での分解が panic せず、採用入力が
+// ビット一致で戻ることを検証する。
+func FuzzTryUnwrapBMP(f *testing.F) {
+	files, _ := filepath.Glob("testdata/bmp/*.bmp")
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			f.Add(b)
+		}
+	}
+	f.Add([]byte("BM garbage bitmap header data here padding padding"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapBMP(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructBMP(u.Recipe, u.Chunked)
+		if err != nil {
+			t.Fatalf("採用した BMP の再構成に失敗: %v", err)
+		}
+		if !bytes.Equal(back, data) {
+			t.Fatal("採用した BMP がビット一致で戻らない")
+		}
+	})
+}

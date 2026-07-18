@@ -571,3 +571,31 @@ func readAudioTestdata(name string) ([]byte, error) {
 	}
 	return nil, os.ErrNotExist
 }
+
+func TestBMPPrecompEndToEnd(t *testing.T) {
+	files, _ := filepath.Glob("../precomp/testdata/bmp/*.bmp")
+	if len(files) == 0 {
+		t.Skip("bmp testdata なし")
+	}
+	s := newTestStore(t)
+	adopted := 0
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := putBytes(t, s, filepath.Base(fn), orig)
+		if m.Encoding == EncodingBMPV1 {
+			adopted++
+		}
+		if !bytes.Equal(getBytes(t, s, m.ID), orig) {
+			t.Fatalf("%s: 読み戻しがビット一致しない", fn)
+		}
+	}
+	if adopted == 0 {
+		t.Fatal("BMP が1つも分解されなかった")
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+}
