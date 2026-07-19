@@ -177,6 +177,9 @@ func TestOptimizeOnEmptyStore(t *testing.T) {
 // インクリメンタル最適化は新着データだけを対象に、フルパスと同等の
 // リージョン化・小チャンクソリッド圧縮を行う(作業キュー駆動)。
 func TestOptimizeIncremental(t *testing.T) {
+	if testing.Short() {
+		t.Skip("重い E2E テスト; -short ではスキップ(CI の全テストジョブで実行)")
+	}
 	t.Parallel()
 	s := newTestStore(t)
 	data := regionCorpus(t, 20<<20)

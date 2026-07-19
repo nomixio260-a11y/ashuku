@@ -35,6 +35,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 重い E2E(Region/Optimize/SmallFiles/Counters)を1シャードに集約し、
+          # 残り全部をもう1シャードで。両シャードで全テストを網羅する
+          # (-run と -skip が完全な分割になる)。パッケージ内は t.Parallel 並列。
+          - shard: heavy
+            args: -run 'TestRegion|TestOptimize|TestSmallFilesCrossFile|TestCountersStayConsistent'
+          - shard: rest
+            args: -skip 'TestRegion|TestOptimize|TestSmallFilesCrossFile|TestCountersStayConsistent'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -42,8 +53,8 @@ jobs:
           go-version-file: go.mod
       - name: cgo 依存
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
-      - name: 全テスト(パッケージ内は t.Parallel で並列)
-        run: go test -timeout 30m ./...
+      - name: テスト(${{ matrix.shard }}、パッケージ内は t.Parallel で並列)
+        run: go test -timeout 30m ${{ matrix.args }} ./...
 
   race:
     runs-on: ubuntu-latest

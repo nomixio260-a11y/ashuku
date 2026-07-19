@@ -162,6 +162,9 @@ func TestOfflineCompressBestBzip2(t *testing.T) {
 // TestOptimizeAdoptsBrotli は Optimize 後にテキストチャンクが brotli 表現へ
 // 昇格し、内容がビット一致で読み戻せることを実ストアで検証する。
 func TestOptimizeAdoptsBrotli(t *testing.T) {
+	if testing.Short() {
+		t.Skip("重い E2E テスト; -short ではスキップ(CI の全テストジョブで実行)")
+	}
 	t.Parallel()
 	s := newTestStore(t)
 	// zstd 系より brotli が確実に勝つテキスト(実測根拠は RESEARCH §4.20)。

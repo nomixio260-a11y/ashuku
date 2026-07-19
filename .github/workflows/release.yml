@@ -37,10 +37,14 @@ jobs:
       - name: cgo 依存(zlib ヘッダ・libzstd ランタイム)
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
 
-      - name: サニティ(vet + テスト)
+      - name: サニティ(vet + 高速テスト + 両ビルド)
+        # リリースビルドのゲートは「速く・十分」であるべき。重い E2E は push ごとの
+        # CI(全テストジョブ)が担保済みなので、ここは -short(重い E2E をスキップ、
+        # 実測 ~40s)+ CGO 有無の両ビルドで型・整合を素早く確認する。
         run: |
           go vet ./...
-          go test -timeout 30m ./...
+          go test -short -timeout 10m ./...
+          CGO_ENABLED=0 go build ./...
 
       - name: 配布バイナリをビルド(サーバー + クライアント3OS)
         run: |

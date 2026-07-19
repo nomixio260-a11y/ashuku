@@ -318,6 +318,9 @@ func TestDiskGuardBlocksWrites(t *testing.T) {
 // 維持カウンタ(Stats O(1)化)が、あらゆる経路(取り込み・重複・削除・
 // リージョン化・repack・パック回収)の後も全走査と一致し続ける。
 func TestCountersStayConsistent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("重い E2E テスト; -short ではスキップ(CI の全テストジョブで実行)")
+	}
 	t.Parallel()
 	s := newTestStore(t)
 	// 多様なワークロード
