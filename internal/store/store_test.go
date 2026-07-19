@@ -67,6 +67,7 @@ func getBytes(t *testing.T, s *Store, id string) []byte {
 }
 
 func TestPutGetRoundTrip(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// チャンク境界をまたぐサイズ(数MiB)で往復の完全一致を確認
 	data := randomData(t, 5<<20)
@@ -83,6 +84,7 @@ func TestPutGetRoundTrip(t *testing.T) {
 }
 
 func TestEmptyFile(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "empty", nil)
 	if m.Size != 0 {
@@ -94,6 +96,7 @@ func TestEmptyFile(t *testing.T) {
 }
 
 func TestCompressionOnRepetitiveData(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "app.log", repetitiveData(8<<20))
 
@@ -107,6 +110,7 @@ func TestCompressionOnRepetitiveData(t *testing.T) {
 }
 
 func TestIncompressibleDataStoredRaw(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := randomData(t, 4<<20)
 	putBytes(t, s, "noise.bin", data)
@@ -123,6 +127,7 @@ func TestIncompressibleDataStoredRaw(t *testing.T) {
 }
 
 func TestDeduplicationAcrossFiles(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 「バックアップ2世代」: 同一の大きなデータ + 末尾に少しの差分
 	base := randomData(t, 6<<20)
@@ -145,6 +150,7 @@ func TestDeduplicationAcrossFiles(t *testing.T) {
 }
 
 func TestDeleteReleasesSpace(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m1 := putBytes(t, s, "a", randomData(t, 3<<20))
 	m2 := putBytes(t, s, "b", repetitiveData(3<<20))
@@ -171,6 +177,7 @@ func TestDeleteReleasesSpace(t *testing.T) {
 }
 
 func TestDeleteSharedChunksKeepsOtherFile(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := randomData(t, 4<<20)
 	m1 := putBytes(t, s, "copy1", data)
@@ -187,6 +194,7 @@ func TestDeleteSharedChunksKeepsOtherFile(t *testing.T) {
 }
 
 func TestDeleteNotFound(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	if err := s.Delete("nonexistent"); err != ErrNotFound {
 		t.Fatalf("err = %v, want ErrNotFound", err)
@@ -196,6 +204,7 @@ func TestDeleteNotFound(t *testing.T) {
 // 小ファイルはチャンク+マニフェストが単一トランザクションで確定される。
 // クォータ超過時は何もコミットされない(チャンクの孤児が残らない)。
 func TestSmallFileQuotaAtomic(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := randomData(t, 64<<10)
 	_, err := s.PutWithOptions("over", bytes.NewReader(data),
@@ -223,6 +232,7 @@ func TestSmallFileQuotaAtomic(t *testing.T) {
 // 同一チャンクが1つの小ファイル内に複数回現れても正しく確定される
 // (単一トランザクション内の自己重複排除)。
 func TestSmallFileDupChunksWithinFile(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 同じ 300KiB ブロックを2回繰り返す(min チャンク 256KiB 超なので
 	// 同一境界で同一チャンクが出うる)
@@ -252,6 +262,7 @@ func TestSmallFileDupChunksWithinFile(t *testing.T) {
 // 小ファイル(バッファ内)と大ファイル(ストリーミング)の境界をまたいでも
 // 双方が正しく往復する。
 func TestBufferBoundaryFiles(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// バッファ上限 = chunkSize*4 = 4MiB(デフォルト)前後のサイズ群
 	for _, size := range []int{1 << 10, 256 << 10, 1 << 20, 4 << 20, (4 << 20) + 1, 6 << 20, 9 << 20} {
@@ -272,6 +283,7 @@ func TestBufferBoundaryFiles(t *testing.T) {
 }
 
 func TestList(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "one", []byte("hello"))
 	putBytes(t, s, "two", []byte("world"))
@@ -288,6 +300,7 @@ func TestList(t *testing.T) {
 // MinFreeBytes を極端に大きくすると、取り込みと Optimize がディスク保護で
 // 拒否される(バックグラウンド処理が満杯を招かない)。
 func TestDiskGuardBlocksWrites(t *testing.T) {
+	t.Parallel()
 	s, err := Open(t.TempDir(), Config{MinFreeBytes: 1 << 60})
 	if err != nil {
 		t.Fatal(err)
@@ -305,6 +318,7 @@ func TestDiskGuardBlocksWrites(t *testing.T) {
 // 維持カウンタ(Stats O(1)化)が、あらゆる経路(取り込み・重複・削除・
 // リージョン化・repack・パック回収)の後も全走査と一致し続ける。
 func TestCountersStayConsistent(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 多様なワークロード
 	m1 := putBytes(t, s, "text", repetitiveData(6<<20))

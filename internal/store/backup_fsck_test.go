@@ -13,6 +13,7 @@ import (
 
 // メタバックアップは有効な bbolt DB を生成し、そこから全ファイルを復元できる。
 func TestMetaBackupRestorable(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := Open(dir, Config{})
 	if err != nil {
@@ -48,6 +49,7 @@ func TestMetaBackupRestorable(t *testing.T) {
 
 // ローテーションは最新 keep 個だけ残す。
 func TestMetaBackupRotation(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "a", []byte("hello"))
 
@@ -71,6 +73,7 @@ func TestMetaBackupRotation(t *testing.T) {
 
 // 健全なストアは fsck で不整合なし。
 func TestFsckHealthy(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "a", randomData(t, 3<<20))
 	putBytes(t, s, "b", repetitiveData(2<<20))
@@ -91,6 +94,7 @@ func TestFsckHealthy(t *testing.T) {
 
 // 参照カウントを人為的に壊すと fsck が検出し、repair が直す。
 func TestFsckRepairsRefcount(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "a", randomData(t, 3<<20))
 
@@ -129,6 +133,7 @@ func TestFsckRepairsRefcount(t *testing.T) {
 
 // 孤児チャンク(参照ゼロだが残存)を fsck repair が回収する。
 func TestFsckReclaimsOrphan(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "keep", randomData(t, 2<<20))
 

@@ -10,6 +10,7 @@ import (
 
 // 開発用実験: 多数の小ファイルの圧縮率(ASHUKU_SMALL_EXP=1 で実行)
 func TestSmallFilesRatioExp(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("ASHUKU_SMALL_EXP") == "" {
 		t.Skip("ASHUKU_SMALL_EXP 未設定")
 	}
@@ -48,6 +49,7 @@ func TestSmallFilesRatioExp(t *testing.T) {
 
 // 理論上限の参考値: 全ファイル連結を brotli-11 で1本に圧縮
 func TestSmallFilesUpperBound(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("ASHUKU_SMALL_EXP") == "" {
 		t.Skip("ASHUKU_SMALL_EXP 未設定")
 	}

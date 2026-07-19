@@ -8,6 +8,7 @@ import (
 
 // 健全なストアはスクラブで破損なしと報告する。
 func TestScrubHealthy(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "a", randomData(t, 3<<20))
 	putBytes(t, s, "b", repetitiveData(2<<20))
@@ -26,6 +27,7 @@ func TestScrubHealthy(t *testing.T) {
 
 // チャンクファイルを1バイト書き換えるとスクラブが破損を検出する。
 func TestScrubDetectsCorruption(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 乱数は圧縮されず単独チャンクファイルになる(パック格納だと壊しにくい)
 	m := putBytes(t, s, "victim", randomData(t, 3<<20))
@@ -66,6 +68,7 @@ func TestScrubDetectsCorruption(t *testing.T) {
 
 // チャンクファイルを削除するとスクラブが欠損を検出する。
 func TestScrubDetectsMissing(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "victim", randomData(t, 3<<20))
 	man, _ := s.Manifest(m.ID)
@@ -98,6 +101,7 @@ func TestScrubDetectsMissing(t *testing.T) {
 
 // 孤児 temp ファイルは起動時に掃除される。
 func TestSweepTempFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := Open(dir, Config{})
 	if err != nil {
@@ -125,6 +129,7 @@ func TestSweepTempFiles(t *testing.T) {
 
 // ローリングスクラブはカーソルを進めながら全チャンクを漏れなく一周する。
 func TestScrubRolling(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "a", randomData(t, 5<<20)) // 複数チャンク
 	st, _ := s.Stats()
@@ -165,6 +170,7 @@ func TestScrubRolling(t *testing.T) {
 // スクラブはキャッシュを迂回してディスクの破損を検出する(以前は読み出しで
 // キャッシュに載ったチャンクの bit rot を見逃していた)。
 func TestScrubDetectsCorruptionBehindCache(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "hot", randomData(t, 2<<20))
 	// 読み出してキャッシュに載せる

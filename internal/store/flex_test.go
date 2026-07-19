@@ -31,6 +31,7 @@ func pseudoText(size int) []byte {
 
 // auto モード: 圧縮可能データは max 並みに縮み、乱数は膨張しない。
 func TestAutoCompressionMode(t *testing.T) {
+	t.Parallel()
 	sAuto, err := Open(t.TempDir(), Config{Compression: "auto"})
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +68,7 @@ func TestAutoCompressionMode(t *testing.T) {
 
 // アップロード単位の圧縮モード上書き。
 func TestPerUploadCompressionOverride(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	text := repetitiveData(4 << 20)
 
@@ -85,6 +87,7 @@ func TestPerUploadCompressionOverride(t *testing.T) {
 
 // 生 zlib ストリーム(git loose object 等)の分解・復元。
 func TestZlibStreamPrecomp(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -113,6 +116,7 @@ func TestZlibStreamPrecomp(t *testing.T) {
 
 // マルチメンバー gzip(連結 gzip = ローテートログの cat)の分解・復元。
 func TestMultiMemberGzipPrecomp(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -182,6 +186,7 @@ func makePNG(t *testing.T, plain []byte, level int, idatSplit int) []byte {
 
 // PNG コンテナの分解・ビット一致復元と削減効果。
 func TestPNGPrecompRoundTrip(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -207,6 +212,7 @@ func TestPNGPrecompRoundTrip(t *testing.T) {
 
 // 類似 PNG 同士(一部編集)で PNG 越しの dedup/デルタが効く。
 func TestPNGCrossFileDedup(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}

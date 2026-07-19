@@ -21,6 +21,7 @@ func putOwned(t *testing.T, s *Store, owner, name string, data []byte) *FileMani
 // List は所有者ごとに分離され、他の所有者のファイル数に影響されない。
 // 所有者IDが別の所有者IDの接頭辞でも(0x1F 区切りで)混ざらない。
 func TestListOwnerIsolationAndPrefix(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putOwned(t, s, "u", "a", []byte("alpha"))
 	putOwned(t, s, "u", "b", []byte("bravo"))
@@ -46,6 +47,7 @@ func TestListOwnerIsolationAndPrefix(t *testing.T) {
 
 // 削除すると所有者索引も維持され、一覧から消える。
 func TestListIndexMaintainedOnDelete(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m1 := putOwned(t, s, "u", "a", []byte("one"))
 	putOwned(t, s, "u", "b", []byte("two"))
@@ -67,6 +69,7 @@ func TestListIndexMaintainedOnDelete(t *testing.T) {
 // 索引導入前に作られたストア(索引エントリなし)を開くと、バックフィルで
 // 復旧して List が正しく動く。
 func TestFileOwnerIndexBackfillOnOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := Open(dir, Config{})
 	if err != nil {
@@ -116,6 +119,7 @@ func TestFileOwnerIndexBackfillOnOpen(t *testing.T) {
 
 // fsck は索引の孤児エントリ・欠損エントリを検出し、repair で修復する。
 func TestFsckRepairsFileOwnerIndex(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putOwned(t, s, "u", "a", []byte("one"))
 
@@ -161,6 +165,7 @@ func TestFsckRepairsFileOwnerIndex(t *testing.T) {
 // List は作成日時の降順(新しい順)で返る。索引キーの反転タイムスタンプに
 // よる順序であり、ソート処理は無い。
 func TestListNewestFirst(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	for i := 0; i < 5; i++ {
 		putOwned(t, s, "u", fmt.Sprintf("f%d", i), []byte{byte(i)})
@@ -185,6 +190,7 @@ func TestListNewestFirst(t *testing.T) {
 
 // ListPage はカーソルで全件を漏れなく重複なく辿れる。
 func TestListPagePagination(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	const n = 7
 	for i := 0; i < n; i++ {
@@ -231,6 +237,7 @@ func TestListPagePagination(t *testing.T) {
 // 一覧は索引レコードだけで組み立てられ、名前・サイズが正しい
 // (巨大マニフェストを読まない実装になっても内容が欠けないことの確認)。
 func TestListRecordFields(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := []byte("hello world, this is content")
 	putOwned(t, s, "u", "record.txt", data)

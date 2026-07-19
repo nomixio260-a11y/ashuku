@@ -32,6 +32,7 @@ func regionCorpus(t *testing.T, size int) []byte {
 }
 
 func TestRegionCompressionImprovesRatioAndRoundTrips(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := regionCorpus(t, 24<<20) // 複数チャンクにまたがる
 
@@ -97,6 +98,7 @@ func smallVocabFile(seed int64, size int) []byte {
 // から漏れる。buildSmallChunkRegions がファイル横断でソリッド圧縮し、
 // 物理容量を減らしつつ全ファイルをビット一致で復元できることを確認する。
 func TestSmallFilesCrossFileSolidCompression(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	const n = 200
 	const fsize = 40 << 10 // 256KiB 未満 → 各ファイル単一チャンク
@@ -156,6 +158,7 @@ func TestSmallFilesCrossFileSolidCompression(t *testing.T) {
 
 // リージョンは冪等(2回 Optimize しても壊れない・物理が増えない)。
 func TestRegionOptimizeIdempotent(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "c", regionCorpus(t, 16<<20))
 	if _, err := s.Optimize(); err != nil {
@@ -176,6 +179,7 @@ func TestRegionOptimizeIdempotent(t *testing.T) {
 
 // リージョン化されたファイルを削除すると、リージョンが解放される。
 func TestRegionDeleteReleasesEverything(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	m := putBytes(t, s, "c", regionCorpus(t, 16<<20))
 	if _, err := s.Optimize(); err != nil {
@@ -197,6 +201,7 @@ func TestRegionDeleteReleasesEverything(t *testing.T) {
 
 // リージョンの一部だけ参照が消えた場合(共有チャンク)、残りは読める。
 func TestRegionPartialDeleteKeepsSharedReadable(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := regionCorpus(t, 16<<20)
 	m1 := putBytes(t, s, "a", data)
@@ -219,6 +224,7 @@ func TestRegionPartialDeleteKeepsSharedReadable(t *testing.T) {
 
 // 低生存率リージョンのコンパクション(解体→詰め直し)で空間が回収される。
 func TestRegionCompaction(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 独立した5ファイルを入れてリージョン化
 	var ids []string
@@ -255,6 +261,7 @@ func TestRegionCompaction(t *testing.T) {
 
 // クライアント経路のダウンロードもリージョンチャンクを正しく返す。
 func TestRegionChunkRep(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := regionCorpus(t, 16<<20)
 	m := putBytes(t, s, "c", data)

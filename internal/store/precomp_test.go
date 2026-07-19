@@ -39,6 +39,7 @@ func textData(size int) []byte {
 }
 
 func TestPrecompGzipRoundTrip(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -62,6 +63,7 @@ func TestPrecompGzipRoundTrip(t *testing.T) {
 // gzip 化されたログでも、展開データに対して圧縮・重複排除が効くことを確認。
 // gzip のまま保存すると圧縮不能(raw)だが、precomp で展開されるため縮む。
 func TestPrecompImprovesRatio(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -82,6 +84,7 @@ func TestPrecompImprovesRatio(t *testing.T) {
 // 「同じデータの gzip を2世代」— gzip のままでは中身が丸ごと違うバイト列に
 // なり dedup が効かないが、展開データ同士なら dedup/デルタが効く。
 func TestPrecompEnablesCrossGzipDedup(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -110,6 +113,7 @@ func TestPrecompEnablesCrossGzipDedup(t *testing.T) {
 
 // zlib 産でない gzip(Go 標準)は素通しで通常保存され、正しく復元される。
 func TestPrecompFallbackForNonZlibGzip(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	var buf bytes.Buffer
 	w := gzip.NewWriter(&buf)
@@ -129,6 +133,7 @@ func TestPrecompFallbackForNonZlibGzip(t *testing.T) {
 
 // precomp 無効設定では gzip もそのまま保存される。
 func TestPrecompDisabled(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -149,6 +154,7 @@ func TestPrecompDisabled(t *testing.T) {
 
 // precomp されたファイルの削除で、展開データのチャンクが GC されることを確認。
 func TestPrecompDeleteReleasesChunks(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -165,6 +171,7 @@ func TestPrecompDeleteReleasesChunks(t *testing.T) {
 
 // gzip マジックで始まるが gzip でない(切り詰められた)入力も安全に保存される。
 func TestPrecompTruncatedGzipFallsBack(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	junk := append([]byte{0x1f, 0x8b, 8}, []byte(strings.Repeat("x", 100))...)
 	m := putBytes(t, s, "junk.bin", junk)
@@ -179,6 +186,7 @@ func TestPrecompTruncatedGzipFallsBack(t *testing.T) {
 // ZIP コンテナ(zlib 産メンバー)が分解され、ビット一致で往復し、
 // 「外側から zstd」より縮むことを確認する。
 func TestPrecompZipRoundTrip(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -214,6 +222,7 @@ func TestPrecompZipRoundTrip(t *testing.T) {
 
 // PDF(FlateDecode)が分解され、ビット一致で往復する。
 func TestPrecompPDFRoundTrip(t *testing.T) {
+	t.Parallel()
 	if !precomp.Supported() {
 		t.Skip("CGO 無効")
 	}
@@ -329,6 +338,7 @@ func clampU8(v float64) uint8 {
 
 // JPEG は分解して保存され、ビット一致で復元でき、物理が元より小さくなる。
 func TestPrecompJPEGRoundTripAndGain(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	jpg := makeJPEG(t, 1, 85)
 	m := putBytes(t, s, "photo.jpg", jpg)
@@ -351,6 +361,7 @@ func TestPrecompJPEGRoundTripAndGain(t *testing.T) {
 // 効き、2枚目の物理増分がほぼゼロになる(生 JPEG バイトでも exact dedup は
 // 効くが、分解形は near-dup にも効くための基盤)。
 func TestPrecompJPEGDedup(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	jpg := makeJPEG(t, 2, 88)
 	putBytes(t, s, "a.jpg", jpg)
@@ -364,6 +375,7 @@ func TestPrecompJPEGDedup(t *testing.T) {
 }
 
 func TestGIFPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// Go 産 GIF(アニメ)を作る
 	pal := make(color.Palette, 256)
@@ -458,6 +470,7 @@ func makeVideoFrame(t *testing.T, frame int) []byte {
 }
 
 func TestMJPEGVideoEndToEnd(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	var frames [][]byte
 	var frameTotal int
@@ -492,6 +505,7 @@ func TestMJPEGVideoEndToEnd(t *testing.T) {
 }
 
 func TestProgressiveJPEGEndToEnd(t *testing.T) {
+	t.Parallel()
 	files, _ := filepath.Glob("../precomp/testdata/progjpeg/*.jpg")
 	if len(files) == 0 {
 		t.Skip("progjpeg testdata なし")
@@ -526,6 +540,7 @@ func TestProgressiveJPEGEndToEnd(t *testing.T) {
 }
 
 func TestWAVPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	files, _ := filepath.Glob("../precomp/testdata/wav/*.wav")
 	aiffs, _ := filepath.Glob("../precomp/testdata/aiff/*.aiff")
 	files = append(files, aiffs...)
@@ -573,6 +588,7 @@ func readAudioTestdata(name string) ([]byte, error) {
 }
 
 func TestBMPPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	files, _ := filepath.Glob("../precomp/testdata/bmp/*.bmp")
 	if len(files) == 0 {
 		t.Skip("bmp testdata なし")
@@ -601,6 +617,7 @@ func TestBMPPrecompEndToEnd(t *testing.T) {
 }
 
 func TestTIFFPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	files, _ := filepath.Glob("../precomp/testdata/tiff/*.tiff")
 	if len(files) == 0 {
 		t.Skip("tiff testdata なし")
@@ -632,6 +649,7 @@ func TestTIFFPrecompEndToEnd(t *testing.T) {
 // 一致→Optimize 後もビット一致、を実ストアで確認する。物理サイズが行指向の
 // 素通し保存より小さいことも確認する。
 func TestCSVPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(11))
 	var b bytes.Buffer
 	b.WriteString("ts,user,action,latency_ms,bytes,ok,region\n")
@@ -692,6 +710,7 @@ func TestCSVPrecompEndToEnd(t *testing.T) {
 // TestJSONLPrecompEndToEnd は同一スキーマ JSONL を投入→骨格+列指向で分解採用→
 // 読み戻しビット一致→行指向素通しより物理が小さい、を実ストアで確認する。
 func TestJSONLPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(13))
 	regions := []string{"us-east", "us-west", "eu-central", "ap-south"}
 	acts := []string{"get", "put", "del", "list"}

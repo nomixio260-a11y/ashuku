@@ -429,7 +429,7 @@ CI(GitHub Actions)が push ごとに gofmt / vet / cgo あり・なし両ビル�
 cmd/ashuku/          サーバー エントリポイント
 cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
-internal/chunker/    FastCDC チャンカー(github.com/jotfs/fastcdc-go)
+internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
 internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
@@ -437,6 +437,6 @@ internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
 ```
 
-コア依存は純 Go(bbolt / klauspost-zstd / fastcdc)で、`CGO_ENABLED=0` でも
+コア依存は純 Go(bbolt / klauspost-zstd / brotli / bzip2、FastCDC は自前実装)で、`CGO_ENABLED=0` でも
 全機能(precompression と libzstd 経路を除く)が動くシングルバイナリになります。
 CGO ビルドではシステムの zlib / libzstd.so.1 に直接リンクします(開発ヘッダ不要)。

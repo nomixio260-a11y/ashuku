@@ -11,6 +11,7 @@ import (
 )
 
 func TestBCJRoundTrip(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(1))
 	// ランダム(E8/E9 が散在)・全E8・短入力・空で往復一致を確認
 	cases := [][]byte{
@@ -35,6 +36,7 @@ func TestBCJRoundTrip(t *testing.T) {
 }
 
 func TestBrotliRoundTrip(t *testing.T) {
+	t.Parallel()
 	data := bytes.Repeat([]byte("hello ashuku compression research "), 4096)
 	br := brotliCompressMax(data)
 	if br == nil || len(br) >= len(data) {
@@ -50,6 +52,7 @@ func TestBrotliRoundTrip(t *testing.T) {
 }
 
 func TestOfflineCompressBestRoundTrip(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	rng := rand.New(rand.NewSource(2))
 	// テキスト様(brotli 有利)・ランダム・機械語風(BCJ 対象)の3種
@@ -99,6 +102,7 @@ func TestOfflineCompressBestRoundTrip(t *testing.T) {
 
 // TestBzip2RoundTrip は bzip2 圧縮→標準ライブラリ decode の往復一致を確認する。
 func TestBzip2RoundTrip(t *testing.T) {
+	t.Parallel()
 	// 反復的な自然文(BWT 有利)。
 	data := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog. "), 8000)
 	bz := bzip2CompressMax(data)
@@ -118,6 +122,7 @@ func TestBzip2RoundTrip(t *testing.T) {
 // bzip2 表現を採用し、往復一致で読み戻せることを確認する。反復的な自然文で
 // bzip2 が zstd/brotli を最小マージン超で下回ることを実測前提にする。
 func TestOfflineCompressBestBzip2(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 語彙を Zipf 的に再利用する疑似自然文(実ベンチの genText 相当)。
 	rng := rand.New(rand.NewSource(42))
@@ -157,6 +162,7 @@ func TestOfflineCompressBestBzip2(t *testing.T) {
 // TestOptimizeAdoptsBrotli は Optimize 後にテキストチャンクが brotli 表現へ
 // 昇格し、内容がビット一致で読み戻せることを実ストアで検証する。
 func TestOptimizeAdoptsBrotli(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// zstd 系より brotli が確実に勝つテキスト(実測根拠は RESEARCH §4.20)。
 	// 完全な繰り返しでは zstd の LZ だけで極小になり優劣が付かないため、
@@ -214,6 +220,7 @@ func TestOptimizeAdoptsBrotli(t *testing.T) {
 // TestRecompressPassCoversNonRegionChunks は「リージョンに入らない単独
 // チャンク」もオフライン最強再圧縮の対象になることを検証する(適用漏れ修正)。
 func TestRecompressPassCoversNonRegionChunks(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 単一チャンク(1チャンク=リージョン束不可、類似相手もなし)の
 	// ログ様テキスト(brotli が決定的に勝つ種別)

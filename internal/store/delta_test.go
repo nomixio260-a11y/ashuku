@@ -16,6 +16,7 @@ func mutate(data []byte, positions ...int) []byte {
 }
 
 func TestDeltaCompressionOnSimilarChunks(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 乱数データは通常圧縮ではまったく縮まない。
 	// わずかに編集した2つ目は、デルタ圧縮なら差分だけの保存になるはず。
@@ -49,6 +50,7 @@ func TestDeltaCompressionOnSimilarChunks(t *testing.T) {
 // 完全一致の重複排除が全滅する(FastCDC の退化ケース)。
 // デルタ圧縮はこのケースを内容の類似性で救済する。
 func TestDeltaRescuesShiftedPeriodicData(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	gen1 := repetitiveData(6 << 20)
 	gen2 := append([]byte("=== gen2 header ==="), gen1...)
@@ -72,6 +74,7 @@ func TestDeltaRescuesShiftedPeriodicData(t *testing.T) {
 }
 
 func TestDeltaBaseSurvivesDeletion(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	base := randomData(t, 1<<20)
 	edited := mutate(base, 2000)
@@ -105,6 +108,7 @@ func TestDeltaBaseSurvivesDeletion(t *testing.T) {
 }
 
 func TestDeltaDisabled(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := Open(dir, Config{DisableDelta: true})
 	if err != nil {
@@ -123,6 +127,7 @@ func TestDeltaDisabled(t *testing.T) {
 }
 
 func TestComputeFeaturesSimilarity(t *testing.T) {
+	t.Parallel()
 	data := randomData(t, 512<<10)
 	edited := mutate(data, 100000)
 	f1 := computeFeatures(data)
@@ -154,6 +159,7 @@ func TestComputeFeaturesSimilarity(t *testing.T) {
 // 30世代の連続編集でデルタチェーン(深さ上限つき)が正しく機能し、
 // 全世代が復元できることを確認する。
 func TestDeltaChainManyGenerations(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	const gens = 30
 	cur := randomData(t, 1<<20)
@@ -196,6 +202,7 @@ func TestDeltaChainManyGenerations(t *testing.T) {
 // 深さ上限が小さくても、上限到達時は完全コピーではなく浅い祖先への
 // 張り替え(rebase)でデルタが継続することを確認する。
 func TestDeltaRebaseAtDepthLimit(t *testing.T) {
+	t.Parallel()
 	s, err := Open(t.TempDir(), Config{MaxDeltaDepth: 3})
 	if err != nil {
 		t.Fatal(err)
@@ -236,6 +243,7 @@ func TestDeltaRebaseAtDepthLimit(t *testing.T) {
 }
 
 func TestDeltaRoundTripLargeShared(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 複数チャンクにまたがるサイズで、部分編集+復元一致を確認
 	base := randomData(t, 5<<20)

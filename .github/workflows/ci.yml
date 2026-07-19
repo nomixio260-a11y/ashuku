@@ -1,15 +1,21 @@
-# CI: push / PR ごとに ビルド・整形・vet・全テスト・race を検証する。
-# cgo 経路(zlib precomp / libzstd-19)と CGO 無効ビルド(スタブ経路)の
-# 両方をビルドし、どちらの構成でも壊れないことを保証する。
+# CI: push / PR ごとに ビルド・整形・vet・全テスト・race・ファジングを検証する。
+#
+# 高速化のため独立した並列ジョブに分割し、壁時計時間を「全部の合計」から
+# 「一番長いジョブ」に落とす(旧: 単一ジョブ逐次 ~12分 → 並列 ~3分)。
+#   - lint    : gofmt / vet / cgo あり・なし両ビルド
+#   - test    : 全テスト(パッケージ内は t.Parallel でコア数まで並列)
+#   - race    : 並行系パッケージの race detector
+#   - fuzz    : precomp/store のファジング(ターゲットを3シャードに分けて並列)
+# 依存の取得・ビルドキャッシュは setup-go@v5 が go.sum を鍵に自動キャッシュする。
 name: CI
 on:
   push:
   pull_request:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -25,17 +31,59 @@ jobs:
         run: go build ./...
       - name: ビルド(CGO_ENABLED=0 スタブ経路)
         run: CGO_ENABLED=0 go build ./...
-      - name: 全テスト
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cgo 依存
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
+      - name: 全テスト(パッケージ内は t.Parallel で並列)
         run: go test -timeout 30m ./...
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cgo 依存
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
       - name: race detector(並行系パッケージ)
-        run: go test -race ./internal/api/ ./internal/client/
-      - name: ファジング(precomp パーサ、各10秒)
+        # chunker は並行チャンク化のデータ競合回帰を守る(gear テーブル読取専用化)。
+        run: go test -race ./internal/api/ ./internal/client/ ./internal/chunker/
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: precomp-a
+            pkg: ./internal/precomp/
+            targets: FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzTryUnwrapProgressive FuzzTryUnwrapGIF
+          - shard: precomp-b
+            pkg: ./internal/precomp/
+            targets: FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzTryUnwrapJSONL FuzzReconstructContainer
+          - shard: store
+            pkg: ./internal/store/
+            targets: FuzzBCJRoundTrip FuzzBrotliDecode FuzzBzip2Decode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cgo 依存
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
+      - name: ファジング(${{ matrix.shard }}、各10秒)
         run: |
-          for f in FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzTryUnwrapProgressive FuzzTryUnwrapGIF FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzTryUnwrapJSONL FuzzReconstructContainer; do
-            go test ./internal/precomp/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
-          done
-      - name: ファジング(store コーデック、各10秒)
-        run: |
-          for f in FuzzBCJRoundTrip FuzzBrotliDecode FuzzBzip2Decode; do
-            go test ./internal/store/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
+          for f in ${{ matrix.targets }}; do
+            go test ${{ matrix.pkg }} -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
           done

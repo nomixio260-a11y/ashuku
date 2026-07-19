@@ -45,6 +45,7 @@ func chunkFileCount(t *testing.T, s *Store) int {
 // TestSmallRepsGoToPacks は小さな表現(デルタ)がパックに集約され、
 // 個別ファイルを作らないことを確認する。
 func TestSmallRepsGoToPacks(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	// 類似世代を投入 → 2世代目以降のチャンクは小さなデルタになる
 	base := randomData(t, 2<<20)
@@ -72,6 +73,7 @@ func TestSmallRepsGoToPacks(t *testing.T) {
 
 // TestPackRoundTrip はパック格納された表現からの復元一致を確認する。
 func TestPackRoundTrip(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	base := randomData(t, 1<<20)
 	m1 := putBytes(t, s, "v1", base)
@@ -94,6 +96,9 @@ func TestPackRoundTrip(t *testing.T) {
 // 領域が解放されるのはチェーン末尾側(新しい世代)を削除したときである。
 // ここでは新しい15世代を削除して古い世代を残す。
 func TestPackCompactionReclaimsDisk(t *testing.T) {
+	// このテストはパッケージ大域変数 compactMinSize を書き換えるので、
+	// t.Parallel() にしない(直列フェーズで実行され、並列テスト群が
+	// compactMinSize を読む前に Cleanup で必ず復元される=データ競合なし)。
 	// テストデータは小さいので、コンパクション対象の下限を下げる
 	orig := compactMinSize
 	compactMinSize = 1
@@ -149,6 +154,7 @@ func TestPackCompactionReclaimsDisk(t *testing.T) {
 // TestPackFullDeleteThenCompact は全削除+コンパクションで
 // 非現行パックが物理削除されることを確認する。
 func TestPackFullDeleteThenCompact(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	base := randomData(t, 1<<20)
 	var ids []string
@@ -179,6 +185,7 @@ func TestPackFullDeleteThenCompact(t *testing.T) {
 // TestPackPersistsAcrossReopen はストアを開き直してもパック格納の
 // 表現が読めることを確認する(現行パックの引き継ぎ)。
 func TestPackPersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := Open(dir, Config{})
 	if err != nil {

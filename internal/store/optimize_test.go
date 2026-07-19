@@ -32,6 +32,7 @@ func driftedStore(t *testing.T, gens int) (*Store, []string, [][]byte) {
 }
 
 func TestOptimizeReducesPhysicalAndPreservesData(t *testing.T) {
+	t.Parallel()
 	s, ids, contents := driftedStore(t, 30)
 
 	before, _ := s.Stats()
@@ -65,6 +66,7 @@ func TestOptimizeReducesPhysicalAndPreservesData(t *testing.T) {
 }
 
 func TestOptimizeIsIdempotent(t *testing.T) {
+	t.Parallel()
 	s, _, _ := driftedStore(t, 20)
 
 	if _, err := s.Optimize(); err != nil {
@@ -88,6 +90,7 @@ func TestOptimizeIsIdempotent(t *testing.T) {
 }
 
 func TestOptimizeThenDeleteReleasesEverything(t *testing.T) {
+	t.Parallel()
 	s, ids, _ := driftedStore(t, 20)
 
 	if _, err := s.Optimize(); err != nil {
@@ -109,6 +112,7 @@ func TestOptimizeThenDeleteReleasesEverything(t *testing.T) {
 // 世代のデルタがベース参照で古いチャンクを生かし続ける」保持期限削除の
 // 問題が、Optimize のゾンビ救出で解決されることを確認する。
 func TestZombieRescueAfterRetentionDelete(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 
 	// 10世代のチェーンを作り、最新の1世代だけ残して古い9世代を削除
@@ -159,6 +163,7 @@ func TestZombieRescueAfterRetentionDelete(t *testing.T) {
 }
 
 func TestOptimizeOnEmptyStore(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	res, err := s.Optimize()
 	if err != nil {
@@ -172,6 +177,7 @@ func TestOptimizeOnEmptyStore(t *testing.T) {
 // インクリメンタル最適化は新着データだけを対象に、フルパスと同等の
 // リージョン化・小チャンクソリッド圧縮を行う(作業キュー駆動)。
 func TestOptimizeIncremental(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	data := regionCorpus(t, 20<<20)
 	m := putBytes(t, s, "big", data)
@@ -216,6 +222,7 @@ func TestOptimizeIncremental(t *testing.T) {
 
 // フルパスは作業キューを空にする(インクリメンタルとの引き継ぎ)。
 func TestOptimizeFullClearsQueues(t *testing.T) {
+	t.Parallel()
 	s := newTestStore(t)
 	putBytes(t, s, "a", repetitiveData(3<<20))
 	if _, err := s.Optimize(); err != nil {

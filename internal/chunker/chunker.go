@@ -6,8 +6,6 @@ package chunker
 import (
 	"errors"
 	"io"
-
-	fastcdc "github.com/jotfs/fastcdc-go"
 )
 
 // DefaultAverageSize はデフォルトの平均チャンクサイズ(1MiB)。
@@ -22,34 +20,30 @@ type Chunk struct {
 
 // Chunker は io.Reader をチャンク列に分割する。
 type Chunker struct {
-	cdc *fastcdc.Chunker
+	cdc *cdc
 }
 
 // New は r を平均 avgSize バイトのチャンクに分割するチャンカーを作る。
-// 下限は avgSize/4、上限は avgSize*4。
+// 下限は avgSize/4、上限は avgSize*4。gear テーブルは読み取り専用なので
+// 複数の Chunker を並行に使ってもデータ競合しない。
 func New(r io.Reader, avgSize int) (*Chunker, error) {
 	if avgSize <= 0 {
 		avgSize = DefaultAverageSize
 	}
-	cdc, err := fastcdc.NewChunker(r, fastcdc.Options{
-		MinSize:     avgSize / 4,
-		AverageSize: avgSize,
-		MaxSize:     avgSize * 4,
-	})
-	if err != nil {
-		return nil, err
+	if avgSize < 4 {
+		return nil, errors.New("avgSize が小さすぎます")
 	}
-	return &Chunker{cdc: cdc}, nil
+	return &Chunker{cdc: newCDC(r, avgSize)}, nil
 }
 
 // Next は次のチャンクを返す。入力の終端では io.EOF を返す。
 func (c *Chunker) Next() (Chunk, error) {
-	ch, err := c.cdc.Next()
+	data, err := c.cdc.next()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return Chunk{}, io.EOF
 		}
 		return Chunk{}, err
 	}
-	return Chunk{Data: ch.Data}, nil
+	return Chunk{Data: data}, nil
 }
