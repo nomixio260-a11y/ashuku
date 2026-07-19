@@ -91,11 +91,13 @@ func findBox(b []byte, typ string) []byte {
 
 // mp4Track は1ビデオトラックのサンプル表。
 type mp4Track struct {
-	lenSize int
-	spsList [][]byte
-	ppsList [][]byte
-	sizes   []int
-	offsets []int64
+	lenSize    int
+	trackID    uint32
+	fragmented bool
+	spsList    [][]byte
+	ppsList    [][]byte
+	sizes      []int
+	offsets    []int64
 }
 
 // parseMP4VideoTrack は avc1 トラックのサンプル表を取り出す(1本のみ対応)。
@@ -104,9 +106,7 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 	if moov == nil {
 		return nil, false
 	}
-	if findBox(moov, "mvex") != nil { // fragmented MP4 は対象外
-		return nil, false
-	}
+	fragmented := findBox(moov, "mvex") != nil
 	var tr *mp4Track
 	okAll := true
 	mp4Boxes(moov, func(t string, body []byte) bool {
@@ -160,7 +160,14 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 		if avcC == nil || len(avcC) < 7 {
 			return true
 		}
-		t2 := &mp4Track{lenSize: int(avcC[4]&3) + 1}
+		t2 := &mp4Track{lenSize: int(avcC[4]&3) + 1, fragmented: fragmented}
+		if tkhd := findBox(body, "tkhd"); len(tkhd) >= 24 {
+			if tkhd[0] == 0 {
+				t2.trackID = binary.BigEndian.Uint32(tkhd[12:])
+			} else {
+				t2.trackID = binary.BigEndian.Uint32(tkhd[20:])
+			}
+		}
 		// SPS/PPS リスト
 		p := 6
 		nSPS := int(avcC[5] & 0x1F)
@@ -200,6 +207,11 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 		}
 		uniform := int(binary.BigEndian.Uint32(stsz[4:8]))
 		cnt := int(binary.BigEndian.Uint32(stsz[8:12]))
+		if cnt == 0 && fragmented {
+			// fMP4: サンプルは moof/trun 側。空のトラックとして受理。
+			tr = t2
+			return true
+		}
 		if cnt <= 0 || cnt > 1<<22 {
 			return true
 		}
@@ -282,6 +294,150 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 	return tr, true
 }
 
+// mp4FragmentSamples は moof/traf/trun からビデオサンプルの (off,size) を集める。
+func mp4FragmentSamples(file []byte, trackID uint32) ([][2]int64, bool) {
+	var out [][2]int64
+	pos := 0
+	n := len(file)
+	for pos+8 <= n {
+		size := int(binary.BigEndian.Uint32(file[pos:]))
+		typ := string(file[pos+4 : pos+8])
+		hdr := 8
+		if size == 1 {
+			if pos+16 > n {
+				return nil, false
+			}
+			s64 := binary.BigEndian.Uint64(file[pos+8:])
+			if s64 > uint64(n-pos) {
+				return nil, false
+			}
+			size = int(s64)
+			hdr = 16
+		} else if size == 0 {
+			size = n - pos
+		}
+		if size < hdr || pos+size > n {
+			return nil, false
+		}
+		if typ == "moof" {
+			moofStart := int64(pos)
+			body := file[pos+hdr : pos+size]
+			okTraf := true
+			mp4Boxes(body, func(bt string, bb []byte) bool {
+				if bt != "traf" {
+					return true
+				}
+				tfhd := findBox(bb, "tfhd")
+				if tfhd == nil || len(bb) < 8 || len(tfhd) < 8 {
+					okTraf = false
+					return false
+				}
+				flags := binary.BigEndian.Uint32(tfhd[0:4]) & 0xFFFFFF
+				tid := binary.BigEndian.Uint32(tfhd[4:8])
+				if tid != trackID {
+					return true // 音声等は骨格に残る
+				}
+				p := 8
+				base := moofStart // default-base-is-moof(0x020000)/暗黙(先頭 traf)
+				if flags&0x1 != 0 {
+					if p+8 > len(tfhd) {
+						okTraf = false
+						return false
+					}
+					base = int64(binary.BigEndian.Uint64(tfhd[p:]))
+					p += 8
+				}
+				if flags&0x2 != 0 {
+					p += 4
+				}
+				if flags&0x8 != 0 {
+					p += 4
+				}
+				defSize := int64(-1)
+				if flags&0x10 != 0 {
+					if p+4 > len(tfhd) {
+						okTraf = false
+						return false
+					}
+					defSize = int64(binary.BigEndian.Uint32(tfhd[p:]))
+					p += 4
+				}
+				cur := base
+				sawTrun := false
+				mp4Boxes(bb, func(ct string, cb []byte) bool {
+					if ct != "trun" || !okTraf {
+						return true
+					}
+					if len(cb) < 8 {
+						okTraf = false
+						return false
+					}
+					tflags := binary.BigEndian.Uint32(cb[0:4]) & 0xFFFFFF
+					scount := int(binary.BigEndian.Uint32(cb[4:8]))
+					if scount < 0 || scount > 1<<20 {
+						okTraf = false
+						return false
+					}
+					q := 8
+					if tflags&0x1 != 0 {
+						if q+4 > len(cb) {
+							okTraf = false
+							return false
+						}
+						cur = base + int64(int32(binary.BigEndian.Uint32(cb[q:])))
+						q += 4
+					} else if !sawTrun {
+						okTraf = false // 先頭 trun に data_offset なしは対象外
+						return false
+					}
+					sawTrun = true
+					if tflags&0x4 != 0 {
+						q += 4
+					}
+					per := 0
+					if tflags&0x100 != 0 {
+						per += 4
+					}
+					szOff := -1
+					if tflags&0x200 != 0 {
+						szOff = per
+						per += 4
+					}
+					if tflags&0x400 != 0 {
+						per += 4
+					}
+					if tflags&0x800 != 0 {
+						per += 4
+					}
+					if q+scount*per > len(cb) {
+						okTraf = false
+						return false
+					}
+					for i := 0; i < scount; i++ {
+						sz := defSize
+						if szOff >= 0 {
+							sz = int64(binary.BigEndian.Uint32(cb[q+i*per+szOff:]))
+						}
+						if sz < 0 {
+							okTraf = false
+							return false
+						}
+						out = append(out, [2]int64{cur, sz})
+						cur += sz
+					}
+					return true
+				})
+				return okTraf
+			})
+			if !okTraf {
+				return nil, false
+			}
+		}
+		pos += size
+	}
+	return out, len(out) > 0
+}
+
 // TryUnwrapMP4H264 は MP4 内の H.264 CAVLC サンプルを再符号化する。
 func TryUnwrapMP4H264(orig []byte, maxPlain int64) (*MP4H264Unwrapped, bool) {
 	if maxPlain <= 0 || maxPlain > maxPlainTotal {
@@ -291,7 +447,7 @@ func TryUnwrapMP4H264(orig []byte, maxPlain int64) (*MP4H264Unwrapped, bool) {
 		return nil, false
 	}
 	tr, ok := parseMP4VideoTrack(orig)
-	if !ok || len(tr.offsets) == 0 {
+	if !ok || (len(tr.offsets) == 0 && !tr.fragmented) {
 		return nil, false
 	}
 	// サンプルをファイルオフセット順に(重複・範囲外は対象外)
@@ -299,9 +455,21 @@ func TryUnwrapMP4H264(orig []byte, maxPlain int64) (*MP4H264Unwrapped, bool) {
 		off  int64
 		size int
 	}
-	samples := make([]sample, len(tr.offsets))
-	for i := range tr.offsets {
-		samples[i] = sample{tr.offsets[i], tr.sizes[i]}
+	var samples []sample
+	if tr.fragmented && len(tr.offsets) == 0 {
+		frs, ok := mp4FragmentSamples(orig, tr.trackID)
+		if !ok {
+			return nil, false
+		}
+		samples = make([]sample, len(frs))
+		for i, fs := range frs {
+			samples[i] = sample{fs[0], int(fs[1])}
+		}
+	} else {
+		samples = make([]sample, len(tr.offsets))
+		for i := range tr.offsets {
+			samples[i] = sample{tr.offsets[i], tr.sizes[i]}
+		}
 	}
 	sort.Slice(samples, func(a, b int) bool { return samples[a].off < samples[b].off })
 	var last int64

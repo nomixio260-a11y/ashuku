@@ -32,3 +32,21 @@ func TestTSRejectsGarbage(t *testing.T) {
 		t.Fatal("ゴミが採用された")
 	}
 }
+
+// TestFragMP4Pipeline は fragmented MP4 の採用+往復一致を確認する。
+func TestFragMP4Pipeline(t *testing.T) {
+	orig, err := os.ReadFile("testdata/h264/frag.mp4")
+	if err != nil {
+		t.Skip(err)
+	}
+	u, ok := TryUnwrapMP4H264(orig, 0)
+	if !ok {
+		t.Fatal("frag.mp4: 採用されなかった")
+	}
+	rt, err := ReconstructMP4H264(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatal("frag.mp4: 往復不一致")
+	}
+	t.Logf("frag.mp4: %dB → %dB(-%.2f%%)", len(orig), len(u.Chunked),
+		100*float64(len(orig)-len(u.Chunked))/float64(len(orig)))
+}
