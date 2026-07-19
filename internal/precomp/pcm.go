@@ -17,7 +17,12 @@ package precomp
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 )
+
+func absF(x float64) float64   { return math.Abs(x) }
+func roundF(x float64) float64 { return math.Round(x) }
+func isNaNInf(x float64) bool  { return math.IsNaN(x) || math.IsInf(x, 0) }
 
 // IsWAV は RIFF/WAVE シグネチャを判定する。
 func IsWAV(head []byte) bool {
@@ -33,9 +38,12 @@ type WAVRecipe struct {
 	Channels  int     `json:"ch"`           // チャンネル数
 	Bytes     int     `json:"bps"`          // 1サンプルのバイト数(1..4)
 	Frames    int     `json:"fr"`           // フレーム数(= サンプル数/ch)
-	Orders    []uint8 `json:"ord"`          // 予測次数。BlockSize>0 なら [ch][block] を平坦化、0 ならチャンネルごと
+	Orders    []uint8 `json:"ord"`          // 予測種別。BlockSize>0 なら [ch][block] を平坦化。0〜4=固定次数、0xFF=LPC
 	BigEndian bool    `json:"be,omitempty"` // AIFF は真(サンプルがビッグエンディアン)
 	BlockSize int     `json:"bs,omitempty"` // ブロック適応次数のブロック長(0=チャンネル一律)
+	// LPCData は LPC ブロックのパラメータをブロック順に連結したもの。
+	// 各 LPC ブロック: shift(1) + order*int16LE 係数。
+	LPCData []byte `json:"lpc,omitempty"`
 }
 
 // WAVUnwrapped は分解結果。
@@ -44,7 +52,14 @@ type WAVUnwrapped struct {
 	Recipe  *WAVRecipe
 }
 
-const wavMaxOrder = 3
+const wavMaxOrder = 4 // FLAC 固定予測子は 0〜4
+
+// LPC 設定
+const (
+	lpcOrder  = 8    // 適応線形予測の次数
+	lpcQBits  = 12   // 係数の量子化ビット幅(符号付き)
+	lpcMarker = 0xFF // Orders 内で「このブロックは LPC」を表す値
+)
 
 // TryUnwrapWAV は WAV の PCM サンプルを予測残差のバイト平面に変換する。
 func TryUnwrapWAV(orig []byte, maxPlain int64) (*WAVUnwrapped, bool) {
@@ -97,48 +112,62 @@ func tryUnwrapPCM(orig []byte, ch, bps, dataOff, dataLen int, bigEndian bool, ma
 		}
 	}
 
-	// ブロック適応: チャンネルごとに blockSize サンプル区間で最良次数を選ぶ
-	// (連続履歴を保つのでブロック境界でも予測は途切れない)。無音/有音や
-	// 静→動で最適次数が変わる音声で縮む。
+	// ブロック適応の予測を2通り作って実測で選ぶ:
+	//  (a) 固定予測(次数0〜4)のみ — 残差に構造が残り byte-plane+zstd と相性が良い
+	//  (b) 固定 + LPC(適応線形予測、次数8)の best-of — 残差の振幅は小さいが白色化
+	// LPC は残差振幅を下げるが zstd の LZ で拾える構造を消すため、音源により
+	// (a)/(b) の優劣が逆転する。両方をバイト平面化して probe 圧縮し小さい方を採る。
 	blockSize := pcmBlockSize
-	nbPerCh := (frames + blockSize - 1) / blockSize
-	orders := make([]uint8, 0, ch*nbPerCh)
-	resid := make([][]uint32, ch)
-	for c := 0; c < ch; c++ {
-		ords, res := blockFixedResidual(chans[c], mask, blockSize)
-		orders = append(orders, ords...)
-		resid[c] = res
-	}
+	prefix := orig[:dataOff]
+	suffix := orig[dataOff+sampleBytes:]
 
-	// 残差をバイト平面(チャンネル→バイト位置→フレーム)に並べる。
-	payload := make([]byte, sampleBytes)
-	pos := 0
-	for c := 0; c < ch; c++ {
-		for b := 0; b < bps; b++ {
-			shift := uint(b * 8)
-			for f := 0; f < frames; f++ {
-				payload[pos] = byte(resid[c][f] >> shift)
-				pos++
+	buildCand := func(allowLPC bool) (chunked []byte, orders []uint8, lpcData []byte) {
+		nbPerCh := (frames + blockSize - 1) / blockSize
+		orders = make([]uint8, 0, ch*nbPerCh)
+		resid := make([][]uint32, ch)
+		for c := 0; c < ch; c++ {
+			ords, res, lpc := blockResidual(chans[c], mask, bps, blockSize, allowLPC)
+			orders = append(orders, ords...)
+			lpcData = append(lpcData, lpc...)
+			resid[c] = res
+		}
+		payload := make([]byte, sampleBytes)
+		pos := 0
+		for c := 0; c < ch; c++ {
+			for b := 0; b < bps; b++ {
+				sh := uint(b * 8)
+				for f := 0; f < frames; f++ {
+					payload[pos] = byte(resid[c][f] >> sh)
+					pos++
+				}
 			}
 		}
+		chunked = make([]byte, 0, len(prefix)+len(payload))
+		chunked = append(chunked, prefix...)
+		chunked = append(chunked, payload...)
+		return chunked, orders, lpcData
 	}
 
-	prefix := orig[:dataOff]
-	suffix := append([]byte(nil), orig[dataOff+sampleBytes:]...)
-	chunked := make([]byte, 0, len(prefix)+len(payload))
-	chunked = append(chunked, prefix...)
-	chunked = append(chunked, payload...)
+	fixedChunk, fixedOrders, _ := buildCand(false)
+	lpcChunk, lpcOrders, lpcData := buildCand(true)
+	fixedProbe := len(jpegProbeEncoder.EncodeAll(fixedChunk, make([]byte, 0, len(fixedChunk)/2)))
+	lpcProbe := len(jpegProbeEncoder.EncodeAll(lpcChunk, make([]byte, 0, len(lpcChunk)/2)))
 
-	probe := jpegProbeEncoder.EncodeAll(chunked, make([]byte, 0, len(chunked)/2))
-	if len(probe)+len(suffix) >= len(orig) {
+	chunked, orders := fixedChunk, fixedOrders
+	best := fixedProbe
+	lpcOut := []byte(nil)
+	if lpcProbe < best {
+		chunked, orders, lpcOut, best = lpcChunk, lpcOrders, lpcData, lpcProbe
+	}
+	if best+len(suffix) >= len(orig) {
 		return nil, false
 	}
 	return &WAVUnwrapped{
 		Chunked: chunked,
 		Recipe: &WAVRecipe{
-			PrefixLen: dataOff, Suffix: suffix,
+			PrefixLen: dataOff, Suffix: append([]byte(nil), suffix...),
 			Channels: ch, Bytes: bps, Frames: frames, Orders: orders, BigEndian: bigEndian,
-			BlockSize: blockSize,
+			BlockSize: blockSize, LPCData: lpcOut,
 		},
 	}, true
 }
@@ -181,8 +210,13 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 		if len(recipe.Orders) != ch*nb {
 			return nil, errors.New("WAV ブロック次数の数が不一致")
 		}
+		lpc := recipe.LPCData
 		for c := 0; c < ch; c++ {
-			chans[c] = inverseBlockFixed(resid[c], recipe.Orders[c*nb:(c+1)*nb], mask, recipe.BlockSize)
+			var err error
+			chans[c], lpc, err = inverseBlock(resid[c], recipe.Orders[c*nb:(c+1)*nb], mask, bps, recipe.BlockSize, lpc)
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		if len(recipe.Orders) != ch {
@@ -210,44 +244,81 @@ func ReconstructWAV(recipe *WAVRecipe, chunked []byte) ([]byte, error) {
 
 // ---- 固定予測子(Shorten 系、特許フリー) ----
 
-// blockFixedResidual はチャンネルを blockSize 区間に分け、各区間で最良次数を
-// 選ぶ(履歴は連続)。orders は区間ごとの次数、res は全体の残差。
-func blockFixedResidual(x []uint32, mask uint32, blockSize int) ([]uint8, []uint32) {
+// signExt は b バイト無符号値を符号付き int64 に拡張する。
+func signExt(v uint32, bps int) int64 {
+	bits := uint(bps * 8)
+	half := uint32(1) << (bits - 1)
+	if v >= half {
+		return int64(v) - (int64(1) << bits)
+	}
+	return int64(v)
+}
+
+func residCostOf(r, mask uint32) uint64 {
+	half := (mask >> 1) + 1
+	if r >= half {
+		return uint64(mask - r + 1)
+	}
+	return uint64(r)
+}
+
+// blockResidual はチャンネルを blockSize 区間に分け、各区間で固定予測(0〜4)と
+// LPC の best-of を選ぶ(履歴は連続)。orders は区間ごとの種別(0〜4 or 0xFF)、
+// res は全体の残差、lpcData は LPC ブロックのパラメータ連結。
+func blockResidual(x []uint32, mask uint32, bps, blockSize int, allowLPC bool) ([]uint8, []uint32, []byte) {
 	n := len(x)
 	res := make([]uint32, n)
 	var orders []uint8
-	half := (mask >> 1) + 1
-	cost := func(r uint32) uint64 {
-		if r >= half {
-			return uint64(mask - r + 1)
-		}
-		return uint64(r)
-	}
+	var lpcData []byte
 	for s := 0; s < n; s += blockSize {
 		e := s + blockSize
 		if e > n {
 			e = n
 		}
+		// 固定予測の最良次数
 		bestOrd, bestCost := 0, ^uint64(0)
 		for ord := 0; ord <= wavMaxOrder; ord++ {
 			var cst uint64
 			for i := s; i < e; i++ {
-				cst += cost((x[i] - predictFixed(ord, x, i)) & mask)
+				cst += residCostOf((x[i]-predictFixed(ord, x, i))&mask, mask)
 			}
 			if cst < bestCost {
 				bestCost, bestOrd = cst, ord
 			}
 		}
-		for i := s; i < e; i++ {
-			res[i] = (x[i] - predictFixed(bestOrd, x, i)) & mask
+		// LPC を試す(allowLPC のときのみ)
+		qc, shift, ok := lpcQuantize(x, s, e, bps)
+		useLPC := false
+		var lpcCost uint64
+		if allowLPC && ok {
+			for i := s; i < e; i++ {
+				lpcCost += residCostOf((x[i]-lpcPredict(x, i, s, qc, shift, bps))&mask, mask)
+			}
+			if lpcCost < bestCost {
+				useLPC = true
+			}
 		}
-		orders = append(orders, uint8(bestOrd))
+		if useLPC {
+			for i := s; i < e; i++ {
+				res[i] = (x[i] - lpcPredict(x, i, s, qc, shift, bps)) & mask
+			}
+			orders = append(orders, lpcMarker)
+			lpcData = append(lpcData, byte(shift))
+			for _, c := range qc {
+				lpcData = append(lpcData, byte(uint16(c)), byte(uint16(c)>>8))
+			}
+		} else {
+			for i := s; i < e; i++ {
+				res[i] = (x[i] - predictFixed(bestOrd, x, i)) & mask
+			}
+			orders = append(orders, uint8(bestOrd))
+		}
 	}
-	return orders, res
+	return orders, res, lpcData
 }
 
-// inverseBlockFixed は blockFixedResidual の逆。
-func inverseBlockFixed(res []uint32, orders []uint8, mask uint32, blockSize int) []uint32 {
+// inverseBlock は blockResidual の逆。消費した lpcData の残りを返す。
+func inverseBlock(res []uint32, orders []uint8, mask uint32, bps, blockSize int, lpcData []byte) ([]uint32, []byte, error) {
 	n := len(res)
 	x := make([]uint32, n)
 	for bi, s := 0, 0; s < n; bi, s = bi+1, s+blockSize {
@@ -255,12 +326,112 @@ func inverseBlockFixed(res []uint32, orders []uint8, mask uint32, blockSize int)
 		if e > n {
 			e = n
 		}
-		ord := int(orders[bi])
-		for i := s; i < e; i++ {
-			x[i] = (res[i] + predictFixed(ord, x, i)) & mask
+		if orders[bi] == lpcMarker {
+			if len(lpcData) < 1+lpcOrder*2 {
+				return nil, nil, errors.New("WAV LPC データが不足")
+			}
+			shift := int(lpcData[0])
+			qc := make([]int32, lpcOrder)
+			for j := 0; j < lpcOrder; j++ {
+				qc[j] = int32(int16(uint16(lpcData[1+j*2]) | uint16(lpcData[2+j*2])<<8))
+			}
+			lpcData = lpcData[1+lpcOrder*2:]
+			for i := s; i < e; i++ {
+				x[i] = (res[i] + lpcPredict(x, i, s, qc, shift, bps)) & mask
+			}
+		} else {
+			ord := int(orders[bi])
+			for i := s; i < e; i++ {
+				x[i] = (res[i] + predictFixed(ord, x, i)) & mask
+			}
 		}
 	}
-	return x
+	return x, lpcData, nil
+}
+
+// lpcPredict は位置 i の LPC 予測値(mod 2^b)。ブロック先頭 s から order 本
+// 未満は 0 予測(残差=サンプルそのもの)にして端を単純化する。
+func lpcPredict(x []uint32, i, s int, qc []int32, shift, bps int) uint32 {
+	if i-s < len(qc) {
+		return 0
+	}
+	var acc int64
+	for j := 0; j < len(qc); j++ {
+		acc += int64(qc[j]) * signExt(x[i-1-j], bps)
+	}
+	return uint32(acc >> uint(shift))
+}
+
+// lpcQuantize はブロック [s,e) の LPC 係数を求めて量子化する。
+// 返り値: 量子化係数(order 本)、右シフト量、成功可否。
+func lpcQuantize(x []uint32, s, e, bps int) ([]int32, int, bool) {
+	n := e - s
+	if n <= lpcOrder*2 {
+		return nil, 0, false
+	}
+	// 自己相関(符号付きサンプル)
+	ac := make([]float64, lpcOrder+1)
+	for lag := 0; lag <= lpcOrder; lag++ {
+		var sum float64
+		for i := s + lag; i < e; i++ {
+			sum += float64(signExt(x[i], bps)) * float64(signExt(x[i-lag], bps))
+		}
+		ac[lag] = sum
+	}
+	if ac[0] == 0 {
+		return nil, 0, false
+	}
+	// Levinson-Durbin
+	lpc := make([]float64, lpcOrder)
+	errPow := ac[0]
+	for i := 0; i < lpcOrder; i++ {
+		r := -ac[i+1]
+		for j := 0; j < i; j++ {
+			r -= lpc[j] * ac[i-j]
+		}
+		r /= errPow
+		lpc[i] = r
+		for j := 0; j < i/2; j++ {
+			t := lpc[j]
+			lpc[j] += r * lpc[i-1-j]
+			lpc[i-1-j] += r * t
+		}
+		if i&1 == 1 {
+			lpc[i/2] += lpc[i/2] * r
+		}
+		errPow *= 1 - r*r
+		if errPow <= 0 {
+			return nil, 0, false
+		}
+	}
+	// 予測子は -lpc(pred = -Σ lpc[j]*x[i-1-j])。量子化。
+	maxc := 0.0
+	for _, c := range lpc {
+		if a := absF(c); a > maxc {
+			maxc = a
+		}
+	}
+	if maxc == 0 || isNaNInf(maxc) {
+		return nil, 0, false
+	}
+	// shift: 係数が qBits 符号付きに収まる最大シフト
+	shift := lpcQBits - 1
+	for (maxc*float64(int64(1)<<uint(shift))) >= float64(int64(1)<<(lpcQBits-1)) && shift > 0 {
+		shift--
+	}
+	qc := make([]int32, lpcOrder)
+	lim := int32(1)<<(lpcQBits-1) - 1
+	for j := range lpc {
+		q := int32(roundF(-lpc[j] * float64(int64(1)<<uint(shift))))
+		if q > lim {
+			q = lim
+		}
+		if q < -lim-1 {
+			q = -lim - 1
+		}
+		qc[j] = q
+	}
+	return qc, shift, true
 }
 
 // inverseFixed は残差からサンプルを逐次復元する。
@@ -285,8 +456,10 @@ func predictFixed(ord int, x []uint32, i int) uint32 {
 		return x[i-1]
 	case 2:
 		return 2*x[i-1] - x[i-2]
-	default: // 3
+	case 3:
 		return 3*x[i-1] - 3*x[i-2] + x[i-3]
+	default: // 4
+		return 4*x[i-1] - 6*x[i-2] + 4*x[i-3] - x[i-4]
 	}
 }
 
