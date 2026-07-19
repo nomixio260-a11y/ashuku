@@ -26,13 +26,15 @@ func TestMP4H264RoundTrip(t *testing.T) {
 }
 
 // TestMP4H264RejectsCABAC は CABAC の MP4 を素通しする。
-func TestMP4H264RejectsCABAC(t *testing.T) {
+// CABAC の P スライス入り(通常動画)は対象外のまま素通しされることを確認。
+// 全イントラ CABAC は §4.35 で採用対象になった(cabac_pipeline_test.go)。
+func TestMP4H264RejectsCABACPSlices(t *testing.T) {
 	orig, err := os.ReadFile("testdata/h264/v_cabac.mp4")
 	if err != nil {
 		t.Skip(err)
 	}
 	if _, ok := TryUnwrapMP4H264(orig, 1<<30); ok {
-		t.Fatal("CABAC MP4 が採用された(対象外のはず)")
+		t.Fatal("P スライス入り CABAC MP4 が採用された(対象外のはず)")
 	}
 }
 

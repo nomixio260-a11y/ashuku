@@ -190,6 +190,19 @@ func (e *cabacEncoder) flush() {
 	e.w.u1(v & 1)
 }
 
+// pcmInsert は I_PCM の生画素挿入(9.3.1)。encodeTerminate(1) のフラッシュ後に
+// 呼ぶ: pcm_alignment_zero_bit でバイト整列→生バイト→符号化器を再初期化
+// (9.3.4.1、firstBitFlag も立て直す)。
+func (e *cabacEncoder) pcmInsert(data []byte) {
+	for e.w.nbit%8 != 0 {
+		e.w.u1(0)
+	}
+	for _, b := range data {
+		e.w.u(uint32(b), 8)
+	}
+	e.low, e.rng, e.outstanding, e.firstBit = 0, 510, 0, true
+}
+
 // cabacInitStates はスライス開始時の全文脈初期化(9.3.1.1)。
 func cabacInitStates(states *[1024]uint8, sliceQPY int, isI bool, initIdc int) {
 	var tab *[2048]int8

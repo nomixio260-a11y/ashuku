@@ -13,6 +13,7 @@ type h264Capture struct {
 	ppsMap map[int]*h264PPS
 	enc    *rangeEncoder
 	model  *h264Model
+	cmodel *cabacSecModel // CABAC 二次確率(スライス跨ぎ持続、遅延生成)
 	nz     *h264NZ
 	coded  int
 }
@@ -83,8 +84,11 @@ func (c *h264Capture) captureNAL(nalData []byte) ([]byte, int, bool, error) {
 		return nil, 0, false, errH264Unsupported
 	}
 	sps := c.spsMap[pps.spsID]
-	if sps == nil || pps.entropyCodingMode {
+	if sps == nil {
 		return nil, 0, false, errH264Unsupported
+	}
+	if pps.entropyCodingMode {
+		return c.captureCABAC(rbsp, payload, sps, pps, typ, refIDC)
 	}
 	r := &h264Reader{b: payload}
 	sl, ok := parseSliceHeader(r, sps, pps, typ, refIDC)
@@ -103,12 +107,70 @@ func (c *h264Capture) captureNAL(nalData []byte) ([]byte, int, bool, error) {
 	return append([]byte(nil), rbsp[:hdrBytes]...), sl.headerBits, true, nil
 }
 
+// captureCABAC は CABAC I スライスを二次算術へ載せ替える(§4.35)。
+// 正準 CABAC 再符号化を並走させ、rebuild が生成するバイト列と原文の共通
+// 接頭辞長を求める。ヘッダブロブに [ヘッダ][delta 1B][tail] を埋め込み、
+// レシピ構造の変更なしで Annex B / MP4 両対応にする。
+// 対象は I スライスのみ(P/B は素通し)。
+func (c *h264Capture) captureCABAC(rbsp, payload []byte, sps *h264SPS, pps *h264PPS, typ, refIDC int) ([]byte, int, bool, error) {
+	r := &h264Reader{b: payload}
+	sl, ok := parseSliceHeader(r, sps, pps, typ, refIDC)
+	if !ok || (sl.sliceType != 2 && sl.sliceType != 7) {
+		return nil, 0, false, errH264Unsupported
+	}
+	hb := 1 + (sl.headerBits+7)/8 // NALヘッダ+スライスヘッダ+cabac 整列ビット
+	if hb >= len(rbsp) {
+		return nil, 0, false, errH264Unsupported
+	}
+	if c.cmodel == nil {
+		c.cmodel = newCabacSecModel()
+	}
+	var stD, stE [1024]uint8
+	cabacInitStates(&stD, sl.sliceQP, true, 0)
+	cabacInitStates(&stE, sl.sliceQP, true, 0)
+	cr := &h264Reader{b: rbsp, pos: hb * 8}
+	w := &h264Writer{}
+	sink := &cabacTeeSink{d: newCabacDecoder(cr), stD: &stD, rc: c.enc, m: c.cmodel,
+		ce: newCabacEncoder(w), stE: &stE}
+	mbState := newCabacMBState(sps.picWidthInMbs, sps.picHeightInMbs)
+	total := sps.picWidthInMbs * sps.picHeightInMbs
+	if !cabacISlice(sink, mbState, sl.firstMB, total, sl.sliceQP) {
+		return nil, 0, false, errH264Unsupported
+	}
+	if rem := len(rbsp)*8 - cr.pos; rem < 0 || rem > 16 {
+		return nil, 0, false, errH264Unsupported
+	}
+	for w.nbit%8 != 0 {
+		w.u1(0)
+	}
+	canon := w.b
+	origBody := rbsp[hb:]
+	match := 0
+	for match < len(canon) && match < len(origBody) && canon[match] == origBody[match] {
+		match++
+	}
+	delta := len(canon) - match
+	tail := origBody[match:]
+	// tail はエンコーダのフラッシュ差(通常 0〜2 バイト)。大きい場合は
+	// 正準側が本体で乖離している=非対応構文の可能性が高いので諦める。
+	if delta < 0 || delta > 255 || len(tail) > 64 {
+		return nil, 0, false, errH264Unsupported
+	}
+	hdr := make([]byte, 0, hb+1+len(tail))
+	hdr = append(hdr, rbsp[:hb]...)
+	hdr = append(hdr, byte(delta))
+	hdr = append(hdr, tail...)
+	c.coded++
+	return hdr, sl.headerBits, true, nil
+}
+
 // h264Rebuild は rebuild(算術→ビット)側のエンジン状態。
 type h264Rebuild struct {
 	spsMap map[int]*h264SPS
 	ppsMap map[int]*h264PPS
 	dec    *rangeDecoder
 	model  *h264Model
+	cmodel *cabacSecModel
 	nz     *h264NZ
 }
 
@@ -159,6 +221,9 @@ func (d *h264Rebuild) rebuildNAL(hdrRBSP []byte, hdrBits int) ([]byte, error) {
 	if !ok || sl.headerBits != hdrBits {
 		return nil, errH264BadRecipe
 	}
+	if pps.entropyCodingMode {
+		return d.rebuildCABAC(hdrRBSP, sps, sl)
+	}
 	if d.nz == nil || d.nz.mbW != sps.picWidthInMbs || d.nz.mbH != sps.picHeightInMbs {
 		d.nz = newH264NZ(sps.picWidthInMbs, sps.picHeightInMbs)
 	}
@@ -176,4 +241,40 @@ func (d *h264Rebuild) rebuildNAL(hdrRBSP []byte, hdrBits int) ([]byte, error) {
 		bw.u1(0)
 	}
 	return escapeRBSP(bw.b), nil
+}
+
+// rebuildCABAC は二次算術から CABAC スライスを正準再符号化し、capture 時に
+// 記録した [delta][tail] で原文バイト列へ正確に合わせる。
+func (d *h264Rebuild) rebuildCABAC(hdrRBSP []byte, sps *h264SPS, sl *h264Slice) ([]byte, error) {
+	hb := 1 + (sl.headerBits+7)/8
+	if len(hdrRBSP) < hb+1 {
+		return nil, errH264BadRecipe
+	}
+	delta := int(hdrRBSP[hb])
+	tail := hdrRBSP[hb+1:]
+	if d.cmodel == nil {
+		d.cmodel = newCabacSecModel()
+	}
+	var st [1024]uint8
+	cabacInitStates(&st, sl.sliceQP, true, 0)
+	w := &h264Writer{}
+	sink := &cabacRebuildSink{dec: d.dec, enc: newCabacEncoder(w), st: &st, m: d.cmodel}
+	mbState := newCabacMBState(sps.picWidthInMbs, sps.picHeightInMbs)
+	total := sps.picWidthInMbs * sps.picHeightInMbs
+	if !cabacISlice(sink, mbState, sl.firstMB, total, sl.sliceQP) {
+		return nil, errH264BadRecipe
+	}
+	for w.nbit%8 != 0 {
+		w.u1(0)
+	}
+	canon := w.b
+	match := len(canon) - delta
+	if match < 0 {
+		return nil, errH264BadRecipe
+	}
+	rbsp := make([]byte, 0, hb+match+len(tail))
+	rbsp = append(rbsp, hdrRBSP[:hb]...)
+	rbsp = append(rbsp, canon[:match]...)
+	rbsp = append(rbsp, tail...)
+	return escapeRBSP(rbsp), nil
 }

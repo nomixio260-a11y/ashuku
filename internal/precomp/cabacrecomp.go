@@ -66,14 +66,70 @@ func (s *cabacCaptureSink) intraPCM(mbSize int) bool {
 	return !s.d.err
 }
 
+// --- tee シンク(capture: 原CABAC復号 + 二次符号化 + 正準CABAC再符号化) ---
+//
+// 正準再符号化を capture 時に並走させるのは、rebuild が生成するバイト列
+// (=正準)と原文の共通接頭辞長を求め、末尾のフラッシュ差(エンコーダ依存、
+// 通常1バイト)を tail としてレシピに保存するため。これで任意エンコーダの
+// 出力を完全可逆にできる。
+
+type cabacTeeSink struct {
+	d   *cabacDecoder
+	stD *[1024]uint8
+	rc  *rangeEncoder
+	m   *cabacSecModel
+	ce  *cabacEncoder
+	stE *[1024]uint8
+}
+
+func (s *cabacTeeSink) decision(ctx int) int {
+	bin := s.d.decodeDecision(&s.stD[ctx])
+	s.rc.encodeBit(&s.m.ctx[ctx], bin)
+	s.ce.encodeDecision(&s.stE[ctx], bin)
+	return bin
+}
+func (s *cabacTeeSink) bypass() int {
+	bin := s.d.decodeBypass()
+	s.rc.encodeBitEq(bin)
+	s.ce.encodeBypass(bin)
+	return bin
+}
+func (s *cabacTeeSink) terminate() int {
+	bin := s.d.decodeTerminate()
+	s.rc.encodeBit(&s.m.term, bin)
+	s.ce.encodeTerminate(bin)
+	return bin
+}
+func (s *cabacTeeSink) failed() bool { return s.d.err }
+
+// intraPCM: 生画素バイトを二次符号へ素通しし、復号器・正準符号化器の両方を
+// バイト整列→再初期化する(terminate(1) のフラッシュは既に済んでいる)。
+func (s *cabacTeeSink) intraPCM(mbSize int) bool {
+	c := s.d.r.pos - 9 + cabacPCMAlign
+	pcmStart := (c + 7) &^ 7
+	pcmEnd := pcmStart + mbSize*8
+	if pcmEnd > len(s.d.r.b)*8 || pcmStart%8 != 0 {
+		s.d.err = true
+		return false
+	}
+	data := s.d.r.b[pcmStart/8 : pcmEnd/8]
+	for _, b := range data {
+		for k := 7; k >= 0; k-- {
+			s.rc.encodeBitEq(int(b>>uint(k)) & 1)
+		}
+	}
+	s.d.reinitAt(pcmEnd)
+	s.ce.pcmInsert(data)
+	return !s.d.err
+}
+
 // --- rebuild シンク(二次符号→CABAC 再符号化) ---
 
 type cabacRebuildSink struct {
-	dec    *rangeDecoder
-	enc    *cabacEncoder
-	st     *[1024]uint8
-	m      *cabacSecModel
-	pcmErr bool
+	dec *rangeDecoder
+	enc *cabacEncoder
+	st  *[1024]uint8
+	m   *cabacSecModel
 }
 
 func (s *cabacRebuildSink) decision(ctx int) int {
@@ -91,10 +147,18 @@ func (s *cabacRebuildSink) terminate() int {
 	s.enc.encodeTerminate(bin)
 	return bin
 }
-func (s *cabacRebuildSink) failed() bool { return s.pcmErr }
+func (s *cabacRebuildSink) failed() bool { return false }
 
-// intraPCM: I_PCM を含むスライスは rebuild 経路では非対応(往復検証で素通しへ退避)。
+// intraPCM: 二次符号から生画素バイトを復元し、正準符号化器へ挿入する。
 func (s *cabacRebuildSink) intraPCM(mbSize int) bool {
-	s.pcmErr = true
-	return false
+	data := make([]byte, mbSize)
+	for i := range data {
+		v := 0
+		for k := 0; k < 8; k++ {
+			v = v<<1 | s.dec.decodeBitEq()
+		}
+		data[i] = byte(v)
+	}
+	s.enc.pcmInsert(data)
+	return true
 }
