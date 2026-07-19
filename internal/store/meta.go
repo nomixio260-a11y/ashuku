@@ -216,6 +216,8 @@ type FileManifest struct {
 	PrecompBMP *precomp.BMPRecipe `json:"precomp_bmp,omitempty"`
 	// PrecompTIFF は非圧縮 TIFF の再構成レシピ。
 	PrecompTIFF *precomp.TIFFRecipe `json:"precomp_tiff,omitempty"`
+	// PrecompCSV は列指向 CSV 変換の再構成レシピ。
+	PrecompCSV *precomp.CSVRecipe `json:"precomp_csv,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -257,6 +259,8 @@ const (
 	EncodingBMPV1 = "bmp-filter-v1"
 	// EncodingTIFFV1 は非圧縮 TIFF のストリップを行予測フィルタで分解して保存。
 	EncodingTIFFV1 = "tiff-filter-v1"
+	// EncodingCSVV1 は矩形 CSV を列指向(+数値列 delta)に転置して保存。
+	EncodingCSVV1 = "csv-columnar-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

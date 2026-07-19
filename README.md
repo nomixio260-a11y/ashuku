@@ -66,6 +66,15 @@
   同種の小ファイル200個で −47%、小さなJSON 2000個で 7.7x=理論上限 8.9x の
   87%)。読み出しはリージョン単位でキャッシュされ、
   削除・低生存率リージョンの回収も自動です。
+- **CSV/区切りテキストの列指向(columnar)変換**: 矩形 CSV は「行 = 異種
+  フィールドの並び」なので行指向のまま圧縮すると型の違う値が交互に来て縮み
+  にくい。列ストア(Parquet)と同じ原理で**列指向に転置**すると各列が同種
+  (タイムスタンプ・列挙・数値)になり圧縮が桁違いに効きます。さらに近単調な
+  数値列を **delta(隣接差)符号化**。実測で行指向比 **-25%**(RESEARCH.md
+  §4.30)。転置は split/join の完全な逆変換で、矩形でありさえすれば引用符・
+  CRLF・非印字バイトもフィールド内容としてそのまま往復します。採用は「行指向
+  より確実に縮む時」だけで、**復元してバイト一致を検証してからのみ**適用+
+  読み出し時 SHA-256 検証。純Go。
 - **raw フォールバック**: 画像・動画など既に圧縮済みのデータは zstd では縮まないため、
   自動的に無圧縮で保存し、サイズ・CPU の無駄を防ぎます。
 - **参照カウント GC**: ファイル削除時、どのファイルからも参照されなくなったチャンク
@@ -155,7 +164,8 @@
 | データの種類 | 期待できる削減率(実測ベース) |
 |---|---|
 | バックアップ/スナップショット(世代保持) | **20〜80倍以上**(世代数に比例して増加。長期保持で数百倍も) |
-| ログ・テキスト・JSON/CSV | 5〜45倍 |
+| ログ・テキスト・JSON | 5〜45倍 |
+| CSV/区切りテキスト(矩形) | **6〜60倍**(列指向転置+数値 delta で行指向比 −25%、ビット一致復元) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
@@ -412,7 +422,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(github.com/jotfs/fastcdc-go)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / WAV / AIFF / BMP / TIFF 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / WAV / AIFF / BMP / TIFF / CSV列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス

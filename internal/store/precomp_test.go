@@ -627,3 +627,64 @@ func TestTIFFPrecompEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCSVPrecompEndToEnd は矩形 CSV を投入→列指向で分解採用→読み戻しビット
+// 一致→Optimize 後もビット一致、を実ストアで確認する。物理サイズが行指向の
+// 素通し保存より小さいことも確認する。
+func TestCSVPrecompEndToEnd(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	var b bytes.Buffer
+	b.WriteString("ts,user,action,latency_ms,bytes,ok,region\n")
+	regions := []string{"us-east", "us-west", "eu-central", "ap-south"}
+	acts := []string{"get", "put", "del", "list"}
+	ts := 1700000000
+	for i := 0; i < 20000; i++ {
+		ts += rng.Intn(5)
+		fmt.Fprintf(&b, "%d,user%d,%s,%d,%d,%d,%s\n",
+			ts, rng.Intn(5000), acts[rng.Intn(4)], rng.Intn(2000),
+			rng.Intn(1000000), rng.Intn(2), regions[rng.Intn(4)])
+	}
+	data := b.Bytes()
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "access.csv", data)
+	if m.Encoding != EncodingCSVV1 {
+		t.Fatalf("CSV が列指向分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+
+	// 列指向の物理サイズ < 素通し(precomp無効)で保存した物理サイズ。
+	s2 := newTestStore(t)
+	m2, err := s2.PutWithOptions("access.csv", bytes.NewReader(data), PutOptions{DisablePrecomp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Encoding != "" {
+		t.Fatalf("DisablePrecomp なのに分解された: %q", m2.Encoding)
+	}
+	st1, _ := s.Stats()
+	st2, _ := s2.Stats()
+	t.Logf("列指向 物理=%d / 行指向素通し 物理=%d (-%.1f%%)",
+		st1.PhysicalBytes, st2.PhysicalBytes,
+		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
+	if st1.PhysicalBytes >= st2.PhysicalBytes {
+		t.Fatalf("列指向が行指向より縮んでいない: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
+	}
+
+	// Optimize 後もビット一致・スクラブ緑。
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("Optimize 後の読み戻しが一致しない")
+	}
+	sr, err := s.Scrub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Corrupt) != 0 || len(sr.Missing) != 0 {
+		t.Fatalf("スクラブで破損検出: %+v", sr)
+	}
+}
