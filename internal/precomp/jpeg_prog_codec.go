@@ -444,11 +444,9 @@ func (pf *progFrame) encodeACRefine(pw *progWriter, sc *progScan, blk []int16) {
 			run++
 			continue
 		}
-		if v > 1 { // 既に有意 → 補正ビット(直近シンボルの後に出す)
-			pending = append(pending, v&1)
-			continue
-		}
-		// v==1: 新規有意
+		// ZRL 折り込み判定は(新規有意だけでなく)既存有意の直前でも行う
+		// (libjpeg と同一)。既存有意で発行した場合、その係数の補正ビットは
+		// ZRL には載らず次のシンボルへ持ち越される。
 		for run > 15 && k < eob {
 			pw.flushEOB()
 			pw.emitHuff(pw.acT, 0xF0)
@@ -458,6 +456,11 @@ func (pf *progFrame) encodeACRefine(pw *progWriter, sc *progScan, blk []int16) {
 			}
 			pending = pending[:0]
 		}
+		if v > 1 { // 既に有意 → 補正ビット(直近シンボルの後に出す)
+			pending = append(pending, v&1)
+			continue
+		}
+		// v==1: 新規有意
 		pw.flushEOB()
 		pw.emitHuff(pw.acT, run<<4|1)
 		sb := 0
@@ -474,7 +477,11 @@ func (pf *progFrame) encodeACRefine(pw *progWriter, sc *progScan, blk []int16) {
 	if run > 0 || len(pending) > 0 {
 		pw.eobrun++
 		pw.bitsBuf = append(pw.bitsBuf, pending...)
-		if pw.eobrun == 0x7FFF {
+		// libjpeg: EOBRUN カウンタ上限のほか、補正ビットバッファの溢れ
+		// (MAX_CORR_BITS=1000、次ブロックで最大 DCTSIZE2-1 ビット増える)
+		// を避けるため BE > 1000-64+1 でも強制フラッシュする。この一致が
+		// ないと補正ビット密度の高い画像でビット一致検証に失敗する。
+		if pw.eobrun == 0x7FFF || len(pw.bitsBuf) > 1000-64+1 {
 			pw.flushEOB()
 		}
 	}
