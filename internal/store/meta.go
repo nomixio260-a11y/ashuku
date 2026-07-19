@@ -220,6 +220,8 @@ type FileManifest struct {
 	PrecompCSV *precomp.CSVRecipe `json:"precomp_csv,omitempty"`
 	// PrecompJSONL は列指向 JSONL 変換の再構成レシピ。
 	PrecompJSONL *precomp.JSONLRecipe `json:"precomp_jsonl,omitempty"`
+	// PrecompH264 は H.264 CAVLC 再圧縮の再構成レシピ。
+	PrecompH264 *precomp.H264Recipe `json:"precomp_h264,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -265,6 +267,8 @@ const (
 	EncodingCSVV1 = "csv-columnar-v1"
 	// EncodingJSONLV1 は同一スキーマ JSONL を骨格+列指向値に分解して保存。
 	EncodingJSONLV1 = "jsonl-columnar-v1"
+	// EncodingH264V1 は H.264 CAVLC(Annex B)を文脈算術へ再符号化して保存。
+	EncodingH264V1 = "h264-cavlc-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

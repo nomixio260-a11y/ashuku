@@ -764,3 +764,49 @@ func TestJSONLPrecompEndToEnd(t *testing.T) {
 		t.Fatalf("スクラブで破損検出: %+v", sr)
 	}
 }
+
+// TestH264PrecompEndToEnd は CAVLC の H.264 を投入→文脈算術で分解採用→
+// 読み戻しビット一致→物理縮小、を実ストアで確認する。
+func TestH264PrecompEndToEnd(t *testing.T) {
+	t.Parallel()
+	files, _ := filepath.Glob("../precomp/testdata/h264/v_*.h264")
+	if len(files) == 0 {
+		t.Skip("h264 testdata なし")
+	}
+	s := newTestStore(t)
+	adopted := 0
+	for _, fn := range files {
+		orig, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := putBytes(t, s, filepath.Base(fn), orig)
+		if m.Encoding == EncodingH264V1 {
+			adopted++
+		}
+		if !bytes.Equal(getBytes(t, s, m.ID), orig) {
+			t.Fatalf("%s: 読み戻しがビット一致しない", fn)
+		}
+	}
+	if adopted == 0 {
+		t.Fatal("CAVLC H.264 が1つも分解されなかった")
+	}
+	st, _ := s.Stats()
+	t.Logf("採用 %d/%d 物理=%d", adopted, len(files), st.PhysicalBytes)
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, fn := range files {
+		orig, _ := os.ReadFile(fn)
+		var id string
+		l, _ := s.List("")
+		for _, f := range l {
+			if f.Name == filepath.Base(fn) {
+				id = f.ID
+			}
+		}
+		if !bytes.Equal(getBytes(t, s, id), orig) {
+			t.Fatalf("%s: Optimize 後の読み戻しが一致しない", fn)
+		}
+	}
+}
