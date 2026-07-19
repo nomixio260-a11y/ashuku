@@ -69,6 +69,9 @@ button:disabled{opacity:.5;cursor:default}
 .bar{height:6px;background:color-mix(in srgb,var(--line) 60%,transparent);border-radius:99px;overflow:hidden;margin-top:6px}
 .bar>div{height:100%;background:var(--acc);width:0%;transition:width .2s}
 #quota{margin-bottom:14px;font-size:12px;color:var(--dim)}
+.hint{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--acc);
+  border-radius:10px;padding:11px 14px;margin:0 0 14px;font-size:12.5px;color:var(--dim);line-height:1.7}
+.hint b{color:var(--text);font-weight:600}
 #drop{border:2px dashed var(--line);border-radius:14px;padding:22px 16px;text-align:center;
   color:var(--dim);margin:0 0 16px;transition:.15s;background:var(--panel);box-shadow:var(--shadow);cursor:pointer}
 #drop.hover{border-color:var(--acc);color:var(--text)}
@@ -120,6 +123,7 @@ button:disabled{opacity:.5;cursor:default}
   </div>
 
   <div class="stats" id="stats" aria-live="polite"></div>
+  <div id="ratioHint" class="hint" hidden></div>
   <div id="quota"></div>
 
   <div id="drop" role="button" tabindex="0" aria-label="ファイルをアップロード">
@@ -216,14 +220,31 @@ const iconFor = name => icons[(name.split(".").pop() || "").toLowerCase()] || "�
 async function loadStats() {
   try {
     const s = await (await api("/api/v1/stats")).json();
+    // 小さな削減も見えるよう、2倍未満は小数2桁で表示(1.0x が実は 1.02x のことがある)。
+    const r = s.total_ratio;
+    const ratioStr = (r < 2 ? r.toFixed(2) : r.toFixed(1)) + "<small>x</small>";
     $("stats").innerHTML = [
       ["保存データ(論理)", fmt(s.logical_bytes)],
       ["実ディスク使用量", fmt(s.physical_bytes)],
-      ["削減倍率", s.total_ratio.toFixed(1) + "<small>x</small>"],
+      ["削減倍率", ratioStr],
       ["節約できた容量", fmt(Math.max(0, s.saved_bytes))],
       ["ファイル数", s.file_count.toLocaleString("ja-JP")],
     ].map(([k,v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
-  } catch (e) { $("stats").innerHTML = ""; }
+    // 削減が小さいときは「なぜ縮まないか」を説明する(既圧縮データは可逆では縮まない)。
+    const hint = $("ratioHint");
+    if (s.logical_bytes > 0 && r < 1.15) {
+      hint.innerHTML = "ℹ️ 削減が小さいのは、アップロードされたデータの多くが" +
+        "<b>すでに圧縮済み</b>(動画 H.264/H.265・VP9・AV1、MP3/AAC 音声、zip・暗号化 など)" +
+        "だからです。これらは情報理論上、可逆では縮みません(どの可逆ツールでも同じ)。" +
+        "<b>大きく縮むのは</b>: バックアップ/スナップショット(20〜80倍)、" +
+        "ログ・テキスト・JSON・CSV(5〜45倍)、無圧縮メディア(WAV/BMP/TIFF)、" +
+        "JPEG 写真(可逆再圧縮で約1.3〜1.5倍)。" +
+        "試しにログやテキスト、同じファイルの複数世代を上げてみてください。";
+      hint.hidden = false;
+    } else {
+      hint.hidden = true;
+    }
+  } catch (e) { $("stats").innerHTML = ""; $("ratioHint").hidden = true; }
   try {
     const me = await (await api("/api/v1/me")).json();
     $("who").textContent = me.name ? `${me.name} としてログイン中${me.admin ? "(管理者)" : ""}` : "";
