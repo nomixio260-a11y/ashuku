@@ -218,6 +218,8 @@ type FileManifest struct {
 	PrecompTIFF *precomp.TIFFRecipe `json:"precomp_tiff,omitempty"`
 	// PrecompCSV は列指向 CSV 変換の再構成レシピ。
 	PrecompCSV *precomp.CSVRecipe `json:"precomp_csv,omitempty"`
+	// PrecompJSONL は列指向 JSONL 変換の再構成レシピ。
+	PrecompJSONL *precomp.JSONLRecipe `json:"precomp_jsonl,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -261,6 +263,8 @@ const (
 	EncodingTIFFV1 = "tiff-filter-v1"
 	// EncodingCSVV1 は矩形 CSV を列指向(+数値列 delta)に転置して保存。
 	EncodingCSVV1 = "csv-columnar-v1"
+	// EncodingJSONLV1 は同一スキーマ JSONL を骨格+列指向値に分解して保存。
+	EncodingJSONLV1 = "jsonl-columnar-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

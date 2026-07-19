@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsCSV(head))
+			precomp.IsTIFF(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -656,6 +656,21 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		m.Encoding = EncodingTIFFV1
 		m.PrecompTIFF = u.Recipe
 		m.precompPlain = u.Chunked
+	case precomp.IsJSONL(buf):
+		if u, ok := precomp.TryUnwrapJSONL(buf, s.precompMax); ok {
+			m.Encoding = EncodingJSONLV1
+			m.PrecompJSONL = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		// JSONL として分解できなくても、区切り文字的に CSV として通ることがある。
+		if u, ok := precomp.TryUnwrapCSV(buf, s.precompMax); ok {
+			m.Encoding = EncodingCSVV1
+			m.PrecompCSV = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		return false
 	case precomp.IsCSV(buf):
 		u, ok := precomp.TryUnwrapCSV(buf, s.precompMax)
 		if !ok {
@@ -1283,6 +1298,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructTIFF(m.PrecompTIFF, plain.Bytes())
 	case EncodingCSVV1:
 		orig, err = precomp.ReconstructCSV(m.PrecompCSV, plain.Bytes())
+	case EncodingJSONLV1:
+		orig, err = precomp.ReconstructJSONL(m.PrecompJSONL, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}

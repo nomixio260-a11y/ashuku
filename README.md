@@ -75,6 +75,14 @@
   CRLF・非印字バイトもフィールド内容としてそのまま往復します。採用は「行指向
   より確実に縮む時」だけで、**復元してバイト一致を検証してからのみ**適用+
   読み出し時 SHA-256 検証。純Go。
+- **JSONL(構造化ログ)の骨格分離+列指向変換**: 改行区切り JSON(構造化ログの
+  定番)は各行が「同じ骨格(キー名・区切り)+ 異なる値」でできています。1行を
+  **骨格**(値を 0x00 に潰した行)と**値の並び**に分け、全行の骨格が同一なら
+  骨格を1本だけ保存して値を列指向に転置(+数値列 delta)。実測で行指向比
+  **-27%**(RESEARCH.md §4.31)。**値の中身(エスケープ・数値表現・Unicode)を
+  一切解釈せず構造だけ触る**ので、JSON の複雑な規則に踏み込まずに完全可逆。
+  同一スキーマ行のみ対象で、入れ子・スキーマ違いは素通し。復元バイト一致検証
+  +読み出し時 SHA-256。純Go。
 - **raw フォールバック**: 画像・動画など既に圧縮済みのデータは zstd では縮まないため、
   自動的に無圧縮で保存し、サイズ・CPU の無駄を防ぎます。
 - **参照カウント GC**: ファイル削除時、どのファイルからも参照されなくなったチャンク
@@ -164,8 +172,9 @@
 | データの種類 | 期待できる削減率(実測ベース) |
 |---|---|
 | バックアップ/スナップショット(世代保持) | **20〜80倍以上**(世代数に比例して増加。長期保持で数百倍も) |
-| ログ・テキスト・JSON | 5〜45倍 |
+| ログ・テキスト | 5〜45倍 |
 | CSV/区切りテキスト(矩形) | **6〜60倍**(列指向転置+数値 delta で行指向比 −25%、ビット一致復元) |
+| JSONL(構造化ログ・同一スキーマ) | **6〜60倍**(骨格分離+列指向で行指向比 −27%、ビット一致復元) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
@@ -422,7 +431,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(github.com/jotfs/fastcdc-go)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / WAV / AIFF / BMP / TIFF / CSV列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス

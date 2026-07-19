@@ -31,7 +31,7 @@ jobs:
         run: go test -race ./internal/api/ ./internal/client/
       - name: ファジング(precomp パーサ、各10秒)
         run: |
-          for f in FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzTryUnwrapProgressive FuzzTryUnwrapGIF FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzReconstructContainer; do
+          for f in FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzTryUnwrapProgressive FuzzTryUnwrapGIF FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzTryUnwrapJSONL FuzzReconstructContainer; do
             go test ./internal/precomp/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
           done
       - name: ファジング(store コーデック、各10秒)

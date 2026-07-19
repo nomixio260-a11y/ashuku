@@ -688,3 +688,60 @@ func TestCSVPrecompEndToEnd(t *testing.T) {
 		t.Fatalf("スクラブで破損検出: %+v", sr)
 	}
 }
+
+// TestJSONLPrecompEndToEnd は同一スキーマ JSONL を投入→骨格+列指向で分解採用→
+// 読み戻しビット一致→行指向素通しより物理が小さい、を実ストアで確認する。
+func TestJSONLPrecompEndToEnd(t *testing.T) {
+	rng := rand.New(rand.NewSource(13))
+	regions := []string{"us-east", "us-west", "eu-central", "ap-south"}
+	acts := []string{"get", "put", "del", "list"}
+	var b bytes.Buffer
+	ts := 1700000000
+	for i := 0; i < 20000; i++ {
+		ts += rng.Intn(5)
+		fmt.Fprintf(&b, `{"ts":%d,"user":"user%d","action":"%s","latency_ms":%d,"bytes":%d,"ok":%t,"region":"%s"}`+"\n",
+			ts, rng.Intn(5000), acts[rng.Intn(4)], rng.Intn(2000),
+			rng.Intn(1000000), rng.Intn(2) == 0, regions[rng.Intn(4)])
+	}
+	data := b.Bytes()
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "events.jsonl", data)
+	if m.Encoding != EncodingJSONLV1 {
+		t.Fatalf("JSONL が列指向分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+
+	s2 := newTestStore(t)
+	m2, err := s2.PutWithOptions("events.jsonl", bytes.NewReader(data), PutOptions{DisablePrecomp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Encoding != "" {
+		t.Fatalf("DisablePrecomp なのに分解された: %q", m2.Encoding)
+	}
+	st1, _ := s.Stats()
+	st2, _ := s2.Stats()
+	t.Logf("列指向 物理=%d / 行指向素通し 物理=%d (-%.1f%%)",
+		st1.PhysicalBytes, st2.PhysicalBytes,
+		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
+	if st1.PhysicalBytes >= st2.PhysicalBytes {
+		t.Fatalf("列指向が行指向より縮んでいない: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
+	}
+
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("Optimize 後の読み戻しが一致しない")
+	}
+	sr, err := s.Scrub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Corrupt) != 0 || len(sr.Missing) != 0 {
+		t.Fatalf("スクラブで破損検出: %+v", sr)
+	}
+}
