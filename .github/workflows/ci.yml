@@ -36,6 +36,6 @@ jobs:
           done
       - name: ファジング(store コーデック、各10秒)
         run: |
-          for f in FuzzBCJRoundTrip FuzzBrotliDecode; do
+          for f in FuzzBCJRoundTrip FuzzBrotliDecode FuzzBzip2Decode; do
             go test ./internal/store/ -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
           done

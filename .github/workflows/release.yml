@@ -1,0 +1,74 @@
+# リリースビルド: 手動トリガー(workflow_dispatch)専用。
+#
+# 「準備は全部自動、押すだけ」を目的にした使い切りワークフロー。ボタン一つで
+#   - Go ツールチェーン + cgo 依存(zlib/libzstd)の用意
+#   - サーバー(cgo込み)と クライアント CLI(純Go・3 OS へクロスコンパイル)の
+#     配布用ビルド(-trimpath -ldflags "-s -w" でパス・シンボル除去)
+#   - SHA-256 チェックサム生成
+#   - 成果物(bin/*)を Actions の Artifact として添付(ダウンロード可能)
+# を全自動で行う。tag を打つと GitHub Release にも添付する(任意)。
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: 'GitHub Release も作成する(タグ名を release_tag に入れた場合)'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release を作る場合のタグ名(例 v0.1.0)。空なら Artifact のみ'
+        default: ''
+
+permissions:
+  contents: write   # Release 作成・アセット添付に必要(Artifact だけなら read で足りる)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: cgo 依存(zlib ヘッダ・libzstd ランタイム)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
+
+      - name: サニティ(vet + テスト)
+        run: |
+          go vet ./...
+          go test -timeout 30m ./...
+
+      - name: 配布バイナリをビルド(サーバー + クライアント3OS)
+        run: |
+          make release
+          make release-cli
+          ls -la bin/
+
+      - name: チェックサム生成
+        run: |
+          cd bin
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Artifact として添付
+        uses: actions/upload-artifact@v4
+        with:
+          name: ashuku-binaries
+          path: bin/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: GitHub Release に添付(任意・タグ指定時のみ)
+        if: ${{ inputs.make_release && inputs.release_tag != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$TAG" bin/* \
+            --title "ashuku $TAG" \
+            --notes "自動ビルド: サーバー(cgo) + クライアント CLI(linux/amd64, darwin/arm64, windows/amd64)。チェックサムは SHA256SUMS.txt を参照。" \
+            || gh release upload "$TAG" bin/* --clobber

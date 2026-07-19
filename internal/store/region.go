@@ -140,6 +140,8 @@ func (s *Store) readRegionRaw(id, codec string, rawTotal int64, useCache bool) (
 		if err == nil {
 			raw = bcjX86Decode(raw)
 		}
+	case compressionBz2:
+		raw, err = bzip2Decode(stored, rawTotal)
 	default:
 		raw, err = s.dec.DecodeAll(stored, make([]byte, 0, rawTotal))
 	}

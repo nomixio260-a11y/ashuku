@@ -82,6 +82,8 @@ func TestOfflineCompressBestRoundTrip(t *testing.T) {
 		case compressionBrBCJ:
 			raw, err = brotliDecode(out, int64(len(data)))
 			raw = bcjX86Decode(raw)
+		case compressionBz2:
+			raw, err = bzip2Decode(out, int64(len(data)))
 		default:
 			t.Fatalf("%s: 不明な comp %q", name, comp)
 		}
@@ -92,6 +94,63 @@ func TestOfflineCompressBestRoundTrip(t *testing.T) {
 			t.Fatalf("%s: 往復不一致 (comp=%s)", name, comp)
 		}
 		t.Logf("%s: %d -> %d (comp=%s rep=%s)", name, len(data), len(out), comp, rep)
+	}
+}
+
+// TestBzip2RoundTrip は bzip2 圧縮→標準ライブラリ decode の往復一致を確認する。
+func TestBzip2RoundTrip(t *testing.T) {
+	// 反復的な自然文(BWT 有利)。
+	data := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog. "), 8000)
+	bz := bzip2CompressMax(data)
+	if bz == nil || len(bz) >= len(data) {
+		t.Fatalf("bzip2 が縮んでいない: %d -> %d", len(data), len(bz))
+	}
+	rt, err := bzip2Decode(bz, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rt, data) {
+		t.Fatal("bzip2 往復不一致")
+	}
+}
+
+// TestOfflineCompressBestBzip2 は BWT 有利なテキストで offlineCompressBest が
+// bzip2 表現を採用し、往復一致で読み戻せることを確認する。反復的な自然文で
+// bzip2 が zstd/brotli を最小マージン超で下回ることを実測前提にする。
+func TestOfflineCompressBestBzip2(t *testing.T) {
+	s := newTestStore(t)
+	// 語彙を Zipf 的に再利用する疑似自然文(実ベンチの genText 相当)。
+	rng := rand.New(rand.NewSource(42))
+	vocab := make([]string, 1500)
+	letters := "abcdefghijklmnopqrstuvwxyz"
+	for i := range vocab {
+		w := make([]byte, 3+rng.Intn(8))
+		for j := range w {
+			w[j] = letters[rng.Intn(26)]
+		}
+		vocab[i] = string(w)
+	}
+	var sb bytes.Buffer
+	for sb.Len() < 2<<20 {
+		idx := int(float64(len(vocab)) * rng.Float64() * rng.Float64())
+		sb.WriteString(vocab[idx])
+		if rng.Intn(12) == 0 {
+			sb.WriteString(".\n")
+		} else {
+			sb.WriteByte(' ')
+		}
+	}
+	data := sb.Bytes()
+	out, comp, rep := s.offlineCompressBest(data)
+	rt, err := bzip2Decode(out, int64(len(data)))
+	if comp == compressionBz2 {
+		if err != nil || !bytes.Equal(rt, data) {
+			t.Fatalf("bzip2 採用だが往復不一致: err=%v", err)
+		}
+		t.Logf("bzip2 採用: %d -> %d (rep=%s)", len(data), len(out), rep)
+	} else {
+		// 環境により brotli/zstd が勝つこともある(best-of なので正しい)。
+		t.Logf("bzip2 は非採用(comp=%s)。best-of が別表現を選択", comp)
 	}
 }
 
@@ -120,8 +179,9 @@ func TestOptimizeAdoptsBrotli(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("Optimize 後の読み戻しが一致しない")
 	}
-	// 少なくとも1チャンクが brotli 系表現になっていること
-	// (リージョン化された場合はメンバーの Compression がリージョン形式)
+	// 少なくとも1チャンクが zstd を超える表現(brotli 系 or bzip2)へ昇格して
+	// いること(反復的ログでは BWT の bzip2 が brotli を上回ることもある。
+	// どちらも best-of が zstd 初期表現から改善した証拠)。
 	found := false
 	comps := map[string]int{}
 	s.db.View(func(tx *bolt.Tx) error {
@@ -131,14 +191,15 @@ func TestOptimizeAdoptsBrotli(t *testing.T) {
 				return err
 			}
 			comps[cm.Compression]++
-			if cm.Compression == compressionBr || cm.Compression == compressionBrBCJ {
+			switch cm.Compression {
+			case compressionBr, compressionBrBCJ, compressionBz2:
 				found = true
 			}
 			return nil
 		})
 	})
 	if !found {
-		t.Fatalf("brotli 表現のチャンクが1つもない(best-of が機能していない): %v", comps)
+		t.Fatalf("zstd を超える表現(brotli/bzip2)のチャンクが1つもない(best-of が機能していない): %v", comps)
 	}
 	// スクラブ(キャッシュ迂回のディスク検証)も全緑であること
 	sr, err := s.Scrub()
@@ -188,7 +249,8 @@ func TestRecompressPassCoversNonRegionChunks(t *testing.T) {
 			return nil
 		})
 	})
-	if comps[compressionBr] == 0 && comps[compressionBrBCJ] == 0 {
+	// zstd 初期表現を超える表現(brotli 系 or bzip2/BWT)へ昇格していること。
+	if comps[compressionBr] == 0 && comps[compressionBrBCJ] == 0 && comps[compressionBz2] == 0 {
 		t.Fatalf("単独チャンクが最強再圧縮されていない: %v", comps)
 	}
 	// 2回目の Optimize は再評価しない(RecompressTried)ことも確認

@@ -35,3 +35,15 @@ func FuzzBrotliDecode(f *testing.F) {
 		}
 	})
 }
+
+func FuzzBzip2Decode(f *testing.F) {
+	f.Add([]byte{})
+	f.Add(bzip2CompressMax([]byte("seed data for bzip2 fuzz seed data for bzip2 fuzz")))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// 任意入力でパニックせず、上限を守ることだけを確認(標準ライブラリ decode)。
+		out, err := bzip2Decode(data, 1<<20)
+		if err == nil && len(out) > 1<<30 {
+			t.Fatal("上限を超えて伸長した")
+		}
+	})
+}

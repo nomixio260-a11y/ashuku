@@ -15,9 +15,11 @@ package store
 
 import (
 	"bytes"
+	stdbzip2 "compress/bzip2"
 	"io"
 
 	"github.com/andybalholm/brotli"
+	dsbzip2 "github.com/dsnet/compress/bzip2"
 )
 
 // 追加の保存表現タグ(ChunkMeta.Compression)。
@@ -25,16 +27,75 @@ const (
 	compressionBr      = "br"       // brotli 品質11
 	compressionZstdBCJ = "zstd-bcj" // BCJ 変換 + zstd
 	compressionBrBCJ   = "br-bcj"   // BCJ 変換 + brotli
+	compressionBz2     = "bz2"      // bzip2(BWT)品質9
+)
+
+// bz2MaxInput は bzip2 を試す入力サイズ上限。bzip2 のブロックは 900KiB
+// なので窓はそれ以上に伸びず、巨大ソリッドリージョンでは brotli の大窓が
+// 勝つ。加えて伸長は ~16MB/s と zstd/brotli より遅いため、コールド読みの
+// レイテンシを抑える意味でも入力を絞る(この範囲でこそ bzip2 の BWT が
+// テキスト・ログで勝つ。best-of なので上限外でも安全に不採用になるだけ)。
+const bz2MaxInput = 12 << 20
+
+// bz2MinGainNum/Den は bzip2 採用の最小マージン(既定の best-of は同点でも
+// 採るが、bzip2 は伸長が遅いので「ある程度縮む時だけ」採用してレイテンシ
+// コストを実利で相殺する)。ここでは brotli/zstd 最小比で 1.5% 以上縮む
+// 場合のみ採用する。
+const (
+	bz2MinGainNum = 985
+	bz2MinGainDen = 1000
 )
 
 // independentComp は「単体で完結する保存表現」(デルタ・リージョン参照で
 // ない)かを返す。リージョン化・パック化の対象判定に使う。
 func independentComp(c string) bool {
 	switch c {
-	case compressionZstd, compressionRaw, compressionBr, compressionZstdBCJ, compressionBrBCJ:
+	case compressionZstd, compressionRaw, compressionBr, compressionZstdBCJ, compressionBrBCJ, compressionBz2:
 		return true
 	}
 	return false
+}
+
+// bzip2CompressMax は bzip2 品質9(BWT ブロック 900KiB)で圧縮する。
+// エンコードは dsnet 実装(offline 専用)。失敗時は nil。
+func bzip2CompressMax(data []byte) []byte {
+	var buf bytes.Buffer
+	w, err := dsbzip2.NewWriter(&buf, &dsbzip2.WriterConfig{Level: 9})
+	if err != nil {
+		return nil
+	}
+	if _, err := w.Write(data); err != nil {
+		_ = w.Close()
+		return nil
+	}
+	if err := w.Close(); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// bzip2Decode は bzip2 ストリームを伸長する。伸長は標準ライブラリの
+// compress/bzip2(純Go・decode 専用・常に利用可能)を使うため、CGO 無効
+// ビルドでも読み出せる。採用前の往復検証もこの経路で行うので、読み出し
+// 経路と検証経路が完全に一致する。sizeHint は容量事前確保のみに使う。
+func bzip2Decode(stored []byte, sizeHint int64) ([]byte, error) {
+	const hardCap = 1 << 30
+	r := stdbzip2.NewReader(bytes.NewReader(stored))
+	out := make([]byte, 0, sizeHint)
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := r.Read(buf)
+		out = append(out, buf[:n]...)
+		if int64(len(out)) > hardCap {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // brotliCompressMax は brotli 品質11・大窓(lgwin=24)で圧縮する。
@@ -163,6 +224,18 @@ func (s *Store) offlineCompressBest(data []byte) ([]byte, string, string) {
 				if rt, err := brotliDecode(br, int64(len(t))); err == nil && bytes.Equal(rt, t) {
 					best, comp, rep = br, compressionBrBCJ, "b11j"
 				}
+			}
+		}
+	}
+	// bzip2(BWT)は反復的な自然文・ログで LZ 系(zstd/brotli)を上回ることが
+	// ある(実測: text -9%, log -1%、RESEARCH.md §4.29)。伸長が遅いので
+	// 入力を絞り、最小マージンを満たし、標準ライブラリ decode で往復一致した
+	// 場合のみ採用する(best-of なので悪化はあり得ない)。
+	if len(data) <= bz2MaxInput {
+		if bz := bzip2CompressMax(data); bz != nil &&
+			len(bz)*bz2MinGainDen < len(best)*bz2MinGainNum {
+			if rt, err := bzip2Decode(bz, int64(len(data))); err == nil && bytes.Equal(rt, data) {
+				best, comp, rep = bz, compressionBz2, "bz9"
 			}
 		}
 	}
