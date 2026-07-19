@@ -195,10 +195,12 @@
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
 | H.264 動画(CAVLC = 監視・ドラレコ・DVR・旧機。生/MP4) | **1.05〜1.1倍**(−5〜8%、ビット一致復元) |
-| H.264 動画(CABAC = スマホ・現行機の実機構成 I/P/B+8x8。生/MP4) | **1.02〜1.04倍**(−2〜4%、ビット一致復元) |
+| H.264 動画(CABAC = スマホ・現行機の実機構成 I/P/B+8x8。生/MP4/**TS**) | **1.02〜1.04倍**(−2〜4%、ビット一致復元) |
+| MPEG-TS 録画(ドラレコ・DVR・テレビ録画・HLS セグメント) | 中の H.264 を再符号化(−2〜3%、ビット一致復元) |
+| MP3 音声 | 骨格分離+文脈算術で素の zstd 比 −0.5〜3% 上乗せ(全 MP3 採用、ビット一致復元) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
 | WAV/AIFF(非圧縮 PCM 音声) | **1.3〜2倍以上**(16bit で −25〜−38%、24bit・低エントロピー音源はさらに大 −88〜96%) |
-| H.265 以降の動画・MP3/AAC 音声(圧縮済み) | ほぼ1倍(raw保存にフォールバック、膨張はしない。重複排除は有効) |
+| H.265 以降の動画・AAC 音声(圧縮済み) | ほぼ1倍(raw保存にフォールバック、膨張はしない。重複排除は有効) |
 
 「テラ→数ギガ」が現実に成立するのは、**同じデータを繰り返し保存するバックアップ用途**
 (重複排除+類似デルタが支配的)や、**高冗長なログ・テキストデータ**の場合です。
@@ -450,7 +452,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4) / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
