@@ -1,7 +1,8 @@
+*.test
 /ashuku
-/data/
 /bin/
 /cli
-/mkpng
 /cmd/headroom/
+/data/
 /headroom
+/mkpng
