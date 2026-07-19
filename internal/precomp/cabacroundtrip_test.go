@@ -66,7 +66,7 @@ func TestCabacRoundTrip(t *testing.T) {
 
 	// --- capture: 全スライスを1本の二次ストリームへ ---
 	model := newCabacSecModel()
-	enc := newRcEncoder()
+	enc := newRangeEncoder()
 	for i, si := range slicesInfo {
 		cr := &h264Reader{b: si.rbsp, pos: si.cabacByte * 8}
 		var states [1024]uint8
@@ -79,11 +79,11 @@ func TestCabacRoundTrip(t *testing.T) {
 			t.Fatalf("capture スライス %d 失敗", i)
 		}
 	}
-	enc.flush()
+	enc.finish()
 
 	// --- rebuild: 二次ストリームから各スライスの CABAC バイトを再生 ---
 	rmodel := newCabacSecModel()
-	rdec := newRcDecoder(enc.out)
+	rdec := newRangeDecoder(enc.out)
 	maxTail := 0
 	for i, si := range slicesInfo {
 		w := &h264Writer{}

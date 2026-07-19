@@ -16,7 +16,7 @@ func TestCabacRecompMeasure(t *testing.T) {
 	spsMap := map[int]*h264SPS{}
 	ppsMap := map[int]*h264PPS{}
 	model := newCabacSecModel()
-	enc := newRcEncoder()
+	enc := newRangeEncoder()
 	var origBits, slices int
 	for _, nal := range nals {
 		typ := int(nal.data[0] & 0x1F)
@@ -64,7 +64,7 @@ func TestCabacRecompMeasure(t *testing.T) {
 			slices++
 		}
 	}
-	enc.flush()
+	enc.finish()
 	origBytes := (origBits + 7) / 8
 	secBytes := len(enc.out)
 	if slices == 0 {
