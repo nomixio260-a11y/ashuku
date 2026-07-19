@@ -182,6 +182,24 @@ func newH264NZ(mbW, mbH int) *h264NZ {
 	return nz
 }
 
+// fillMB は MB 全体の luma/chroma nz を一括で埋める(skip/I_PCM の高速路)。
+func (nz *h264NZ) fillMB(mbAddr int, v int16) {
+	bx := (mbAddr % nz.mbW) * 4
+	by := (mbAddr / nz.mbW) * 4
+	for y := 0; y < 4; y++ {
+		row := nz.luma[(by+y)*nz.mbW*4+bx:]
+		row[0], row[1], row[2], row[3] = v, v, v, v
+	}
+	cx := (mbAddr % nz.mbW) * 2
+	cy := (mbAddr / nz.mbW) * 2
+	for c := 0; c < 2; c++ {
+		for y := 0; y < 2; y++ {
+			row := nz.chroma[c][(cy+y)*nz.mbW*2+cx:]
+			row[0], row[1] = v, v
+		}
+	}
+}
+
 func (nz *h264NZ) setLuma(mbAddr, blk, count int) {
 	x := (mbAddr%nz.mbW)*4 + lumaBlkX[blk]
 	y := (mbAddr/nz.mbW)*4 + lumaBlkY[blk]

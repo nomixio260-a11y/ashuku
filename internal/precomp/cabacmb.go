@@ -198,20 +198,14 @@ func (st *cabacMBState) markSkipMB(mb int, isB bool) {
 		for i8 := 0; i8 < 4; i8++ {
 			st.refs[l][mb*4+i8] = v
 		}
-		for b := 0; b < 16; b++ {
-			st.mvdAbs[l][mb*16+b] = [2]uint8{}
-		}
+		copy(st.mvdAbs[l][mb*16:mb*16+16], zeroMvd16[:])
 	}
-	for blk := 0; blk < 16; blk++ {
-		st.nz.setLuma(mb, blk, 0)
-	}
-	for c := 0; c < 2; c++ {
-		for blk := 0; blk < 4; blk++ {
-			st.nz.setChroma(mb, c, blk, 0)
-		}
-	}
+	st.nz.fillMB(mb, 0)
 	st.lastDqpNonzero = false
 }
+
+// zeroMvd16 は mvd 一括クリア用のゼロ配列。
+var zeroMvd16 [16][2]uint8
 
 // markIntraPredState は intra MB の inter 近傍状態(ref/mvd/direct)を設定する。
 func (st *cabacMBState) markIntraPredState(mb int) {
@@ -220,9 +214,7 @@ func (st *cabacMBState) markIntraPredState(mb int) {
 		for i8 := 0; i8 < 4; i8++ {
 			st.refs[l][mb*4+i8] = refNU
 		}
-		for b := 0; b < 16; b++ {
-			st.mvdAbs[l][mb*16+b] = [2]uint8{}
-		}
+		copy(st.mvdAbs[l][mb*16:mb*16+16], zeroMvd16[:])
 	}
 }
 
@@ -293,14 +285,7 @@ func cabacIntraBody(sink cabacSink, st *cabacMBState, sc *cabacSliceCtx, mb int,
 		// FFmpeg: cbp_table=0xf7ef 相当(全 coded)、nz=16、chroma_pred=0。
 		st.chromaPred[mb] = 0
 		st.cbp16[mb] = 0x1EF
-		for blk := 0; blk < 16; blk++ {
-			st.nz.setLuma(mb, blk, 16)
-		}
-		for c := 0; c < 2; c++ {
-			for blk := 0; blk < 4; blk++ {
-				st.nz.setChroma(mb, c, blk, 16)
-			}
-		}
+		st.nz.fillMB(mb, 16)
 		st.lastDqpNonzero = false
 		return true
 	}
