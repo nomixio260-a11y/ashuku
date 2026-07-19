@@ -82,7 +82,7 @@ jobs:
             targets: FuzzTryUnwrapGzip FuzzTryUnwrapZlib FuzzTryUnwrapZip FuzzTryUnwrapPDF FuzzTryUnwrapJPEG FuzzTryUnwrapProgressive FuzzTryUnwrapGIF
           - shard: precomp-b
             pkg: ./internal/precomp/
-            targets: FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzTryUnwrapJSONL FuzzTryUnwrapH264 FuzzReconstructContainer
+            targets: FuzzTryUnwrapAVI FuzzTryUnwrapWAV FuzzTryUnwrapAIFF FuzzTryUnwrapBMP FuzzTryUnwrapTIFF FuzzTryUnwrapCSV FuzzTryUnwrapJSONL FuzzTryUnwrapH264 FuzzTryUnwrapMP4H264 FuzzReconstructContainer
           - shard: store
             pkg: ./internal/store/
             targets: FuzzBCJRoundTrip FuzzBrotliDecode FuzzBzip2Decode

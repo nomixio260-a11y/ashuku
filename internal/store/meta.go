@@ -222,6 +222,8 @@ type FileManifest struct {
 	PrecompJSONL *precomp.JSONLRecipe `json:"precomp_jsonl,omitempty"`
 	// PrecompH264 は H.264 CAVLC 再圧縮の再構成レシピ。
 	PrecompH264 *precomp.H264Recipe `json:"precomp_h264,omitempty"`
+	// PrecompMP4 は MP4 コンテナ入り H.264 CAVLC の再構成レシピ。
+	PrecompMP4 *precomp.MP4H264Recipe `json:"precomp_mp4,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -269,6 +271,8 @@ const (
 	EncodingJSONLV1 = "jsonl-columnar-v1"
 	// EncodingH264V1 は H.264 CAVLC(Annex B)を文脈算術へ再符号化して保存。
 	EncodingH264V1 = "h264-cavlc-v1"
+	// EncodingMP4V1 は MP4 内の H.264 CAVLC サンプルを再符号化して保存。
+	EncodingMP4V1 = "mp4-h264-cavlc-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

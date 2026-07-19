@@ -159,9 +159,13 @@
   文脈適応算術符号で再符号化します(JPEG と同じ「VLC→算術」の原理を動画へ
   拡張)。CAVLC の決定的な逆変換でビット単位に復元でき、採用前に全体を復元
   してバイト一致を検証します。実測(x264 産、Annex B): **−5〜−8%**。
+  **MP4 コンテナ入りの CAVLC**(ドラレコ・DVR・旧型スマホ・画面録画に多い)にも
+  対応し、moov のサンプル表を解析して動画トラックだけを再符号化、音声・コンテナは
+  原文保存してファイル全体をバイト一致で戻します(実測 end-to-end −5.1%)。
   スマホ動画等の **H.264 CABAC・H.265・VP9・AV1 は既に算術符号**で理論限界
-  近くまで圧縮されているため可逆に縮める余地がなく、判定して安全に素通し
-  します(重複排除のみ有効。RESEARCH.md §4.23/§4.33 に機会分析の全記録)。
+  近くまで圧縮されており、汎用圧縮では残余冗長がほぼ 0(実測: zlib で ±0%)。
+  判定して安全に素通しします(重複排除のみ有効。CABAC 専用再推定で理論上
+  1〜3% の余地はあるが実装規模が過大——RESEARCH.md §4.23/§4.33/§4.34)。
 
 > **運用ノート**: デルタは「新しい世代 → 古い世代への差分」の順方向チェーンなので、
 > 古い世代を削除した直後は、新しい世代が参照しているベースチャンクが
@@ -183,7 +187,7 @@
 | JSONL(構造化ログ・同一スキーマ) | **6〜60倍**(骨格分離+列指向で行指向比 −27%、ビット一致復元) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
-| H.264 動画(CAVLC = 監視カメラ・webcam 系) | **1.05〜1.1倍**(−5〜8%、ビット一致復元。CABAC は素通し) |
+| H.264 動画(CAVLC = 監視・ドラレコ・DVR・旧機・画面録画。生/MP4) | **1.05〜1.1倍**(−5〜8%、ビット一致復元。CABAC は素通し) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
 | WAV/AIFF(非圧縮 PCM 音声) | **1.3〜2倍以上**(16bit で −25〜−38%、24bit・低エントロピー音源はさらに大 −88〜96%) |
 | H.264 CABAC・H.265 以降の動画・MP3/AAC 音声(圧縮済み) | ほぼ1倍(raw保存にフォールバック、膨張はしない。重複排除は有効) |
@@ -438,7 +442,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264-CAVLC / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264-CAVLC(生/MP4) / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス

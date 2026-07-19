@@ -810,3 +810,23 @@ func TestH264PrecompEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestMP4H264PrecompEndToEnd は MP4(CAVLC 動画+AAC 音声)の実ストア往復。
+func TestMP4H264PrecompEndToEnd(t *testing.T) {
+	t.Parallel()
+	orig, err := os.ReadFile("../precomp/testdata/h264/v_av.mp4")
+	if err != nil {
+		t.Skip("mp4 testdata なし")
+	}
+	s := newTestStore(t)
+	m := putBytes(t, s, "v_av.mp4", orig)
+	if m.Encoding != EncodingMP4V1 {
+		t.Fatalf("MP4 CAVLC が分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), orig) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+	st, _ := s.Stats()
+	t.Logf("mp4 %d -> 物理 %d (-%.1f%%)", len(orig), st.PhysicalBytes,
+		100*float64(int64(len(orig))-st.PhysicalBytes)/float64(len(orig)))
+}

@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsMP4(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -655,6 +655,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingTIFFV1
 		m.PrecompTIFF = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsMP4(buf):
+		u, ok := precomp.TryUnwrapMP4H264(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingMP4V1
+		m.PrecompMP4 = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsH264(buf):
 		u, ok := precomp.TryUnwrapH264(buf, s.precompMax)
@@ -1310,6 +1318,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructJSONL(m.PrecompJSONL, plain.Bytes())
 	case EncodingH264V1:
 		orig, err = precomp.ReconstructH264(m.PrecompH264, plain.Bytes())
+	case EncodingMP4V1:
+		orig, err = precomp.ReconstructMP4H264(m.PrecompMP4, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}
