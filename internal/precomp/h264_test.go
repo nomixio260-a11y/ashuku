@@ -22,12 +22,6 @@ func TestH264RoundTripTestdata(t *testing.T) {
 		}
 		u, ok := TryUnwrapH264(orig, 1<<30)
 		base := filepath.Base(fn)
-		if base == "v_cabac.h264" {
-			if ok {
-				t.Fatalf("%s: CABAC が採用された(対象外のはず)", base)
-			}
-			continue
-		}
 		if !ok {
 			t.Logf("%s: 非採用(素通し)", base)
 			continue

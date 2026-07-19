@@ -1926,6 +1926,51 @@ entropy_coding_mode スライスが自動的に二次算術へ載るようにし
 だけで、**実運用のプログレッシブ写真(mozjpeg/PIL の既定)は大半が
 素通しになっていた**可能性が高い。修正の実利は大きい。
 
+## 4.37 独自研究(2026-07-19): CABAC P/B スライス+8x8 変換 — スマホ実機動画の可逆再圧縮を達成
+
+§4.35-4.36 の I スライス CABAC を、**スマホカメラ実機の構成そのもの**
+(High プロファイル: P/B スライス・8x8 変換・weighted pred・複数参照)へ
+拡張した。「スマホ動画の可逆再圧縮」の本丸。
+
+### 実装(cabacinter.go / cabacmb.go 拡張)
+- **スライスヘッダ**: B(direct_spatial_mv_pred、L1、両リスト modification)、
+  pred_weight_table(P weightp / B explicit)、High 系 PPS tail
+  (transform_8x8_mode・scaling matrix・second_chroma_qp)、SPS
+  direct_8x8_inference。
+- **inter 予測層**: mb_skip_flag(P:11-13/B:24-26)、P/B mb_type ビンツリー
+  (P:14-17、B:27-32、intra escape 17/32)、sub_mb_type(P:21-23/B:36-39)、
+  ref_idx(54-59、近傍 ref>0 と B の direct 除外)、mvd(40-/47-、近傍
+  |mvd| 和の閾値文脈+EG3 バイパス)。FFmpeg と同一の scan8 キャッシュ
+  設計で、近傍(ref/|mvd|/direct/skip/8x8DCT)を per-MB 追跡する。
+  動きベクトル値・direct 予測は構文に影響しないため一切計算しない。
+- **8x8 変換**: transform_size_8x8_flag(399-401)、cat5 残差(64係数、
+  8x8 有意マップ写像、4:2:0 では cbf なし)、B_Direct の
+  direct_8x8_inference ゲート。
+- **inter 特有の文脈規約**: cbf/cbp の「利用不可近傍」既定値が
+  intra(64/0x7CF)と inter(0/0x00F)で異なる非対称性を実装。
+
+### 検証(遅発性デシンク・オラクル+計装 FFmpeg)
+x264 生成の5ストリーム(P-only Main / weighted P / P+8x8 High /
+B+8x8 High / zerolatency 画面録画風)+全イントラ2本、**計 210 スライス
+全てが end_of_slice にビット単位で整列**。開発中に計装 FFmpeg
+(per-MB range / per-ref / per-mvd トレース)との突き合わせで特定した
+実バグ: (1) mvd 保存の Z 順/ラスタ順不一致、(2) SPS direct_8x8_inference
+未解析、(3) subDirect フラグの前スライス残留。
+
+### 実測(本番経路、採用+往復バイト厳密検証つき)
+| ストリーム | 構成 | 削減 |
+|---|---|---:|
+| v_cabac.h264 | P 動画(Main) | **-2.7%** |
+| v_cabac.mp4 | 同 MP4 | **-3.0%** |
+| p_main.h264 | P-only 30f | **-3.4%** |
+| b_high.h264 | B+8x8 High | **-3.8%** |
+| phone_like.mp4 | 640x360 High B 8x8(スマホ様) | **-2.1%** |
+
+P/B は I-only(-1.3〜-2.2%)より縮む(skip/mvd/cbp=0 系の文脈が
+二次モデルの持続適応と相性が良い)。CAVLC(-3〜-6%)と合わせ、
+**H.264 のほぼ全実機構成が可逆再圧縮の対象**になった。非対応構文
+(インターレース・MBAFF・4:2:2 等)は従来どおり素通しで安全。
+
 ## 5. 再現方法
 
 ```sh

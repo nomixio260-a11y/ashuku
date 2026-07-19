@@ -35,9 +35,11 @@ func (st *cabacMBState) cbfCtxDC(mb, cat, idx int) int {
 }
 
 // cbfCtxAC は AC ブロックの coded_block_flag ctxIdx(近傍 4x4 nz)。
+// 利用不可近傍の既定値は現在 MB の intra/inter で異なる(64/0)。
 func (st *cabacMBState) cbfCtxLumaAC(mb, cat, blk int) int {
-	nza := st.nz.lumaNbrNZ(mb, blk, -1, 0)
-	nzb := st.nz.lumaNbrNZ(mb, blk, 0, -1)
+	def := st.nzDefault()
+	nza := st.nz.lumaNbrNZDef(mb, blk, -1, 0, def)
+	nzb := st.nz.lumaNbrNZDef(mb, blk, 0, -1, def)
 	ctx := 0
 	if nza > 0 {
 		ctx++
@@ -49,8 +51,9 @@ func (st *cabacMBState) cbfCtxLumaAC(mb, cat, blk int) int {
 }
 
 func (st *cabacMBState) cbfCtxChromaAC(mb, comp, blk int) int {
-	nza := st.nz.chromaNbrNZ(mb, comp, blk, -1, 0)
-	nzb := st.nz.chromaNbrNZ(mb, comp, blk, 0, -1)
+	def := st.nzDefault()
+	nza := st.nz.chromaNbrNZDef(mb, comp, blk, -1, 0, def)
+	nzb := st.nz.chromaNbrNZDef(mb, comp, blk, 0, -1, def)
 	ctx := 0
 	if nza > 0 {
 		ctx++
@@ -118,8 +121,70 @@ func cabacResidualBlock(sink cabacSink, cat, maxCoeff, cbfCtx int) int {
 	return coeffCount
 }
 
-// cabacIResidual は I マクロブロックの全残差を走査する。
-func cabacIResidual(sink cabacSink, st *cabacMBState, mb int, i16 bool, cbp int) bool {
+// cabacResidual8x8 は cat5(luma 8x8、64係数)を走査する。4:2:0 では cbf は
+// 読まない(cbp ビットが唯一のゲート)。有意マップは 8x8 用の文脈写像を使う。
+func cabacResidual8x8(sink cabacSink) int {
+	coeffCount := 0
+	last := 0
+	for last = 0; last < 63; last++ {
+		if sink.decision(402+int(cabacSig8x8Frame[last])) != 0 {
+			coeffCount++
+			if sink.decision(417+int(cabacLast8x8[last])) != 0 {
+				last = 64
+				break
+			}
+		}
+	}
+	if last == 63 {
+		coeffCount++
+	}
+	if coeffCount == 0 {
+		return 0
+	}
+	const absBase = 426
+	nodeCtx := 0
+	for i := 0; i < coeffCount; i++ {
+		ctx := coeffAbsLevel1Ctx[nodeCtx] + absBase
+		if sink.decision(ctx) == 0 {
+			nodeCtx = coeffAbsTrans[0][nodeCtx]
+			sink.bypass()
+		} else {
+			coeffAbs := 2
+			ctx = coeffAbsLevelGt1Ctx[nodeCtx] + absBase
+			nodeCtx = coeffAbsTrans[1][nodeCtx]
+			for coeffAbs < 15 && sink.decision(ctx) != 0 {
+				coeffAbs++
+			}
+			if coeffAbs >= 15 {
+				j := 0
+				for sink.bypass() != 0 && j < 16+7 {
+					j++
+				}
+				for j > 0 {
+					sink.bypass()
+					j--
+				}
+			}
+			sink.bypass()
+		}
+	}
+	return coeffCount
+}
+
+// cabacResidualMB はマクロブロックの全残差を走査する(I16/4x4/8x8)。
+func cabacResidualMB(sink cabacSink, st *cabacMBState, mb int, i16, is8x8 bool, cbp int) bool {
+	if is8x8 {
+		for i8 := 0; i8 < 4; i8++ {
+			cc := 0
+			if cbp&(1<<i8) != 0 {
+				cc = cabacResidual8x8(sink)
+			}
+			for j := 0; j < 4; j++ {
+				st.nz.setLuma(mb, i8*4+j, cc)
+			}
+		}
+		return cabacResidualChroma(sink, st, mb, cbp)
+	}
 	if i16 {
 		// luma DC(cat0, 16 係数)
 		cc := cabacResidualBlock(sink, 0, 16, st.cbfCtxDC(mb, 0, 0))
@@ -151,7 +216,11 @@ func cabacIResidual(sink cabacSink, st *cabacMBState, mb int, i16 bool, cbp int)
 			}
 		}
 	}
-	// chroma
+	return cabacResidualChroma(sink, st, mb, cbp)
+}
+
+// cabacResidualChroma は chroma DC/AC の残差走査(4:2:0)。
+func cabacResidualChroma(sink cabacSink, st *cabacMBState, mb, cbp int) bool {
 	cbpChroma := cbp >> 4
 	if cbpChroma != 0 {
 		for c := 0; c < 2; c++ { // chroma DC(cat3, 4 係数)

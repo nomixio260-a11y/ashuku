@@ -149,7 +149,13 @@ func parseSPS(rbsp []byte) (*h264SPS, bool) {
 	if s.chromaFormatIDC != 1 || s.separateColour {
 		return nil, false // 4:2:0 のみ
 	}
-	// 以降(direct_8x8, cropping, VUI)はスライス解析に不要
+	// direct_8x8_inference_flag(B の dct8x8 許可判定に必要)
+	d8, err := r.u1()
+	if err != nil {
+		return nil, false
+	}
+	s.direct8x8 = d8 == 1
+	// 以降(cropping, VUI)はスライス解析に不要
 	return s, true
 }
 
@@ -246,18 +252,68 @@ func parsePPS(rbsp []byte) (*h264PPS, bool) {
 	}
 	p.redundantPicCntPresent = b == 1
 	if r.moreRBSPData() {
-		// transform_8x8_mode / scaling matrix / second_chroma_qp — High 系。
-		// transform 8x8 は CAVLC 解析に影響するため対象外にする。
-		return nil, false
+		// High 系 PPS tail: transform_8x8_mode / scaling matrix / second_chroma_qp。
+		b, err = r.u1()
+		if err != nil {
+			return nil, false
+		}
+		p.transform8x8 = b == 1
+		sm, err := r.u1() // pic_scaling_matrix_present_flag
+		if err != nil {
+			return nil, false
+		}
+		if sm == 1 {
+			n := 6
+			if p.transform8x8 {
+				n += 2 // 4:2:0 では 8x8 は輝度 intra/inter の2本
+			}
+			for i := 0; i < n; i++ {
+				fb, err := r.u1()
+				if err != nil {
+					return nil, false
+				}
+				if fb == 1 {
+					size := 16
+					if i >= 6 {
+						size = 64
+					}
+					if !skipScalingList(r, size) {
+						return nil, false
+					}
+				}
+			}
+		}
+		if _, err := r.se(); err != nil { // second_chroma_qp_index_offset
+			return nil, false
+		}
 	}
 	return p, true
+}
+
+// skipScalingList は scaling_list(7.3.2.1.1.1)を読み飛ばす。
+func skipScalingList(r *h264Reader, size int) bool {
+	lastScale, nextScale := 8, 8
+	for j := 0; j < size; j++ {
+		if nextScale != 0 {
+			d, err := r.se()
+			if err != nil {
+				return false
+			}
+			nextScale = (lastScale + int(d) + 256) % 256
+		}
+		if nextScale != 0 {
+			lastScale = nextScale
+		}
+	}
+	return true
 }
 
 // h264Slice はスライスヘッダの解析結果(ヘッダ原文ビットは別途保持)。
 type h264Slice struct {
 	firstMB       int
-	sliceType     int // 0/5=P, 2/7=I のみ対応
+	sliceType     int // 0/5=P, 1/6=B, 2/7=I
 	numRefIdxL0   int
+	numRefIdxL1   int
 	headerBits    int // RBSP 先頭(NALヘッダ後)からヘッダ末尾までのビット数
 	sliceQP       int
 	nalRefIDC     int
@@ -266,6 +322,11 @@ type h264Slice struct {
 	cabacInitPres bool
 	cabacInitIDC  int
 }
+
+// isI/isP/isB はスライス種別の便宜メソッド。
+func (sl *h264Slice) isI() bool { return sl.sliceType == 2 || sl.sliceType == 7 }
+func (sl *h264Slice) isP() bool { return sl.sliceType == 0 || sl.sliceType == 5 }
+func (sl *h264Slice) isB() bool { return sl.sliceType == 1 || sl.sliceType == 6 }
 
 // parseSliceHeader はスライスヘッダを解析し、データ開始ビット位置を得る。
 // r は RBSP(NAL ヘッダの直後)を指す。
@@ -283,9 +344,10 @@ func parseSliceHeader(r *h264Reader, sps *h264SPS, pps *h264PPS, nalType, nalRef
 	sl.sliceType = int(st)
 	switch sl.sliceType {
 	case 0, 5: // P
+	case 1, 6: // B
 	case 2, 7: // I
 	default:
-		return nil, false // B/SP/SI は対象外
+		return nil, false // SP/SI は対象外
 	}
 	if _, err := r.ue(); err != nil { // pps_id(呼び出し側で選択済み)
 		return nil, false
@@ -327,8 +389,15 @@ func parseSliceHeader(r *h264Reader, sps *h264SPS, pps *h264PPS, nalType, nalRef
 		}
 	}
 	sl.numRefIdxL0 = pps.numRefIdxL0Default
-	isP := sl.sliceType == 0 || sl.sliceType == 5
-	if isP {
+	sl.numRefIdxL1 = pps.numRefIdxL1Default
+	isP := sl.isP()
+	isB := sl.isB()
+	if isB {
+		if _, err := r.u1(); err != nil { // direct_spatial_mv_pred_flag
+			return nil, false
+		}
+	}
+	if isP || isB {
 		b, err := r.u1() // num_ref_idx_active_override
 		if err != nil {
 			return nil, false
@@ -339,32 +408,47 @@ func parseSliceHeader(r *h264Reader, sps *h264SPS, pps *h264PPS, nalType, nalRef
 				return nil, false
 			}
 			sl.numRefIdxL0 = int(v) + 1
-		}
-		// ref_pic_list_modification
-		b, err = r.u1()
-		if err != nil {
-			return nil, false
-		}
-		if b == 1 {
-			for {
-				op, err := r.ue()
+			if isB {
+				v, err := r.ue()
 				if err != nil {
 					return nil, false
 				}
-				if op == 3 {
-					break
-				}
-				if op > 3 {
-					return nil, false
-				}
-				if _, err := r.ue(); err != nil {
-					return nil, false
+				sl.numRefIdxL1 = int(v) + 1
+			}
+		}
+		// ref_pic_list_modification(l0、B は l1 も)
+		nLists := 1
+		if isB {
+			nLists = 2
+		}
+		for l := 0; l < nLists; l++ {
+			b, err = r.u1()
+			if err != nil {
+				return nil, false
+			}
+			if b == 1 {
+				for {
+					op, err := r.ue()
+					if err != nil {
+						return nil, false
+					}
+					if op == 3 {
+						break
+					}
+					if op > 3 {
+						return nil, false
+					}
+					if _, err := r.ue(); err != nil {
+						return nil, false
+					}
 				}
 			}
 		}
 	}
-	if pps.weightedPred && isP {
-		return nil, false // 重み付き予測テーブルは対象外(baseline では出ない)
+	if (pps.weightedPred && isP) || (pps.weightedBipredIDC == 1 && isB) {
+		if !skipPredWeightTable(r, sl, isB) {
+			return nil, false
+		}
 	}
 	if sl.nalRefIDC != 0 {
 		// dec_ref_pic_marking
@@ -409,6 +493,53 @@ func parseSliceHeader(r *h264Reader, sps *h264SPS, pps *h264PPS, nalType, nalRef
 			}
 		}
 	}
+	return parseSliceHeaderTail(r, sl, pps)
+}
+
+// skipPredWeightTable は pred_weight_table(7.3.3.2、4:2:0)を読み飛ばす。
+func skipPredWeightTable(r *h264Reader, sl *h264Slice, isB bool) bool {
+	if _, err := r.ue(); err != nil { // luma_log2_weight_denom
+		return false
+	}
+	if _, err := r.ue(); err != nil { // chroma_log2_weight_denom(chroma あり)
+		return false
+	}
+	lists := [][2]int{{0, sl.numRefIdxL0}}
+	if isB {
+		lists = append(lists, [2]int{1, sl.numRefIdxL1})
+	}
+	for _, ln := range lists {
+		for i := 0; i < ln[1]; i++ {
+			b, err := r.u1() // luma_weight_flag
+			if err != nil {
+				return false
+			}
+			if b == 1 {
+				if _, err := r.se(); err != nil {
+					return false
+				}
+				if _, err := r.se(); err != nil {
+					return false
+				}
+			}
+			b, err = r.u1() // chroma_weight_flag
+			if err != nil {
+				return false
+			}
+			if b == 1 {
+				for k := 0; k < 4; k++ {
+					if _, err := r.se(); err != nil {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// parseSliceHeaderTail はヘッダ末尾(cabac_init_idc 以降)を読む。
+func parseSliceHeaderTail(r *h264Reader, sl *h264Slice, pps *h264PPS) (*h264Slice, bool) {
 	// CABAC はスライスヘッダ後に cabac_init_idc(ue)が続く。ここでは
 	// エントロピーモードで分岐して読み進める(CAVLC 経路は entropyCodingMode=false)。
 	if pps.entropyCodingMode && sl.sliceType != 2 && sl.sliceType != 7 {
