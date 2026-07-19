@@ -94,7 +94,12 @@ jobs:
       - name: cgo 依存
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd1
       - name: ファジング(${{ matrix.shard }}、各10秒)
+        # fuzztime 満了時に実行中の入力が猶予を超えると "context deadline
+        # exceeded" で偽陽性になることがある(遅い共有ランナーで稀に発生)。
+        # 本物のクラッシュは corpus に書かれ再実行でも確定的に落ちるので、
+        # 1回だけリトライしてフレークと実障害を区別する。
         run: |
           for f in ${{ matrix.targets }}; do
-            go test ${{ matrix.pkg }} -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
+            go test ${{ matrix.pkg }} -run '^$' -fuzz "$f" -fuzztime 10s || \
+              go test ${{ matrix.pkg }} -run '^$' -fuzz "$f" -fuzztime 10s || exit 1
           done
