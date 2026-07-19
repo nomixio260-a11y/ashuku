@@ -249,6 +249,27 @@ func combineNC(nA int, aOK bool, nB int, bOK bool) int {
 var lumaBlkX = [16]int{0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3}
 var lumaBlkY = [16]int{0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3}
 
+// lumaNbrNZ は luma ブロック blk の (dx,dy) 隣接 4x4 の非ゼロ数。CABAC の
+// cbf 文脈用。利用不可(スライス外)の隣接は I スライスでは 64 扱い
+// (FFmpeg fill_caches の CABAC&&!INTRA?0:64 で、I は INTRA なので 64)。
+func (nz *h264NZ) lumaNbrNZ(mbAddr, blk, dx, dy int) int {
+	x := (mbAddr%nz.mbW)*4 + lumaBlkX[blk] + dx
+	y := (mbAddr/nz.mbW)*4 + lumaBlkY[blk] + dy
+	if v, ok := nz.lumaAt(mbAddr, x, y); ok {
+		return v
+	}
+	return 64
+}
+
+func (nz *h264NZ) chromaNbrNZ(mbAddr, comp, blk, dx, dy int) int {
+	x := (mbAddr%nz.mbW)*2 + blk&1 + dx
+	y := (mbAddr/nz.mbW)*2 + blk>>1 + dy
+	if v, ok := nz.chromaAt(comp, x, y); ok {
+		return v
+	}
+	return 64
+}
+
 // --- 残差ブロック(9.2): coeff_token → T1符号 → レベル → total_zeros → run ---
 
 // residualBlock は1ブロックをトランスコードし totalCoeff を返す。

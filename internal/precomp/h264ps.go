@@ -264,6 +264,7 @@ type h264Slice struct {
 	idr           bool
 	disableDeblk  int
 	cabacInitPres bool
+	cabacInitIDC  int
 }
 
 // parseSliceHeader はスライスヘッダを解析し、データ開始ビット位置を得る。
@@ -408,8 +409,14 @@ func parseSliceHeader(r *h264Reader, sps *h264SPS, pps *h264PPS, nalType, nalRef
 			}
 		}
 	}
-	if pps.entropyCodingMode {
-		return nil, false // CABAC(念のため)
+	// CABAC はスライスヘッダ後に cabac_init_idc(ue)が続く。ここでは
+	// エントロピーモードで分岐して読み進める(CAVLC 経路は entropyCodingMode=false)。
+	if pps.entropyCodingMode && sl.sliceType != 2 && sl.sliceType != 7 {
+		v, err := r.ue() // cabac_init_idc(I 以外)
+		if err != nil || v > 2 {
+			return nil, false
+		}
+		sl.cabacInitIDC = int(v)
 	}
 	q, err := r.se()
 	if err != nil {
