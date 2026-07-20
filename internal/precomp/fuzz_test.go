@@ -379,6 +379,122 @@ func FuzzTryUnwrapBMP(f *testing.F) {
 	})
 }
 
+// FuzzTryUnwrapHEIF は攻撃者制御の HEIF/HEIC での分解が panic せず、採用
+// 入力が必ずビット一致で戻ることを検証する(新しい手組みバイナリパーサ)。
+func FuzzTryUnwrapHEIF(f *testing.F) {
+	// ftyp(heic)+ 断片で IsHEIF を通しパーサへ入れる種。
+	ftyp := append([]byte{0, 0, 0, 16}, "ftypheic"...)
+	ftyp = append(ftyp, "mif1"...)
+	f.Add(ftyp)
+	f.Add(append(ftyp, "\x00\x00\x00\x10metagarbage!!"...))
+	// version>=2 の iloc を含みうる断片(過去に OOB panic した形)。
+	f.Add(append(ftyp, "\x00\x00\x00\x10iloc\x02\x00\x00\x00\x44\x00\x00\x01"...))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapHEIF(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructHEIF(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した HEIF がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapAAC は攻撃者制御の ADTS AAC での分解が panic せず、採用入力が
+// ビット一致で戻ることを検証する。
+func FuzzTryUnwrapAAC(f *testing.F) {
+	for _, fn := range globSeed("testdata/aac/*.aac") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\xFF\xF1\x50\x80\x00\x1F\xFC garbage adts frame"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapAAC(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructAAC(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した AAC がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapM4A は攻撃者制御の MP4/M4A(mp4a)での分解が panic せず、
+// 採用入力がビット一致で戻ることを検証する。
+func FuzzTryUnwrapM4A(f *testing.F) {
+	for _, fn := range globSeed("testdata/aac/*.m4a") {
+		f.Add(fn)
+	}
+	for _, fn := range globSeed("testdata/hevc/*.mp4") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A mp42 garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapM4A(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructM4A(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した M4A がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapTS は攻撃者制御の MPEG-TS での分解が panic せず、採用入力が
+// ビット一致で戻ることを検証する。
+func FuzzTryUnwrapTS(f *testing.F) {
+	for _, fn := range globSeed("testdata/hevc/*.ts") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\x47\x40\x00\x10 garbage transport stream packet payload data"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapTS(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructTS(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した TS がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// globSeed はシード用にファイルを読み込む(存在しなければ空)。
+func globSeed(pattern string) [][]byte {
+	files, _ := filepath.Glob(pattern)
+	var out [][]byte
+	for _, fn := range files {
+		if b, err := os.ReadFile(fn); err == nil {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// TestHEIFIlocOOB は version>=2 の短い iloc で範囲外パニックしないことの
+// 直接回帰(過去に heifParseIloc が index out of range を起こした形)。
+func TestHEIFIlocOOB(t *testing.T) {
+	cases := [][]byte{
+		{0x02, 0, 0, 0, 0x44, 0, 0, 1},       // ver=2, len=8 (Uint32 が範囲外だった)
+		{0x02, 0, 0, 0, 0x44, 0, 0, 1, 0},    // len=9
+		{0x00, 0, 0, 0, 0x44, 0},             // ver=0, len=6
+		{0x01, 0, 0, 0, 0x44, 0, 0},          // ver=1, len=7
+		{0x02, 0, 0, 0},                       // len<8
+	}
+	for i, c := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("case %d: heifParseIloc がパニック: %v", i, r)
+				}
+			}()
+			heifParseIloc(c) // パニックしなければよい(結果は false 想定)
+		}()
+	}
+}
+
 // FuzzTryUnwrapTIFF は攻撃者制御の TIFF での分解が panic せず、採用入力が
 // ビット一致で戻ることを検証する。
 func FuzzTryUnwrapTIFF(f *testing.F) {

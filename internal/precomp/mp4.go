@@ -305,12 +305,18 @@ func mp4SampleTable(stbl []byte, t2 *mp4Track, fragmented bool) bool {
 	}
 	t2.offsets = make([]int64, 0, cnt)
 	si := 0
+	// stsc の first_chunk は仕様上単調増加なので、各エントリを単調ポインタで
+	// 走査して chunk ごとの samples_per_chunk を O(chunks+entries) で引く。
+	// 旧来の「chunk ごとに全 stsc を線形探索」は stco×stsc の二次計算で、
+	// samples_per_chunk=0(=si 不進行)かつ大量 stco の細工で数時間の CPU を
+	// 焼けた。単調でない不正 stsc は結果が変わりうるが、復元検証で不採用
+	// (安全に素通し)になるだけ。
+	ei := 0
+	per := 0
 	for ci := 0; ci < len(chunkOff) && si < cnt; ci++ {
-		per := 0
-		for _, e := range ents {
-			if e.first <= ci+1 {
-				per = e.per
-			}
+		for ei < len(ents) && ents[ei].first <= ci+1 {
+			per = ents[ei].per
+			ei++
 		}
 		off := chunkOff[ci]
 		for k := 0; k < per && si < cnt; k++ {
@@ -355,6 +361,10 @@ func parseHvcC(hvcC []byte) ([][]byte, int, bool) {
 }
 
 // mp4FragmentSamples は moof/traf/trun からビデオサンプルの (off,size) を集める。
+// maxFragSamples は断片化 MP4 の総サンプル数上限(メモリ爆発の防御)。
+// 64MiB(precompMax)級の実ファイルなら平均16B/サンプル以上あり十分に余裕。
+const maxFragSamples = 1 << 22
+
 func mp4FragmentSamples(file []byte, trackID uint32) ([][2]int64, bool) {
 	var out [][2]int64
 	pos := 0
@@ -434,7 +444,11 @@ func mp4FragmentSamples(file []byte, trackID uint32) ([][2]int64, bool) {
 					}
 					tflags := binary.BigEndian.Uint32(cb[0:4]) & 0xFFFFFF
 					scount := int(binary.BigEndian.Uint32(cb[4:8]))
-					if scount < 0 || scount > 1<<20 {
+					// per トラン上限に加え、トラン跨ぎの累計も縛る。per==0
+					// (per-sample フラグ無し)だと下の q+scount*per 検査が
+					// scount を縛らないため、小さな trun を多数並べて累計を
+					// 爆発させられる(~1M×トラン数)。総サンプル数を上限する。
+					if scount < 0 || scount > 1<<20 || len(out)+scount > maxFragSamples {
 						okTraf = false
 						return false
 					}

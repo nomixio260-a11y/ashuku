@@ -548,7 +548,21 @@ func (s *Store) releasePrecomp() { <-s.precompSem }
 // tryPrecomp は buf を gzip(単一/マルチ)または生 zlib として分解を試み、
 // 成功したらマニフェストにレシピを記録して真を返す。
 // 展開データは m.precompPlain に一時保持される。
-func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
+//
+// 防御: 個々のコーデックは攻撃者が構成しうるバイナリを解析するため、
+// 万一 panic しても「非分解(=安全に素通し)」へ落とす。これにより
+// 呼び出し側の releasePrecomp(セマフォ解放)が確実に実行され、細工した
+// アップロードによるセマフォ枯渇→全 precomp 読み出しの恒久ブロックを防ぐ。
+// 正当なファイルの挙動は不変(panic しない)。
+func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			// 破損レシピを残さないよう部分状態を捨てる。
+			m.Encoding = ""
+			m.precompPlain = nil
+			ok = false
+		}
+	}()
 	sum := sha256.Sum256(buf)
 	switch {
 	case precomp.IsGzip(buf):

@@ -101,17 +101,38 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 
 // colEncodeDict は列 c を「npal + パレット + ID列」で直列化する
 // (カーディナリティが行数の半分未満かつ上限内の時のみ)。
+//
+// カーディナリティが閾値に達した時点で即座に打ち切る(全行を走査してから
+// 判定していた旧版は、高カーディナリティ列で無駄な O(n) スキャンと、
+// nrows/2 まで膨らむ seen マップの大量確保を招いた)。採否の判定は
+// 旧版と厳密に等価(最終 len(order) が閾値以上なら不採用)。
 func colEncodeDict(grid [][][]byte, c, nrows int) ([]byte, bool) {
-	seen := make(map[string]int, nrows/2+1)
+	// len(order) がこの値に達したら dict 不適(len(order)*2>=nrows または
+	// colDictMaxCard 到達と等価)。
+	limit := (nrows + 1) / 2
+	if colDictMaxCard < limit {
+		limit = colDictMaxCard
+	}
+	if limit < 1 {
+		return nil, false
+	}
+	hint := limit
+	if hint > 4096 { // 巨大な事前確保を防ぐ(以降は伸長に任せる)
+		hint = 4096
+	}
+	seen := make(map[string]int, hint+1)
 	order := make([][]byte, 0, 16)
 	for r := 0; r < nrows; r++ {
 		s := string(grid[r][c])
 		if _, ok := seen[s]; !ok {
 			seen[s] = len(order)
 			order = append(order, grid[r][c])
+			if len(order) >= limit { // カーディナリティ過大 → 早期打ち切り
+				return nil, false
+			}
 		}
 	}
-	if len(order)*2 >= nrows || len(order) >= colDictMaxCard {
+	if len(order) == 0 {
 		return nil, false
 	}
 	var b bytes.Buffer
@@ -140,7 +161,9 @@ func decodeColumns(blob []byte, codecs []uint8, colBytes []int, ncol, nrows int)
 	}
 	off := 0
 	for c := 0; c < ncol; c++ {
-		if colBytes[c] < 0 || off+colBytes[c] > len(blob) {
+		// off+colBytes[c] は加算オーバフローで負に化けて検査をすり抜けうる
+		// ため、残量との比較で境界を確かめる(off<=len(blob) は不変)。
+		if colBytes[c] < 0 || colBytes[c] > len(blob)-off {
 			return nil, errors.New("列セグメント長が範囲外")
 		}
 		seg := blob[off : off+colBytes[c]]

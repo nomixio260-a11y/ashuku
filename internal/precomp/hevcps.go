@@ -7,6 +7,10 @@ package precomp
 // (SPS は strong_intra_smoothing まで、PPS は slice_segment_header_
 // extension_present まで。以降の VUI/拡張は読まない)。
 
+// hevcMaxDim は許容する picture 幅/高さの上限(8K 級を大きく上回る)。
+// 無制限の ue() 由来の巨大寸法による OOM/範囲外を防ぐ防御値。
+const hevcMaxDim = 16384
+
 // hevcSPS は SPS の解析結果(必要フィールドのみ)。
 type hevcSPS struct {
 	spsID            int
@@ -274,6 +278,12 @@ func parseHEVCSPS(rbsp []byte) (*hevcSPS, bool) {
 		return nil, false
 	}
 	s.height = int(v)
+	// 寸法上限(防御): width/height は無制限の ue() なので、巨大値だと
+	// hevcPicState の make([]uint8, minCbW*minCbH) が回収不能な OOM を
+	// 起こしうる。実 HEVC の最大(8K 級)を大きく上回る上限で弾く。
+	if s.width <= 0 || s.height <= 0 || s.width > hevcMaxDim || s.height > hevcMaxDim {
+		return nil, false
+	}
 	cw, err := r.u1()
 	if err != nil {
 		return nil, false

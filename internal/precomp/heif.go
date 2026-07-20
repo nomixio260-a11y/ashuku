@@ -198,9 +198,15 @@ func heifParseIloc(iloc []byte) (map[int]ilocEntry, bool) {
 	}
 	var itemCount int
 	if ver < 2 {
+		if p+2 > len(iloc) {
+			return nil, false
+		}
 		itemCount = int(binary.BigEndian.Uint16(iloc[p:]))
 		p += 2
 	} else {
+		if p+4 > len(iloc) {
+			return nil, false
+		}
 		itemCount = int(binary.BigEndian.Uint32(iloc[p:]))
 		p += 4
 	}
