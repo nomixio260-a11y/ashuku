@@ -557,8 +557,9 @@ func (s *Store) releasePrecomp() { <-s.precompSem }
 func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			// 破損レシピを残さないよう部分状態を捨てる。
+			// 破損レシピを残さないよう部分状態を捨てる(内側再帰の状態も含む)。
 			m.Encoding = ""
+			m.InnerEncoding = ""
 			m.precompPlain = nil
 			ok = false
 		}
@@ -825,6 +826,13 @@ func (s *Store) tryInnerText(m *FileManifest) {
 		m.precompPlain = u.Chunked
 		return
 	}
+	// テキスト系が不成立でも base64(gzip した MIME/base64 ダンプ等)が拾える。
+	if u, ok := precomp.TryUnwrapBase64(plain, s.precompMax); ok {
+		m.InnerEncoding = EncodingBase64V1
+		m.PrecompBase64 = u.Recipe
+		m.precompPlain = u.Chunked
+		return
+	}
 }
 
 // reconstructInner は内側テキスト変換を復元し、外側(gzip 等)の展開データに戻す。
@@ -836,6 +844,8 @@ func (s *Store) reconstructInner(m *FileManifest, chunked []byte) ([]byte, error
 		return precomp.ReconstructCSV(m.PrecompCSV, chunked)
 	case EncodingLogV1:
 		return precomp.ReconstructLog(m.PrecompLog, chunked)
+	case EncodingBase64V1:
+		return precomp.ReconstructBase64(m.PrecompBase64, chunked)
 	default:
 		return nil, fmt.Errorf("未知の内側 encoding: %q", m.InnerEncoding)
 	}

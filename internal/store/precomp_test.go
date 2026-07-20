@@ -862,6 +862,43 @@ func TestRecursivePrecompGzipColumnar(t *testing.T) {
 	t.Logf("gzip+内側列指向 物理=%d(元 gzip=%dB, 展開=%dB)", st1.PhysicalBytes, len(data), logbuf.Len())
 }
 
+// TestRecursivePrecompGzipBase64 は gzip した base64 ダンプ(圧縮可能下地)を
+// 投入→ gzip 展開→内側で base64 復号(再帰)→往復ビット一致、を確認する。
+func TestRecursivePrecompGzipBase64(t *testing.T) {
+	t.Parallel()
+	if !precomp.Supported() {
+		t.Skip("CGO 無効")
+	}
+	rng := rand.New(rand.NewSource(51))
+	words := [][]byte{[]byte("record"), []byte("value"), []byte("field")}
+	blob := func(n int) []byte {
+		var b bytes.Buffer
+		for b.Len() < n {
+			b.Write(words[rng.Intn(len(words))])
+			b.WriteByte(byte(rng.Intn(16)))
+		}
+		return b.Bytes()[:n]
+	}
+	var body bytes.Buffer
+	for i := 0; i < 10; i++ {
+		enc := base64.StdEncoding.EncodeToString(blob(8192))
+		fmt.Fprintf(&body, "-----BEGIN BLOB %d-----\n%s\n-----END BLOB %d-----\n", i, enc, i)
+	}
+	data := zlibGzip(t, body.Bytes(), 6)
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "dump.b64.gz", data)
+	if m.Encoding != EncodingGzipZlibV1 {
+		t.Fatalf("gzip 展開されなかった: %q", m.Encoding)
+	}
+	if m.InnerEncoding != EncodingBase64V1 {
+		t.Fatalf("内側で base64 復号されなかった: inner=%q", m.InnerEncoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("gzip+内側base64 の読み戻しがビット一致しない")
+	}
+}
+
 // TestBase64PrecompEndToEnd は base64 で符号化した圧縮可能バイナリの束
 // (証明書束・ペイロードダンプ様)を投入→復号分解採用→読み戻しビット一致→
 // base64 素通しより物理が小さい、を実ストアで確認する。
