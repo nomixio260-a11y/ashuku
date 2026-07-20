@@ -164,3 +164,35 @@ func hashOf(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+// TestFsckCountsDuplicateHashesCorrectly は、同一ハッシュが複数回現れるマニフェスト
+// ([H,H])で Fsck の期待参照カウントが出現ごとに正しく数え(=2)、正当な
+// RefCount を mismatch と誤報しないことを確認する。Fsck が重複を数え損なうと、
+// --repair が正しいカウントを下方修正して共有チャンクを早期 GC しかねない
+//(=CommitClientManifest の重複カウント漏れと対称のリスク)。
+func TestFsckCountsDuplicateHashesCorrectly(t *testing.T) {
+	s := newTestStore(t)
+	block := make([]byte, 1200)
+	for i := range block {
+		block[i] = byte('a' + i%26)
+	}
+	sum := sha256.Sum256(block)
+	h := hex.EncodeToString(sum[:])
+	if err := s.PutChunkVerified(h, block, "none", int64(len(block))); err != nil {
+		t.Fatal(err)
+	}
+	if _, missing, err := s.CommitClientManifest("F", "", []string{h, h}, 0, 0); err != nil || len(missing) > 0 {
+		t.Fatalf("commit: err=%v missing=%v", err, missing)
+	}
+	res, err := s.Fsck(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RefcountMismatches != 0 || res.OrphanChunks != 0 {
+		t.Fatalf("Fsck が重複ハッシュを誤カウント: mismatches=%d orphans=%d", res.RefcountMismatches, res.OrphanChunks)
+	}
+	// --repair も何も壊さないこと(冪等)。
+	if res, err := s.Fsck(true); err != nil || res.RefcountMismatches != 0 {
+		t.Fatalf("Fsck repair が誤動作: err=%v mismatches=%d", err, res.RefcountMismatches)
+	}
+}
