@@ -224,6 +224,8 @@ type FileManifest struct {
 	PrecompH264 *precomp.H264Recipe `json:"precomp_h264,omitempty"`
 	// PrecompMP4 は MP4 コンテナ入り H.264 CAVLC の再構成レシピ。
 	PrecompMP4 *precomp.MP4H264Recipe `json:"precomp_mp4,omitempty"`
+	// PrecompHEVC は HEVC(Annex B)の再構成レシピ。
+	PrecompHEVC *precomp.HEVCRecipe `json:"precomp_hevc,omitempty"`
 	// PrecompTS は MPEG-TS コンテナ入り H.264 の再構成レシピ。
 	PrecompTS *precomp.TSRecipe `json:"precomp_ts,omitempty"`
 	// PrecompMP3 は MP3 の再構成レシピ。
@@ -277,6 +279,8 @@ const (
 	EncodingH264V1 = "h264-cavlc-v1"
 	// EncodingMP4V1 は MP4 内の H.264 CAVLC サンプルを再符号化して保存。
 	EncodingMP4V1 = "mp4-h264-cavlc-v1"
+	// EncodingHEVCV1 は HEVC の I スライス CABAC を再符号化して保存。
+	EncodingHEVCV1 = "hevc-v1"
 	// EncodingTSV1 は MPEG-TS 内の H.264 を再符号化して保存。
 	EncodingTSV1 = "ts-h264-v1"
 	// EncodingMP3V1 は MP3 を骨格分離+文脈算術で保存。

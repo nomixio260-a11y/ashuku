@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsMP4(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -671,6 +671,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingH264V1
 		m.PrecompH264 = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsHEVC(buf):
+		u, ok := precomp.TryUnwrapHEVC(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingHEVCV1
+		m.PrecompHEVC = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsTS(buf):
 		u, ok := precomp.TryUnwrapTS(buf, s.precompMax)
@@ -1336,6 +1344,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructH264(m.PrecompH264, plain.Bytes())
 	case EncodingMP4V1:
 		orig, err = precomp.ReconstructMP4H264(m.PrecompMP4, plain.Bytes())
+	case EncodingHEVCV1:
+		orig, err = precomp.ReconstructHEVC(m.PrecompHEVC, plain.Bytes())
 	case EncodingTSV1:
 		orig, err = precomp.ReconstructTS(m.PrecompTS, plain.Bytes())
 	case EncodingMP3V1:
