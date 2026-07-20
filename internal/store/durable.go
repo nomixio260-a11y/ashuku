@@ -22,6 +22,14 @@ import (
 // durableWrite は data を path にアトミックかつ耐久的に書き込む。
 func durableWrite(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	// dir が新規作成される(例: シャード chunks/<2hex>/ の最初のチャンク)場合、
+	// 末尾の fsyncDir(dir) は dir 自身のエントリを親に永続化しない。親を fsync
+	// しないと、クラッシュ後に dir ごと(=配下の rename 済みファイルごと)失われる。
+	// 新規作成のときだけ親も耐久化する(既存シャードでは余計な fsync をしない)。
+	newDir := false
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		newDir = true
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -49,7 +57,14 @@ func durableWrite(path string, data []byte) error {
 		return err
 	}
 	// (3) ディレクトリエントリ(rename)をディスクへ
-	return fsyncDir(dir)
+	if err := fsyncDir(dir); err != nil {
+		return err
+	}
+	// (4) dir を新規作成した場合、その作成を親ディレクトリで耐久化する。
+	if newDir {
+		return fsyncDir(filepath.Dir(dir))
+	}
+	return nil
 }
 
 // fsyncDir はディレクトリを開いて fsync する(rename の耐久化)。

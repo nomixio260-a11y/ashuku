@@ -653,6 +653,27 @@ func (s *Store) rescueZombies(res *OptimizeResult) (int, error) {
 // 呼び出し側がゾンビ解放との純減判定を済ませている)。
 func (s *Store) applyRebase(hash, newBase string, delta []byte, res *OptimizeResult, requireImprovement bool) (bool, error) {
 	newRep := newBase[:8]
+	// 事前チェック(必須): 新 rep 名が現在の loose 表現と同名だと、下の writeRep が
+	// 稼働中ファイルを上書きし、その後 in-tx ガード(meta.Rep==newRep)で done=false と
+	// なって discardNewRep が同じファイルを削除する=データ損失。書き込み前に諦める
+	// (repackChunk は自前で precheck するが、rescueZombies は本関数を直接呼ぶため、
+	// 両経路をここでまとめて守る)。newBase[:8] と現 Rep が衝突する稀な状況で発火する。
+	skip := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		meta, err := getChunkMeta(tx, hash)
+		if err != nil {
+			return err
+		}
+		if meta == nil || (meta.Rep == newRep && meta.PackID == "") {
+			skip = true
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if skip {
+		return false, nil
+	}
 	loc, err := s.writeRep(hash, newRep, delta)
 	if err != nil {
 		return false, err
