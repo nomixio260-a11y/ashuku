@@ -123,6 +123,44 @@ func TestColumnarNanoTimestamp(t *testing.T) {
 	}
 }
 
+// TestColumnarFixedDecimal は漸増する固定小数列が colDeltaDec で符号化され
+// 往復一致し、乱数小数列は raw に退避する(採否は best-of)ことを確認する。
+func TestColumnarFixedDecimal(t *testing.T) {
+	rng := rand.New(rand.NewSource(77))
+	var b bytes.Buffer
+	b.WriteString("temp,latency\n") // 気温=漸増(delta有効), latency=乱数(raw)
+	temp := 20.0
+	for i := 0; i < 2000; i++ {
+		temp += (rng.Float64() - 0.5) * 0.2
+		fmt.Fprintf(&b, "%.2f,%.3f\n", temp, rng.Float64()*100)
+	}
+	orig := b.Bytes()
+	u, ok := TryUnwrapCSV(orig, 1<<20)
+	if !ok {
+		t.Fatal("採用されなかった")
+	}
+	rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatalf("固定小数 往復不一致: err=%v", err)
+	}
+	if u.Recipe.Codec[0] != colDeltaDec {
+		t.Errorf("temp 列(漸増固定小数)は colDeltaDec 期待、実際 codec=%d", u.Recipe.Codec[0])
+	}
+	if u.Recipe.Codec[1] != colRaw {
+		t.Errorf("latency 列(乱数小数)は raw 期待、実際 codec=%d", u.Recipe.Codec[1])
+	}
+	t.Logf("codecs=%v (4=colDeltaDec)", u.Recipe.Codec)
+
+	// 固定小数の桁・符号バリエーションの往復。
+	edge := []byte("v\n0.00\n-0.50\n1.05\n-1.00\n12.34\n0.01\n99.99\n-9.99\n")
+	if u, ok := TryUnwrapCSV(edge, 1<<20); ok {
+		rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(rt, edge) {
+			t.Fatalf("固定小数エッジ 往復不一致: err=%v", err)
+		}
+	}
+}
+
 // TestColumnarLegacyDelta19Digit は「桁上限 18→19 の緩和」が旧形式レシピの
 // 復元を壊さないことの回帰。旧エンコーダは 19桁 row0 を parseCanonInt(18桁上限)で
 // 弾き、基準 0 で delta を格納した。新 parseCanonInt(19桁)で基準を計算すると

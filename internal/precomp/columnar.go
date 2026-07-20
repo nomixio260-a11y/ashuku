@@ -27,10 +27,11 @@ import (
 
 // 列コーデック識別子(レシピに保存)。
 const (
-	colRaw     uint8 = 0
-	colDelta   uint8 = 1
-	colDict    uint8 = 2 // パレット + ASCII-ID(改行区切り)
-	colDictBin uint8 = 3 // パレット + 固定幅 LE 二進 ID(区切り無し)
+	colRaw      uint8 = 0
+	colDelta    uint8 = 1 // 正準 int の隣接差分
+	colDict     uint8 = 2 // パレット + ASCII-ID(改行区切り)
+	colDictBin  uint8 = 3 // パレット + 固定幅 LE 二進 ID(区切り無し)
+	colDeltaDec uint8 = 4 // 固定小数(同一小数桁)のスケール整数隣接差分
 )
 
 // colDictMaxCard は dict を試すカーディナリティ上限(パレットが大きすぎると
@@ -52,6 +53,15 @@ func encodeColumns(grid [][][]byte, ncol, nrows int) (blob []byte, codecs []uint
 		if d, ok := colEncodeDelta(grid, c, nrows); ok {
 			if pl := probeLen(d); pl < bestPL {
 				best, bestCodec, bestPL = d, colDelta, pl
+			}
+		}
+		// 固定小数(気温・価格・センサ値)の隣接差分。**隣接値が相関する(漸増)
+		// 列だけ**を候補にする(colEncodeDeltaDec 内で相関判定)。乱数小数は差分が
+		// 縮まないので候補にせず raw に退避(probeLen は zstd 概算のため、乱数列で
+		// 誤って delta を選ぶのを防ぐ)。RESEARCH §4.51。
+		if d, ok := colEncodeDeltaDec(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colDeltaDec, pl
 			}
 		}
 		// dict は ASCII-ID 版と二進-ID 版の両方を試して小さい方を採る。
@@ -106,6 +116,126 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		b.WriteString(strconv.FormatInt(v-prev, 10))
 		b.WriteByte('\n')
 		prev = v
+	}
+	return b.Bytes(), true
+}
+
+// parseFixedDec は b が固定小数(整数部 '.' 小数部、小数桁 >=1)として正準
+// 往復する(parse→format が元と一致)なら、スケール整数と小数桁を返す。
+// 先頭ゼロ・'+'・"-0.00"・整数(小数点なし)は非対象=false。
+func parseFixedDec(b []byte) (scaled int64, scale int, ok bool) {
+	s := string(b)
+	if len(s) < 3 || len(s) > 19 {
+		return 0, 0, false
+	}
+	neg := false
+	t := s
+	if t[0] == '-' {
+		neg = true
+		t = t[1:]
+	}
+	dot := -1
+	for i := 0; i < len(t); i++ {
+		if t[i] == '.' {
+			dot = i
+			break
+		}
+	}
+	if dot <= 0 || dot == len(t)-1 { // 小数点が先頭/末尾/無しは不可
+		return 0, 0, false
+	}
+	intPart, frac := t[:dot], t[dot+1:]
+	if len(intPart) > 1 && intPart[0] == '0' { // 先頭ゼロ不可
+		return 0, 0, false
+	}
+	v, err := strconv.ParseInt(intPart+frac, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if neg {
+		v = -v
+	}
+	sc := len(frac)
+	if formatFixedDec(v, sc) != s { // 正準往復の確認("-0.00" 等を弾く)
+		return 0, 0, false
+	}
+	return v, sc, true
+}
+
+// formatFixedDec はスケール整数と小数桁から固定小数文字列を作る。
+func formatFixedDec(v int64, scale int) string {
+	neg := v < 0
+	u := v
+	if neg {
+		u = -u
+	}
+	str := strconv.FormatInt(u, 10)
+	for len(str) <= scale { // 小数桁を満たすよう先頭ゼロ詰め
+		str = "0" + str
+	}
+	res := str[:len(str)-scale] + "." + str[len(str)-scale:]
+	if neg {
+		res = "-" + res
+	}
+	return res
+}
+
+// colEncodeDeltaDec は固定小数列(データ行が全て同一小数桁の固定小数)を
+// 「小数桁 + row0 逐語 + 以降スケール整数の隣接差分」で直列化する。気温・
+// 価格・センサ値など漸増する小数列に有効(乱数小数は best-of で raw に退避)。
+func colEncodeDeltaDec(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	scale := -1
+	scaled := make([]int64, nrows)
+	for r := 1; r < nrows; r++ {
+		v, sc, ok := parseFixedDec(grid[r][c])
+		if !ok {
+			return nil, false
+		}
+		if scale == -1 {
+			scale = sc
+		} else if sc != scale {
+			return nil, false // 小数桁が揃わない列は対象外
+		}
+		scaled[r] = v
+	}
+	if scale < 0 {
+		return nil, false
+	}
+	// 相関判定: 隣接差分の総和が値の総和より十分小さい(=漸増)列だけを
+	// 対象にする。乱数小数は差分が値と同程度になり delta 化しても縮まないので
+	// 候補から外す(probeLen が乱数列で誤選択するのを未然に防ぐ)。
+	absF := func(x int64) float64 {
+		if x < 0 {
+			return float64(-x)
+		}
+		return float64(x)
+	}
+	var sumDelta, sumVal float64
+	for r := 2; r < nrows; r++ {
+		sumDelta += absF(scaled[r] - scaled[r-1])
+	}
+	for r := 1; r < nrows; r++ {
+		sumVal += absF(scaled[r])
+	}
+	if sumDelta*2 >= sumVal { // 相関が弱い(乱数的)→ 非対象
+		return nil, false
+	}
+	var b bytes.Buffer
+	b.WriteString(strconv.Itoa(scale))
+	b.WriteByte('\n')
+	b.Write(grid[0][c])
+	b.WriteByte('\n')
+	prev := int64(0)
+	if v, sc, ok := parseFixedDec(grid[0][c]); ok && sc == scale {
+		prev = v
+	}
+	for r := 1; r < nrows; r++ {
+		b.WriteString(strconv.FormatInt(scaled[r]-prev, 10))
+		b.WriteByte('\n')
+		prev = scaled[r]
 	}
 	return b.Bytes(), true
 }
@@ -295,6 +425,28 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 			}
 			v := prev + d
 			grid[r][c] = []byte(strconv.FormatInt(v, 10))
+			prev = v
+		}
+	case colDeltaDec:
+		if len(parts) != nrows+1 { // 小数桁 + row0 + (nrows-1) 差分
+			return errors.New("固定小数 delta 列の要素数不一致")
+		}
+		scale, err := strconv.Atoi(string(parts[0]))
+		if err != nil || scale < 1 || scale > 18 {
+			return errors.New("固定小数の小数桁が不正")
+		}
+		grid[0][c] = parts[1]
+		prev := int64(0)
+		if v, sc, ok := parseFixedDec(parts[1]); ok && sc == scale {
+			prev = v
+		}
+		for r := 1; r < nrows; r++ {
+			d, err := strconv.ParseInt(string(parts[r+1]), 10, 64)
+			if err != nil {
+				return errors.New("固定小数 delta 値の解析に失敗")
+			}
+			v := prev + d
+			grid[r][c] = []byte(formatFixedDec(v, scale))
 			prev = v
 		}
 	case colDict:
