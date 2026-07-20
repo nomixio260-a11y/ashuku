@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -809,6 +810,58 @@ func TestLogPrecompEndToEnd(t *testing.T) {
 		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
 	if st1.PhysicalBytes >= st2.PhysicalBytes {
 		t.Fatalf("列指向が行指向より縮んでいない: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻し再確認が一致しない")
+	}
+}
+
+// TestBase64PrecompEndToEnd は base64 で符号化した圧縮可能バイナリの束
+// (証明書束・ペイロードダンプ様)を投入→復号分解採用→読み戻しビット一致→
+// base64 素通しより物理が小さい、を実ストアで確認する。
+func TestBase64PrecompEndToEnd(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewSource(31))
+	words := [][]byte{[]byte("record"), []byte("value"), []byte("field"), []byte("entry")}
+	blob := func(n int) []byte {
+		var b bytes.Buffer
+		for b.Len() < n {
+			b.Write(words[rng.Intn(len(words))])
+			b.WriteByte(byte(rng.Intn(16)))
+		}
+		return b.Bytes()[:n]
+	}
+	var buf bytes.Buffer
+	for i := 0; i < 12; i++ {
+		enc := base64.StdEncoding.EncodeToString(blob(8192))
+		fmt.Fprintf(&buf, "-----BEGIN BLOB %d-----\n%s\n-----END BLOB %d-----\n", i, enc, i)
+	}
+	data := buf.Bytes()
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "bundle.b64", data)
+	if m.Encoding != EncodingBase64V1 {
+		t.Fatalf("base64 が復号分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+
+	s2 := newTestStore(t)
+	m2, err := s2.PutWithOptions("bundle.b64", bytes.NewReader(data), PutOptions{DisablePrecomp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Encoding != "" {
+		t.Fatalf("DisablePrecomp なのに分解された: %q", m2.Encoding)
+	}
+	st1, _ := s.Stats()
+	st2, _ := s2.Stats()
+	t.Logf("復号形 物理=%d / base64 素通し 物理=%d (-%.1f%%)",
+		st1.PhysicalBytes, st2.PhysicalBytes,
+		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
+	if st1.PhysicalBytes >= st2.PhysicalBytes {
+		t.Fatalf("base64 復号で物理が減っていません: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
 	}
 	if !bytes.Equal(getBytes(t, s, m.ID), data) {
 		t.Fatal("読み戻し再確認が一致しない")

@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head) || precomp.IsLog(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head) || precomp.IsLog(head) || precomp.IsBase64(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -755,10 +755,16 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 			m.precompPlain = u.Chunked
 			break
 		}
+		if tryB64Precomp(s, m, buf) {
+			break
+		}
 		return false
 	case precomp.IsCSV(buf):
 		u, ok := precomp.TryUnwrapCSV(buf, s.precompMax)
 		if !ok {
+			if tryB64Precomp(s, m, buf) {
+				break
+			}
 			return false
 		}
 		m.Encoding = EncodingCSVV1
@@ -767,15 +773,36 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 	case precomp.IsLog(buf):
 		u, ok := precomp.TryUnwrapLog(buf, s.precompMax)
 		if !ok {
+			// ログとして分解できなくても base64 が拾えることがある。
+			if tryB64Precomp(s, m, buf) {
+				break
+			}
 			return false
 		}
 		m.Encoding = EncodingLogV1
 		m.PrecompLog = u.Recipe
 		m.precompPlain = u.Chunked
+	case precomp.IsBase64(buf):
+		if !tryB64Precomp(s, m, buf) {
+			return false
+		}
 	default:
 		return false
 	}
 	m.OrigSHA256 = hex.EncodeToString(sum[:])
+	return true
+}
+
+// tryB64Precomp は buf を base64 復号分解として試し、成功したらマニフェストに
+// レシピを記録して真を返す(テキスト系分解が不成立の時のフォールバック)。
+func tryB64Precomp(s *Store, m *FileManifest, buf []byte) bool {
+	b, ok := precomp.TryUnwrapBase64(buf, s.precompMax)
+	if !ok {
+		return false
+	}
+	m.Encoding = EncodingBase64V1
+	m.PrecompBase64 = b.Recipe
+	m.precompPlain = b.Chunked
 	return true
 }
 
@@ -1401,6 +1428,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructJSONL(m.PrecompJSONL, plain.Bytes())
 	case EncodingLogV1:
 		orig, err = precomp.ReconstructLog(m.PrecompLog, plain.Bytes())
+	case EncodingBase64V1:
+		orig, err = precomp.ReconstructBase64(m.PrecompBase64, plain.Bytes())
 	case EncodingH264V1:
 		orig, err = precomp.ReconstructH264(m.PrecompH264, plain.Bytes())
 	case EncodingMP4V1:

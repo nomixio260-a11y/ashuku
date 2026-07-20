@@ -101,6 +101,14 @@
   best-of(リクエスト/UA/ステータスは dict、IP/バイトは raw)。実測で
   **物理 −28.5%**(従来は素通しだったクラス。RESEARCH.md §4.47)。骨格が全行
   一致しない行は素通し。復元バイト一致検証+読み出し時 SHA-256。純Go。
+- **base64 の復号→再圧縮**: base64 はバイナリを 4/3 に膨らませてバイト境界を
+  ずらし、元の反復構造を圧縮器から隠します。そこで **base64 領域を復号して
+  素のバイナリに戻して**から圧縮します(骨格に位置を記録、復元時に同じ符号器で
+  再符号化)。標準/URL-safe・パディング有無を自動判定し、**復号→再符号化が
+  厳密一致する正準 base64 のみ**採用。**下地が圧縮可能**(テキスト・証明書・
+  構造化データ)なら −7〜36%、既に圧縮済み(画像等)の base64 は縮まないので
+  正しく不採用。JSON 値・data: URI・JWT・生ダンプ等の連続 base64 が対象
+  (RESEARCH.md §4.49)。復元バイト一致検証+読み出し時 SHA-256。純Go。
 - **raw フォールバック**: 画像・動画など既に圧縮済みのデータは zstd では縮まないため、
   自動的に無圧縮で保存し、サイズ・CPU の無駄を防ぎます。
 - **参照カウント GC**: ファイル削除時、どのファイルからも参照されなくなったチャンク
@@ -248,6 +256,7 @@
 | CSV/区切りテキスト(矩形) | **6〜60倍**(列指向転置+列別 dict(二進ID)/delta(ナノ秒対応)/raw、CRLF 対応で行指向比 −31〜50%、ビット一致復元) |
 | JSONL(構造化ログ・同一スキーマ) | **6〜60倍**(骨格分離+列別 dict(二進ID)/delta/raw で行指向比 −22〜33%、ビット一致復元) |
 | 空白区切りログ(nginx/Apache combined) | **6〜60倍**(引用符/角括弧を原子化した骨格分離+列指向で物理 −28.5%、ビット一致復元) |
+| base64(証明書束・data:URI・JWT・ペイロード) | **下地が圧縮可能なら −7〜36%**(復号して素のバイナリに戻す、ビット一致復元。既圧縮メディアは不採用) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
 | H.264 動画(CAVLC = 監視・ドラレコ・DVR・旧機。生/MP4) | **1.05〜1.1倍**(−5〜8%、ビット一致復元) |
@@ -511,7 +520,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL・空白区切りログ列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL・空白区切りログ列指向 / base64復号 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
