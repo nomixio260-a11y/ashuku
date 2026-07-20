@@ -628,19 +628,29 @@ func (s *Store) dissolveRegion(regionID string, res *OptimizeResult) error {
 		if err != nil {
 			return err
 		}
+		applied := false
 		err = s.db.Update(func(tx *bolt.Tx) error {
 			meta, err := getChunkMeta(tx, hash)
 			if err != nil || meta == nil || meta.RegionID != regionID {
-				return err
+				return err // 並行 GC/移動でメンバーが消えた等 → 連結しない
 			}
 			meta.Compression = comp
 			meta.RegionID = ""
 			meta.RegionOff = 0
 			meta.StoredSize = int64(len(out))
-			return applyRepLocation(tx, meta, "", loc, int64(len(out)))
+			if err := applyRepLocation(tx, meta, "", loc, int64(len(out))); err != nil {
+				return err
+			}
+			applied = true
+			return nil
 		})
 		if err != nil {
 			return err
+		}
+		if !applied {
+			// 書き込んだ新表現が meta に連結されなかった(並行 GC 等)場合は破棄する。
+			// 放置すると孤児 loose ファイル/未計上 pack バイトのリークになる。
+			s.discardNewRep(hash, "", loc)
 		}
 	}
 	// リージョンを削除
