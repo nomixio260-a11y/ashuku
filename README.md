@@ -190,8 +190,21 @@
   HEVC イントラを ISOBMFF の meta/iloc/iinf アイテム構造で格納します。
   iloc からアイテムのバイト範囲と hvcC のパラメータセットを取り出し、
   上記 HEVC エンジンでイントラ再符号化します(単一 hvc1 アイテム・
-  construction_method 0)。実測 −1.0%。VP9・AV1 は対象外のまま安全に
-  素通しします(重複排除のみ有効)。
+  construction_method 0)。実測 −1.0%。
+- **AAC-LC 音声の可逆再圧縮(ADTS / M4A / MP4)**: スマホ動画の音声
+  トラック・音楽アプリ・ポッドキャストの定番 AAC も、MP3 と同じ
+  「ハフマン→文脈算術」で縮めます。raw_data_block を規格どおり走査し
+  (SCE/CPE/LFE、ics_info・section_data・scalefactor・pulse・TNS・
+  spectral_data)、11 種スペクトル符号帳の記号を符号帳×周波数帯の適応
+  二分木モデルへ載せ替えます。**ADTS(生 .aac)と MP4/M4A(mp4a、
+  esds の AudioSpecificConfig から諸元取得)**の両方に対応。フレーム/
+  サンプルごとに正準ハフマン再符号化でビット一致検証してから採用し、
+  非対応(SBR/PS/prediction 等)は原文退避。実測(非周期音源、対 zstd
+  往復検証つき): ADTS −1.2%、M4A −1.0%。周期の強い合成音は zstd 単体が
+  勝つため正しく不採用にします。実音楽・音声はさらに縮む見込みです。
+  VP9・AV1・WebP(ロッシー=VP8)は既に算術/レンジ符号化済みのため
+  可逆再圧縮の余地が情報理論的に乏しく、対象外のまま安全に素通しします
+  (重複排除のみ有効)。
 
 > **運用ノート**: デルタは「新しい世代 → 古い世代への差分」の順方向チェーンなので、
 > 古い世代を削除した直後は、新しい世代が参照しているベースチャンクが
@@ -219,9 +232,10 @@
 | HEVC スマホ動画(生/MP4 hvc1/MOV/TS、I+P+B 全体) | 素の zstd 比 −1.7〜2.4% 上乗せ(動画全体を再符号化、ビット一致復元) |
 | HEIC/HEIF 写真(iPhone 標準) | 素の zstd 比 −1% 上乗せ(HEVC イントラを再符号化、ビット一致復元) |
 | MP3 音声 | 骨格分離+文脈算術で素の zstd 比 −0.5〜3% 上乗せ(全 MP3 採用、ビット一致復元) |
+| AAC-LC 音声(スマホ動画音声・音楽。ADTS/M4A/MP4) | 素の zstd 比 −1% 上乗せ(スペクトル/スケールファクタ算術化、ビット一致復元) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
 | WAV/AIFF(非圧縮 PCM 音声) | **1.3〜2倍以上**(16bit で −25〜−38%、24bit・低エントロピー音源はさらに大 −88〜96%) |
-| VP9/AV1 動画・AAC 音声(圧縮済み) | ほぼ1倍(raw保存にフォールバック、膨張はしない。重複排除は有効) |
+| VP9/AV1 動画・WebP ロッシー(既に算術/レンジ符号化済み) | ほぼ1倍(raw保存にフォールバック、膨張はしない。重複排除は有効) |
 
 「テラ→数ギガ」が現実に成立するのは、**同じデータを繰り返し保存するバックアップ用途**
 (重複排除+類似デルタが支配的)や、**高冗長なログ・テキストデータ**の場合です。
@@ -473,7 +487,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
