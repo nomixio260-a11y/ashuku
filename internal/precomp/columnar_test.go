@@ -286,3 +286,49 @@ func TestColumnarDelta2(t *testing.T) {
 		t.Fatalf("往復不一致: err=%v", err)
 	}
 }
+
+// TestColumnarTSVAndSemicolon は TSV(タブ区切り)と ';' 区切り CSV が列指向変換で
+// 採用され byte 一致で往復すること、および区切りが正しく記録されることを確認する。
+func TestColumnarTSVAndSemicolon(t *testing.T) {
+	rng := rand.New(rand.NewSource(21))
+	for _, tc := range []struct {
+		name  string
+		delim byte
+	}{{"tsv", '\t'}, {"semicolon", ';'}} {
+		var b bytes.Buffer
+		fmt.Fprintf(&b, "seq%clevel%crand\n", tc.delim, tc.delim)
+		seq := 1000
+		levels := []string{"INFO", "WARN", "ERROR"}
+		for i := 0; i < 2000; i++ {
+			seq += rng.Intn(3)
+			fmt.Fprintf(&b, "%d%c%s%c%d\n", seq, tc.delim, levels[rng.Intn(3)], tc.delim, rng.Intn(1<<30))
+		}
+		orig := b.Bytes()
+		u, ok := TryUnwrapCSV(orig, 1<<20)
+		if !ok {
+			t.Fatalf("%s が採用されなかった", tc.name)
+		}
+		if u.Recipe.Delim != tc.delim {
+			t.Errorf("%s: Delim=%q 期待 %q", tc.name, u.Recipe.Delim, tc.delim)
+		}
+		rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(rt, orig) {
+			t.Fatalf("%s 往復不一致: err=%v", tc.name, err)
+		}
+		// seq 列は delta 系が選ばれるはず(区切りに依らず列指向が効く)。
+		if u.Recipe.Codec[0] == colRaw {
+			t.Errorf("%s: seq 列が raw(delta 系期待)", tc.name)
+		}
+	}
+	// ',' CSV は従来通り Delim=0(既定)で記録されること(後方互換)。
+	var c bytes.Buffer
+	c.WriteString("a,b,n\n")
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&c, "x,y,%d\n", i)
+	}
+	if u, ok := TryUnwrapCSV(c.Bytes(), 1<<20); ok {
+		if u.Recipe.Delim != 0 {
+			t.Errorf("',' CSV は Delim=0 期待、実際 %q", u.Recipe.Delim)
+		}
+	}
+}

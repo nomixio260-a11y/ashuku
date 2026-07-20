@@ -39,6 +39,7 @@ type CSVRecipe struct {
 	Delta      []bool  `json:"d,omitempty"`  // 旧: 列ごとの数値 delta フラグ(後方互換)
 	Codec      []uint8 `json:"cc,omitempty"` // 新: 列ごとのコーデック(raw/delta/dict)
 	ColBytes   []int   `json:"cb,omitempty"` // 新: 列ごとのセグメントバイト長
+	Delim      byte    `json:"dl,omitempty"` // 区切り文字(0=',' 既定。TSV='\t'/欧州=';')
 }
 
 // CSVUnwrapped は分解結果。
@@ -58,7 +59,12 @@ func IsCSV(head []byte) bool {
 	if i := bytes.IndexByte(head, '\n'); i >= 0 {
 		line = head[:i]
 	}
-	if len(line) < 3 || bytes.IndexByte(line, ',') < 0 {
+	if len(line) < 3 {
+		return false
+	}
+	// 区切り候補(',' TSV='\t' 欧州=';')のいずれかを先頭行に含むこと。
+	if bytes.IndexByte(line, ',') < 0 && bytes.IndexByte(line, '\t') < 0 &&
+		bytes.IndexByte(line, ';') < 0 {
 		return false
 	}
 	for _, b := range line {
@@ -169,19 +175,35 @@ func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 			lines[i] = lines[i][:len(lines[i])-1]
 		}
 	}
-	ncol := bytes.Count(lines[0], []byte{','}) + 1
-	if ncol < csvMinCols || ncol > csvMaxCols {
-		return nil, false
-	}
 	nrows := len(lines)
-	// 各行を列に分割し、矩形性を確認。
-	grid := make([][][]byte, nrows)
-	for i, ln := range lines {
-		f := bytes.Split(ln, []byte{','})
-		if len(f) != ncol {
-			return nil, false // 非矩形 → 変換不可
+	// 区切り文字を検出する。',' を最優先(既存 CSV の挙動を厳密に維持)し、矩形に
+	// ならなければ '\t'(TSV)・';'(欧州 CSV/ログ)を試す。純粋に追加的なので、
+	// 従来 ',' で成立していたファイルの挙動は変わらない。
+	var grid [][][]byte
+	var ncol int
+	delim := byte(',')
+	for _, d := range []byte{',', '\t', ';'} {
+		nc := bytes.Count(lines[0], []byte{d}) + 1
+		if nc < csvMinCols || nc > csvMaxCols {
+			continue
 		}
-		grid[i] = f
+		g := make([][][]byte, nrows)
+		rect := true
+		for i, ln := range lines {
+			f := bytes.Split(ln, []byte{d})
+			if len(f) != nc {
+				rect = false
+				break
+			}
+			g[i] = f
+		}
+		if rect {
+			grid, ncol, delim = g, nc, d
+			break
+		}
+	}
+	if grid == nil {
+		return nil, false // どの区切りでも矩形にならない
 	}
 
 	// 列ごとに最適コーデック(raw/delta/dict)を選び、連結ブロブを作る。
@@ -195,6 +217,9 @@ func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 	recipe := &CSVRecipe{
 		Cols: ncol, Rows: nrows, TrailingNL: trailingNL, CRLF: crlf,
 		Codec: codecs, ColBytes: colBytes,
+	}
+	if delim != ',' {
+		recipe.Delim = delim // ',' は 0(既定)で保存し既存レシピと同形を保つ
 	}
 
 	// 最終安全弁: 復元して orig とバイト一致を確認。
@@ -231,7 +256,11 @@ func ReconstructCSV(recipe *CSVRecipe, blob []byte) ([]byte, error) {
 		}
 		fields = g
 	}
-	// 行を ',' で、行同士を '\n' で連結。
+	// 行を区切り文字で、行同士を '\n' で連結。Delim==0 は ',' (既定/旧レシピ)。
+	delim := recipe.Delim
+	if delim == 0 {
+		delim = ','
+	}
 	var out bytes.Buffer
 	out.Grow(len(blob))
 	for r := 0; r < nrows; r++ {
@@ -240,7 +269,7 @@ func ReconstructCSV(recipe *CSVRecipe, blob []byte) ([]byte, error) {
 		}
 		for c := 0; c < ncol; c++ {
 			if c > 0 {
-				out.WriteByte(',')
+				out.WriteByte(delim)
 			}
 			out.Write(fields[r][c])
 		}
