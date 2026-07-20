@@ -30,6 +30,7 @@ type hevcSPS struct {
 	log2MaxPcm       int
 	pcmLoopFilterOff bool
 	numDeltaPocs     []int // 各 st_ref_pic_set の NumDeltaPocs
+	rpsNumUsed       []int // 各 st_ref_pic_set の used_by_curr 数(NumPocTotalCurr 寄与)
 	longTermPresent  bool
 	numLongTermSPS   int
 	temporalMvp      bool
@@ -39,33 +40,35 @@ type hevcSPS struct {
 
 // hevcPPS は PPS の解析結果。
 type hevcPPS struct {
-	ppsID                 int
-	spsID                 int
-	dependentSlices       bool
-	outputFlagPresent     bool
-	numExtraSliceBits     int
-	signDataHiding        bool
-	cabacInitPresent      bool
-	initQP                int
-	constrainedIntraPred  bool
-	transformSkip         bool
-	cuQPDeltaEnabled      bool
-	diffCuQPDeltaDepth    int
+	ppsID                  int
+	spsID                  int
+	dependentSlices        bool
+	outputFlagPresent      bool
+	numExtraSliceBits      int
+	signDataHiding         bool
+	cabacInitPresent       bool
+	numRefIdxL0Default     int
+	numRefIdxL1Default     int
+	initQP                 int
+	constrainedIntraPred   bool
+	transformSkip          bool
+	cuQPDeltaEnabled       bool
+	diffCuQPDeltaDepth     int
 	cbQPOffset, crQPOffset int
-	sliceChromaQPOffsets  bool
-	weightedPred          bool
-	weightedBipred        bool
-	transquantBypass      bool
-	tilesEnabled          bool
-	entropyCodingSync     bool // WPP
-	loopFilterAcrossSlice bool
-	deblockingOverride    bool
-	deblockingDisabled    bool
-	betaOffset, tcOffset  int
-	scalingListPresent    bool
-	listsModPresent       bool
-	log2ParallelMerge     int
-	sliceHdrExtPresent    bool
+	sliceChromaQPOffsets   bool
+	weightedPred           bool
+	weightedBipred         bool
+	transquantBypass       bool
+	tilesEnabled           bool
+	entropyCodingSync      bool // WPP
+	loopFilterAcrossSlice  bool
+	deblockingOverride     bool
+	deblockingDisabled     bool
+	betaOffset, tcOffset   int
+	scalingListPresent     bool
+	listsModPresent        bool
+	log2ParallelMerge      int
+	sliceHdrExtPresent     bool
 }
 
 // hevcParsePTL は profile_tier_level を読み飛ばす。
@@ -124,66 +127,75 @@ func hevcParsePTL(r *h264Reader, maxSubLayersMinus1 int) bool {
 	return true
 }
 
-// hevcParseShortTermRPS は st_ref_pic_set を読み、NumDeltaPocs を返す。
+// hevcParseShortTermRPS は st_ref_pic_set を読み、NumDeltaPocs と
+// NumPocTotalCurr 寄与(used_by_curr_pic の数)を返す。
 // idx == 0 の場合 inter 予測フラグは存在しない。
-func hevcParseShortTermRPS(r *h264Reader, idx int, prevNumDelta []int) (int, bool) {
+func hevcParseShortTermRPS(r *h264Reader, idx int, prevNumDelta []int) (int, int, bool) {
 	interPred := false
 	if idx != 0 {
 		b, err := r.u1()
 		if err != nil {
-			return 0, false
+			return 0, 0, false
 		}
 		interPred = b == 1
 	}
 	if interPred {
 		// SPS 内では RefRpsIdx = idx-1(delta_idx なし)
 		if idx == 0 || idx-1 >= len(prevNumDelta) {
-			return 0, false
+			return 0, 0, false
 		}
 		if _, err := r.u1(); err != nil { // delta_rps_sign
-			return 0, false
+			return 0, 0, false
 		}
 		if _, err := r.ue(); err != nil { // abs_delta_rps_minus1
-			return 0, false
+			return 0, 0, false
 		}
 		refNum := prevNumDelta[idx-1]
-		count := 0
+		count, used := 0, 0
 		for j := 0; j <= refNum; j++ {
-			used, err := r.u1()
+			u, err := r.u1()
 			if err != nil {
-				return 0, false
+				return 0, 0, false
 			}
 			useDelta := 1
-			if used == 0 {
+			if u == 0 {
 				ud, err := r.u1()
 				if err != nil {
-					return 0, false
+					return 0, 0, false
 				}
 				useDelta = int(ud)
 			}
-			if used == 1 || useDelta == 1 {
+			if u == 1 {
+				used++
+			}
+			if u == 1 || useDelta == 1 {
 				count++
 			}
 		}
-		return count, true
+		return count, used, true
 	}
 	nNeg, err := r.ue()
 	if err != nil || nNeg > 16 {
-		return 0, false
+		return 0, 0, false
 	}
 	nPos, err := r.ue()
 	if err != nil || nPos > 16 {
-		return 0, false
+		return 0, 0, false
 	}
+	used := 0
 	for i := 0; i < int(nNeg)+int(nPos); i++ {
-		if _, err := r.ue(); err != nil {
-			return 0, false
+		if _, err := r.ue(); err != nil { // delta_poc
+			return 0, 0, false
 		}
-		if _, err := r.u1(); err != nil {
-			return 0, false
+		u, err := r.u1() // used_by_curr_pic
+		if err != nil {
+			return 0, 0, false
+		}
+		if u == 1 {
+			used++
 		}
 	}
-	return int(nNeg) + int(nPos), true
+	return int(nNeg) + int(nPos), used, true
 }
 
 // hevcSkipScalingList は scaling_list_data を読み飛ばす。
@@ -378,11 +390,12 @@ func parseHEVCSPS(rbsp []byte) (*hevcSPS, bool) {
 		return nil, false
 	}
 	for i := 0; i < int(nRps); i++ {
-		nd, ok := hevcParseShortTermRPS(r, i, s.numDeltaPocs)
+		nd, nu, ok := hevcParseShortTermRPS(r, i, s.numDeltaPocs)
 		if !ok {
 			return nil, false
 		}
 		s.numDeltaPocs = append(s.numDeltaPocs, nd)
+		s.rpsNumUsed = append(s.rpsNumUsed, nu)
 	}
 	if b, err = r.u1(); err != nil {
 		return nil, false
@@ -455,12 +468,16 @@ func parseHEVCPPS(rbsp []byte) (*hevcPPS, bool) {
 		return nil, false
 	}
 	p.cabacInitPresent = b == 1
-	if _, err = r.ue(); err != nil { // num_ref_idx_l0_default_active_minus1
+	v0, err := r.ue() // num_ref_idx_l0_default_active_minus1
+	if err != nil || v0 > 14 {
 		return nil, false
 	}
-	if _, err = r.ue(); err != nil { // num_ref_idx_l1_default_active_minus1
+	p.numRefIdxL0Default = int(v0) + 1
+	v1, err := r.ue() // num_ref_idx_l1_default_active_minus1
+	if err != nil || v1 > 14 {
 		return nil, false
 	}
+	p.numRefIdxL1Default = int(v1) + 1
 	sv, err := r.se()
 	if err != nil {
 		return nil, false

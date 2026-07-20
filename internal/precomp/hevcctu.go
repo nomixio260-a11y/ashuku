@@ -1,17 +1,20 @@
 package precomp
 
-// HEVC I スライスの CABAC 構文走査(ピクセル復号なし)。
+// HEVC の CABAC 構文走査(ピクセル復号なし、I/P/B スライス対応)。
 //
 // H.264 側(cabacmb.go)と同じ設計: ビン入出力を cabacSink 抽象に通し、
 // 文脈選択(ctxIdx)と近傍状態だけを FFmpeg(=規格)と同一に再現する。
-// 走査に必要な永続状態は CU 分割深さ(tab_ct_depth)と輝度イントラ
-// モード(tab_ipm)のみ。残差の CSBF・greater1 状態・Rice パラメータは
-// TU ローカル。WPP(entropy_coding_sync)は行頭での terminate+バイト
-// 整列+文脈復元(前行 CTU2 個目後のスナップショット)で追随する。
+// 走査に必要な永続状態は CU 分割深さ(tab_ct_depth)・輝度イントラモード
+// (tab_ipm)・cu_skip_flag のみ。動きベクトル・参照ピクチャ・マージ候補は
+// 復号後の導出でありビットのパースには一切不要なので追わない。残差の
+// CSBF・greater1 状態・Rice パラメータは TU ローカル。WPP は行頭での
+// terminate+エントリポイント再初期化+前行 CTU2 個目後の文脈復元で追随。
 //
-// v1 の対象: I スライス・4:2:0・タイルなし。RExt 拡張(persistent rice、
-// transform_skip_context、cu_chroma_qp_offset 等)は非対応で、該当
-// ストリームは走査が破綻して検証で弾かれる(素通し保存に落ちる)。
+// inter(P/B): cu_skip_flag / pred_mode / part_mode(AMP 含む)/ merge /
+// inter_pred_idc / ref_idx / mvd_coding / mvp / rqt_root_cbf を復号する。
+// v1 の対象: 4:2:0・タイルなし・長期参照/SCC なし。RExt 拡張(persistent
+// rice、transform_skip_context 等)は非対応で、該当ストリームは走査が
+// 破綻して検証で弾かれる(素通し保存に落ちる)。
 
 // hevcTraceFn はデバッグ用トレースフック(テストから設定、通常 nil)。
 var hevcTraceFn func(format string, args ...any)
@@ -73,6 +76,7 @@ type hevcPicState struct {
 	minPuW, minPuH int
 	ctDepth        []uint8 // min-CB 粒度の分割深さ
 	ipm            []uint8 // min-PU 粒度の輝度イントラモード
+	skip           []uint8 // min-CB 粒度の cu_skip_flag(P/B の skip 文脈用)
 }
 
 func newHEVCPicState(sps *hevcSPS, pps *hevcPPS) *hevcPicState {
@@ -87,6 +91,7 @@ func newHEVCPicState(sps *hevcSPS, pps *hevcPPS) *hevcPicState {
 	}
 	p.ctDepth = make([]uint8, p.minCbW*p.minCbH)
 	p.ipm = make([]uint8, p.minPuW*p.minPuH)
+	p.skip = make([]uint8, p.minCbW*p.minCbH)
 	return p
 }
 
@@ -103,13 +108,16 @@ type hevcWalk struct {
 	ctbLeft, ctbUp bool
 
 	// CU 単位(走査中の一時状態)
-	tqBypass       bool
-	intraSplit     bool
-	maxTrafoDepth  int
-	puMode         [4]uint8
-	cuModeC        uint8
+	tqBypass        bool
+	intraSplit      bool
+	cuIntra         bool // 現 CU が intra か
+	interSplit0     bool // inter の depth0 強制分割条件
+	curDepth        int  // 現 CU の四分木深さ(inter_pred_idc 文脈用)
+	maxTrafoDepth   int
+	puMode          [4]uint8
+	cuModeC         uint8
 	tuMode, tuModeC uint8
-	isQpDeltaCoded bool
+	isQpDeltaCoded  bool
 
 	ok bool
 }
@@ -352,63 +360,347 @@ func (w *hevcWalk) splitCUCtx(x0, y0, depth int) int {
 
 // --- CU ---
 
+// part_mode の値(FFmpeg PART_* と同順)。
+const (
+	hevcPart2Nx2N = 0
+	hevcPart2NxN  = 1
+	hevcPartNx2N  = 2
+	hevcPartNxN   = 3
+	hevcPart2NxnU = 4
+	hevcPart2NxnD = 5
+	hevcPartNLx2N = 6
+	hevcPartNRx2N = 7
+)
+
 func (w *hevcWalk) codingUnit(x0, y0, log2, depth int) {
 	sps := w.pic.sps
 	pps := w.pic.pps
 	s := w.sink
+	inter := w.sl.isInter()
+	size := 1 << log2
+	length := size >> sps.log2MinCb
+	xCb, yCb := x0>>sps.log2MinCb, y0>>sps.log2MinCb
 
 	hevcTrace("CU x=%d y=%d log2=%d", x0, y0, log2)
 	w.intraSplit = false
+	w.interSplit0 = false
+	w.curDepth = depth
 	w.tqBypass = false
 	if pps.transquantBypass {
 		w.tqBypass = s.decision(hevcCtxTQBypass) == 1
 	}
-	// I スライス: skip_flag/pred_mode_flag なし、常に intra
-	partNxN := false
-	if log2 == sps.log2MinCb {
-		if s.decision(hevcCtxPartMode) == 0 {
-			partNxN = true
-			w.intraSplit = true
+
+	skip := false
+	if inter {
+		skip = s.decision(hevcCtxSkipFlag+w.skipCtx(x0, y0)) == 1
+		hevcTrace("SKIP v=%d", b2i(skip))
+	}
+	// skip_flag を近傍参照のため即時に CU 全域へ書き戻す
+	for y := 0; y < length; y++ {
+		row := (yCb+y)*w.pic.minCbW + xCb
+		for x := 0; x < length; x++ {
+			w.pic.skip[row+x] = uint8(b2i(skip))
 		}
 	}
-	pcm := false
-	if !partNxN && sps.pcmEnabled &&
-		log2 >= sps.log2MinPcm && log2 <= sps.log2MaxPcm {
-		pcm = s.terminate() == 1
-	}
-	part := 0
-	if partNxN {
-		part = 3
-	}
-	hevcTrace("CUI part=%d pcm=%d", part, b2i(pcm))
-	if pcm {
-		w.fillIPM(x0, y0, 1<<log2, hevcIntraDC)
-		size := 1 << log2
-		bits := size*size*sps.pcmBitDepthLuma +
-			2*(size>>1)*(size>>1)*sps.pcmBitDepthChr
-		if !s.intraPCM((bits + 7) >> 3) {
-			w.ok = false
-			return
-		}
+
+	if skip {
+		w.cuIntra = false
+		w.fillIPM(x0, y0, size, hevcIntraDC)
+		w.predictionUnit(size, size, 0, true)
 	} else {
-		w.intraPredictionUnit(x0, y0, log2)
+		predIntra := true
+		if inter {
+			predIntra = s.decision(hevcCtxPredMode) == 1
+			hevcTrace("PMODE v=%d", b2i(predIntra))
+		}
+		w.cuIntra = predIntra
+		part := hevcPart2Nx2N
+		if !predIntra || log2 == sps.log2MinCb {
+			part = w.partMode(log2, predIntra)
+			hevcTrace("PART p=%d intra=%d", part, b2i(predIntra))
+		}
+		w.intraSplit = part == hevcPartNxN && predIntra
+
+		pcm := false
+		mergeFlag := false
+		if predIntra {
+			if part == hevcPart2Nx2N && sps.pcmEnabled &&
+				log2 >= sps.log2MinPcm && log2 <= sps.log2MaxPcm {
+				pcm = s.terminate() == 1
+			}
+			hevcTrace("CUI part=%d pcm=%d", part, b2i(pcm))
+			if pcm {
+				w.fillIPM(x0, y0, size, hevcIntraDC)
+				bits := size*size*sps.pcmBitDepthLuma +
+					2*(size>>1)*(size>>1)*sps.pcmBitDepthChr
+				if !s.intraPCM((bits + 7) >> 3) {
+					w.ok = false
+					return
+				}
+			} else {
+				w.intraPredictionUnit(x0, y0, log2)
+			}
+		} else {
+			w.fillIPM(x0, y0, size, hevcIntraDC)
+			mergeFlag = w.interDispatch(x0, y0, log2, part)
+		}
 		if !w.ok {
 			return
 		}
-		w.maxTrafoDepth = sps.maxTrDepthIntra + b2i(w.intraSplit)
-		w.transformTree(x0, y0, x0, y0, log2, 0, 0, 0, 0)
-		if !w.ok {
-			return
+		if !pcm {
+			rqtRoot := true
+			if !predIntra && !(part == hevcPart2Nx2N && mergeFlag) {
+				rqtRoot = s.decision(hevcCtxNoResidual) == 1
+				hevcTrace("RQT v=%d", b2i(rqtRoot))
+			}
+			if rqtRoot {
+				if predIntra {
+					w.maxTrafoDepth = sps.maxTrDepthIntra + b2i(w.intraSplit)
+				} else {
+					w.maxTrafoDepth = sps.maxTrDepthInter
+					w.interSplit0 = sps.maxTrDepthInter == 0 && part != hevcPart2Nx2N
+				}
+				w.transformTree(x0, y0, x0, y0, log2, 0, 0, 0, 0)
+				if !w.ok {
+					return
+				}
+			}
 		}
 	}
 	// CU 全域に分割深さを書き戻す
-	length := (1 << log2) >> sps.log2MinCb
-	xCb, yCb := x0>>sps.log2MinCb, y0>>sps.log2MinCb
 	for y := 0; y < length; y++ {
 		row := (yCb+y)*w.pic.minCbW + xCb
 		for x := 0; x < length; x++ {
 			w.pic.ctDepth[row+x] = uint8(depth)
 		}
+	}
+}
+
+// skipCtx は cu_skip_flag の文脈 inc(左/上 CB の skip)。
+func (w *hevcWalk) skipCtx(x0, y0 int) int {
+	sps := w.pic.sps
+	ctbMask := (1 << sps.log2CtbSize) - 1
+	x0b, y0b := x0&ctbMask, y0&ctbMask
+	xCb, yCb := x0>>sps.log2MinCb, y0>>sps.log2MinCb
+	inc := 0
+	if (w.ctbLeft || x0b != 0) && w.pic.skip[yCb*w.pic.minCbW+xCb-1] != 0 {
+		inc++
+	}
+	if (w.ctbUp || y0b != 0) && w.pic.skip[(yCb-1)*w.pic.minCbW+xCb] != 0 {
+		inc++
+	}
+	return inc
+}
+
+// partMode は part_mode を復号する(FFmpeg ff_hevc_part_mode_decode)。
+func (w *hevcWalk) partMode(log2 int, intra bool) int {
+	s := w.sink
+	sps := w.pic.sps
+	if s.decision(hevcCtxPartMode) == 1 {
+		return hevcPart2Nx2N
+	}
+	if log2 == sps.log2MinCb {
+		if intra {
+			return hevcPartNxN
+		}
+		if s.decision(hevcCtxPartMode+1) == 1 {
+			return hevcPart2NxN
+		}
+		if log2 == 3 {
+			return hevcPartNx2N
+		}
+		if s.decision(hevcCtxPartMode+2) == 1 {
+			return hevcPartNx2N
+		}
+		return hevcPartNxN
+	}
+	if !sps.amp {
+		if s.decision(hevcCtxPartMode+1) == 1 {
+			return hevcPart2NxN
+		}
+		return hevcPartNx2N
+	}
+	if s.decision(hevcCtxPartMode+1) == 1 {
+		if s.decision(hevcCtxPartMode+3) == 1 {
+			return hevcPart2NxN
+		}
+		if s.bypass() == 1 {
+			return hevcPart2NxnD
+		}
+		return hevcPart2NxnU
+	}
+	if s.decision(hevcCtxPartMode+3) == 1 {
+		return hevcPartNx2N
+	}
+	if s.bypass() == 1 {
+		return hevcPartNRx2N
+	}
+	return hevcPartNLx2N
+}
+
+// interDispatch は part_mode に応じて各 PU を予測パースし、最後の PU の
+// merge_flag を返す(rqt_root_cbf 条件用)。
+func (w *hevcWalk) interDispatch(x0, y0, log2, part int) bool {
+	cb := 1 << log2
+	last := false
+	pu := func(nPbW, nPbH, idx int) {
+		if w.ok {
+			last = w.predictionUnit(nPbW, nPbH, idx, false)
+		}
+	}
+	switch part {
+	case hevcPart2Nx2N:
+		pu(cb, cb, 0)
+	case hevcPart2NxN:
+		pu(cb, cb/2, 0)
+		pu(cb, cb/2, 1)
+	case hevcPartNx2N:
+		pu(cb/2, cb, 0)
+		pu(cb/2, cb, 1)
+	case hevcPart2NxnU:
+		pu(cb, cb/4, 0)
+		pu(cb, cb*3/4, 1)
+	case hevcPart2NxnD:
+		pu(cb, cb*3/4, 0)
+		pu(cb, cb/4, 1)
+	case hevcPartNLx2N:
+		pu(cb/4, cb, 0)
+		pu(cb*3/4, cb, 1)
+	case hevcPartNRx2N:
+		pu(cb*3/4, cb, 0)
+		pu(cb/4, cb, 1)
+	case hevcPartNxN:
+		pu(cb/2, cb/2, 0)
+		pu(cb/2, cb/2, 1)
+		pu(cb/2, cb/2, 2)
+		pu(cb/2, cb/2, 3)
+	}
+	return last
+}
+
+// predictionUnit は 1 PU の inter 予測構文を復号し merge_flag を返す。
+func (w *hevcWalk) predictionUnit(nPbW, nPbH, partIdx int, skip bool) bool {
+	s := w.sink
+	sl := w.sl
+	mergeFlag := skip
+	if !skip {
+		mergeFlag = s.decision(hevcCtxMergeFlag) == 1
+	}
+	if skip || mergeFlag {
+		idx := 0
+		if sl.maxNumMerge > 1 {
+			idx = s.decision(hevcCtxMergeIdx)
+			if idx != 0 {
+				for idx < sl.maxNumMerge-1 && s.bypass() == 1 {
+					idx++
+				}
+			}
+		}
+		hevcTrace("MRG f=1 idx=%d", idx)
+		return mergeFlag
+	}
+	hevcTrace("MRG f=0")
+	// AMVP: inter_pred_idc(B のみ)→ L0/L1 それぞれ ref_idx/mvd/mvp
+	idc := 0 // PRED_L0
+	if sl.isB() {
+		idc = w.interPredIdc(nPbW, nPbH)
+	}
+	hevcTrace("IPD idc=%d", idc)
+	if idc != 1 { // != PRED_L1 → L0 or BI
+		w.refIdx(0, sl.numRefIdx[0])
+		w.mvdCoding()
+		mvp := s.decision(hevcCtxMvpFlag)
+		hevcTrace("MVP l=0 v=%d", mvp)
+	}
+	if idc != 0 { // != PRED_L0 → L1 or BI
+		w.refIdx(1, sl.numRefIdx[1])
+		if !(sl.mvdL1Zero && idc == 2) {
+			w.mvdCoding()
+		}
+		mvp := s.decision(hevcCtxMvpFlag)
+		hevcTrace("MVP l=1 v=%d", mvp)
+	}
+	return mergeFlag
+}
+
+// interPredIdc は inter_pred_idc を復号(0=L0,1=L1,2=BI)。
+func (w *hevcWalk) interPredIdc(nPbW, nPbH int) int {
+	s := w.sink
+	if nPbW+nPbH == 12 {
+		if s.decision(hevcCtxInterPredIdc+4) == 1 {
+			return 1
+		}
+		return 0
+	}
+	// ct_depth 文脈: 現 CU の四分木深さ。ct_depth は quadtree の depth に一致。
+	if s.decision(hevcCtxInterPredIdc+w.curDepth) == 1 {
+		return 2 // PRED_BI
+	}
+	if s.decision(hevcCtxInterPredIdc+4) == 1 {
+		return 1
+	}
+	return 0
+}
+
+// refIdx は ref_idx_lX を復号(先頭 min(max,2) bin が文脈、以降 bypass)。
+func (w *hevcWalk) refIdx(list, numRef int) {
+	s := w.sink
+	max := numRef - 1
+	i := 0
+	if max > 0 {
+		maxCtx := max
+		if maxCtx > 2 {
+			maxCtx = 2
+		}
+		for i < maxCtx && s.decision(hevcCtxRefIdx+i) == 1 {
+			i++
+		}
+		if i == 2 {
+			for i < max && s.bypass() == 1 {
+				i++
+			}
+		}
+	}
+	hevcTrace("REF l=%d idx=%d", list, i)
+}
+
+// mvdCoding は mvd_coding を復号(x/y 2 成分)。
+func (w *hevcWalk) mvdCoding() {
+	s := w.sink
+	gt0x := s.decision(hevcCtxAbsMvdGt0)
+	gt0y := s.decision(hevcCtxAbsMvdGt0)
+	xv, yv := gt0x, gt0y
+	if gt0x == 1 {
+		xv += s.decision(hevcCtxAbsMvdGt1 + 1)
+	}
+	if gt0y == 1 {
+		yv += s.decision(hevcCtxAbsMvdGt1 + 1)
+	}
+	w.mvdComponent(xv)
+	w.mvdComponent(yv)
+	hevcTrace("MVD x=%d y=%d", xv, yv)
+}
+
+// mvdComponent は 1 成分の残り(abs_mvd_minus2 EG1 + 符号、または符号のみ)。
+func (w *hevcWalk) mvdComponent(v int) {
+	s := w.sink
+	switch v {
+	case 2: // abs_mvd_minus2: EG1 bypass prefix+suffix, 符号
+		k := 1
+		for k < 31 && s.bypass() == 1 {
+			k++
+		}
+		if k >= 31 {
+			w.ok = false
+			return
+		}
+		for k > 0 {
+			k--
+			s.bypass()
+		}
+		s.bypass() // sign
+	case 1:
+		s.bypass() // sign
 	}
 }
 
@@ -554,14 +846,16 @@ func (w *hevcWalk) transformTree(x0, y0, xBase, yBase, log2, depth, blkIdx, base
 	s := w.sink
 	cbfCb, cbfCr := baseCbfCb, baseCbfCr
 
-	if w.intraSplit {
-		if depth == 1 {
-			w.tuMode = w.puMode[blkIdx]
+	if w.cuIntra {
+		if w.intraSplit {
+			if depth == 1 {
+				w.tuMode = w.puMode[blkIdx]
+				w.tuModeC = w.cuModeC
+			}
+		} else {
+			w.tuMode = w.puMode[0]
 			w.tuModeC = w.cuModeC
 		}
-	} else {
-		w.tuMode = w.puMode[0]
-		w.tuModeC = w.cuModeC
 	}
 
 	var split bool
@@ -569,7 +863,8 @@ func (w *hevcWalk) transformTree(x0, y0, xBase, yBase, log2, depth, blkIdx, base
 		depth < w.maxTrafoDepth && !(w.intraSplit && depth == 0) {
 		split = s.decision(hevcCtxSplitTrafo+5-log2) == 1
 	} else {
-		split = log2 > sps.log2MaxTb || (w.intraSplit && depth == 0)
+		interSplit := w.interSplit0 && depth == 0
+		split = log2 > sps.log2MaxTb || (w.intraSplit && depth == 0) || interSplit
 	}
 
 	if sps.chromaFormatIDC != 0 && log2 > 2 {
@@ -598,8 +893,12 @@ func (w *hevcWalk) transformTree(x0, y0, xBase, yBase, log2, depth, blkIdx, base
 		return
 	}
 
-	// intra は cbf_luma を常に復号
-	cbfLuma := s.decision(hevcCtxCbfLuma + b2i(depth == 0))
+	// cbf_luma: intra は常に復号。inter は depth!=0 か色差 cbf があるとき
+	// のみ復号し、depth0 で色差 cbf 無しなら暗黙 1。
+	cbfLuma := 1
+	if w.cuIntra || depth != 0 || cbfCb != 0 || cbfCr != 0 {
+		cbfLuma = s.decision(hevcCtxCbfLuma + b2i(depth == 0))
+	}
 	hevcTrace("TU x=%d y=%d log2=%d d=%d blk=%d cbfL=%d", x0, y0, log2, depth, blkIdx, cbfLuma)
 	w.transformUnit(x0, y0, xBase, yBase, log2, blkIdx, cbfLuma, cbfCb, cbfCr)
 }
@@ -620,8 +919,9 @@ func (w *hevcWalk) transformUnit(x0, y0, xBase, yBase, log2, blkIdx, cbfLuma, cb
 	}
 	// cu_chroma_qp_offset は RExt(chroma_qp_offset_list)のみ: v1 対象外
 
+	// スキャン選択はモード依存だが inter では常に DIAG。
 	scanIdx, scanIdxC := hevcScanDiag, hevcScanDiag
-	if log2 < 4 {
+	if w.cuIntra && log2 < 4 {
 		if w.tuMode >= 6 && w.tuMode <= 14 {
 			scanIdx = hevcScanVert
 		} else if w.tuMode >= 22 && w.tuMode <= 30 {

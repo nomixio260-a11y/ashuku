@@ -290,8 +290,8 @@ func (s *hevcRebuildSink) intraPCM(nBytes int) bool {
 func (s *hevcRebuildSink) initCtx(sliceQP, initType int) {
 	hevcInitStates(&s.st, sliceQP, initType)
 }
-func (s *hevcRebuildSink) saveCtx()                      { s.saved = s.st }
-func (s *hevcRebuildSink) loadCtx()                      { s.st = s.saved }
+func (s *hevcRebuildSink) saveCtx() { s.saved = s.st }
+func (s *hevcRebuildSink) loadCtx() { s.st = s.saved }
 
 // finishSub は現サブストリームの正準出力へ [delta][tail] を適用し out に足す。
 func (s *hevcRebuildSink) finishSub() bool {

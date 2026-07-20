@@ -15,7 +15,15 @@ type hevcSlice struct {
 	numEntry      int
 	entryOffsets  []int // entry_point_offset(+1 済み、バイト)
 	headerBits    int   // NAL ヘッダ(2バイト)後からヘッダ末尾(整列後)までのビット数
+	// inter(P/B)用
+	numRefIdx   [2]int // num_ref_idx_lX_active(L0/L1)
+	maxNumMerge int    // MaxNumMergeCand(1..5)
+	mvdL1Zero   bool   // mvd_l1_zero_flag
+	temporalMvp bool   // slice_temporal_mvp_enabled_flag
 }
+
+func (sl *hevcSlice) isInter() bool { return sl.sliceType != 2 }
+func (sl *hevcSlice) isB() bool     { return sl.sliceType == 0 }
 
 // ceilLog2 は av_ceil_log2 相当。
 func ceilLog2(n int) int {
@@ -76,6 +84,7 @@ func parseHEVCSliceHeader(r *h264Reader, sps *hevcSPS, pps *hevcPPS, nalType int
 			return nil, false
 		}
 	}
+	numPocTotalCurr := 0
 	isIDR := nalType == hevcNALIDRWRadl || nalType == hevcNALIDRNLP
 	if !isIDR {
 		if _, err := r.u(sps.log2MaxPocLsb); err != nil { // poc_lsb
@@ -88,24 +97,35 @@ func parseHEVCSliceHeader(r *h264Reader, sps *hevcSPS, pps *hevcPPS, nalType int
 		if spsFlag == 0 {
 			// スライス内 st_ref_pic_set(idx = num_short_term_ref_pic_sets)
 			idx := len(sps.numDeltaPocs)
-			if _, ok := hevcParseShortTermRPSSlice(r, idx, sps.numDeltaPocs); !ok {
+			_, used, ok := hevcParseShortTermRPSSlice(r, idx, sps.numDeltaPocs)
+			if !ok {
 				return nil, false
 			}
+			numPocTotalCurr = used
 		} else if len(sps.numDeltaPocs) > 0 {
 			nb := ceilLog2(len(sps.numDeltaPocs))
+			rpsIdx := 0
 			if nb > 0 {
-				if _, err := r.u(nb); err != nil {
+				v, err := r.u(nb)
+				if err != nil {
 					return nil, false
 				}
+				rpsIdx = int(v)
 			}
-		}
-		if sps.longTermPresent {
-			return nil, false // 長期参照つきは対象外(v1、全イントラでは出ない)
-		}
-		if sps.temporalMvp {
-			if _, err := r.u1(); err != nil { // slice_temporal_mvp_enabled
+			if rpsIdx >= len(sps.rpsNumUsed) {
 				return nil, false
 			}
+			numPocTotalCurr = sps.rpsNumUsed[rpsIdx]
+		}
+		if sps.longTermPresent {
+			return nil, false // 長期参照つきは対象外(v1、まれ)
+		}
+		if sps.temporalMvp {
+			b, err := r.u1() // slice_temporal_mvp_enabled
+			if err != nil {
+				return nil, false
+			}
+			sl.temporalMvp = b == 1
 		}
 	}
 	if sps.sao {
@@ -122,8 +142,109 @@ func parseHEVCSliceHeader(r *h264Reader, sps *hevcSPS, pps *hevcPPS, nalType int
 			sl.saoChroma = b == 1
 		}
 	}
-	if sl.sliceType != 2 {
-		return nil, false // P/B スライスは対象外(v1: 全イントラのみ)
+	if sl.isInter() {
+		// P/B スライス固有ブロック(7.3.6.1)
+		sl.numRefIdx[0] = pps.numRefIdxL0Default
+		if sl.isB() {
+			sl.numRefIdx[1] = pps.numRefIdxL1Default
+		}
+		ov, err := r.u1() // num_ref_idx_active_override_flag
+		if err != nil {
+			return nil, false
+		}
+		if ov == 1 {
+			v, err := r.ue()
+			if err != nil || v > 14 {
+				return nil, false
+			}
+			sl.numRefIdx[0] = int(v) + 1
+			if sl.isB() {
+				v, err := r.ue()
+				if err != nil || v > 14 {
+					return nil, false
+				}
+				sl.numRefIdx[1] = int(v) + 1
+			}
+		}
+		if numPocTotalCurr == 0 {
+			return nil, false // 参照ゼロの P/B は不正
+		}
+		// ref_pic_lists_modification
+		if pps.listsModPresent && numPocTotalCurr > 1 {
+			nb := ceilLog2(numPocTotalCurr)
+			m0, err := r.u1()
+			if err != nil {
+				return nil, false
+			}
+			if m0 == 1 {
+				for i := 0; i < sl.numRefIdx[0]; i++ {
+					if _, err := r.u(nb); err != nil {
+						return nil, false
+					}
+				}
+			}
+			if sl.isB() {
+				m1, err := r.u1()
+				if err != nil {
+					return nil, false
+				}
+				if m1 == 1 {
+					for i := 0; i < sl.numRefIdx[1]; i++ {
+						if _, err := r.u(nb); err != nil {
+							return nil, false
+						}
+					}
+				}
+			}
+		}
+		if sl.isB() {
+			b, err := r.u1() // mvd_l1_zero_flag
+			if err != nil {
+				return nil, false
+			}
+			sl.mvdL1Zero = b == 1
+		}
+		if pps.cabacInitPresent {
+			b, err := r.u1() // cabac_init_flag
+			if err != nil {
+				return nil, false
+			}
+			sl.cabacInitFlag = b == 1
+		}
+		if sl.temporalMvp {
+			collocatedList := 0
+			if sl.isB() {
+				c, err := r.u1() // collocated_from_l0_flag
+				if err != nil {
+					return nil, false
+				}
+				if c == 0 {
+					collocatedList = 1
+				}
+			}
+			if sl.numRefIdx[collocatedList] > 1 {
+				if _, err := r.ue(); err != nil { // collocated_ref_idx
+					return nil, false
+				}
+			}
+		}
+		wp := (pps.weightedPred && sl.sliceType == 1) ||
+			(pps.weightedBipred && sl.isB())
+		if wp {
+			if !hevcParsePredWeightTable(r, sps, sl) {
+				return nil, false
+			}
+		}
+		five, err := r.ue() // five_minus_max_num_merge_cand
+		if err != nil || five > 4 {
+			return nil, false
+		}
+		sl.maxNumMerge = 5 - int(five)
+		if sl.maxNumMerge < 1 {
+			return nil, false
+		}
+		// motion_vector_resolution_control_idc(SCC 拡張)は非対応前提で
+		// use_integer_mv_flag は読まない(通常ストリームでは出ない)。
 	}
 	q, err := r.se()
 	if err != nil {
@@ -217,14 +338,74 @@ func parseHEVCSliceHeader(r *h264Reader, sps *hevcSPS, pps *hevcPPS, nalType int
 	return sl, true
 }
 
+// hevcParsePredWeightTable は pred_weight_table(7.3.6.3)を読み飛ばす。
+// 重み値は復号に不要(パースのみ)なので構造だけ追う。
+func hevcParsePredWeightTable(r *h264Reader, sps *hevcSPS, sl *hevcSlice) bool {
+	if _, err := r.ue(); err != nil { // luma_log2_weight_denom
+		return false
+	}
+	if sps.chromaFormatIDC != 0 {
+		if _, err := r.se(); err != nil { // delta_chroma_log2_weight_denom
+			return false
+		}
+	}
+	lists := 1
+	if sl.isB() {
+		lists = 2
+	}
+	for l := 0; l < lists; l++ {
+		n := sl.numRefIdx[l]
+		lumaFlags := make([]int, n)
+		for i := 0; i < n; i++ {
+			b, err := r.u1() // luma_weight_lX_flag
+			if err != nil {
+				return false
+			}
+			lumaFlags[i] = int(b)
+		}
+		chromaFlags := make([]int, n)
+		if sps.chromaFormatIDC != 0 {
+			for i := 0; i < n; i++ {
+				b, err := r.u1() // chroma_weight_lX_flag
+				if err != nil {
+					return false
+				}
+				chromaFlags[i] = int(b)
+			}
+		}
+		for i := 0; i < n; i++ {
+			if lumaFlags[i] == 1 {
+				if _, err := r.se(); err != nil { // delta_luma_weight
+					return false
+				}
+				if _, err := r.se(); err != nil { // luma_offset
+					return false
+				}
+			}
+			if chromaFlags[i] == 1 {
+				for j := 0; j < 2; j++ {
+					if _, err := r.se(); err != nil { // delta_chroma_weight
+						return false
+					}
+					if _, err := r.se(); err != nil { // delta_chroma_offset
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
 // hevcParseShortTermRPSSlice はスライスヘッダ内の st_ref_pic_set。
 // スライス内では inter 予測時に delta_idx_minus1 が現れる。
-func hevcParseShortTermRPSSlice(r *h264Reader, idx int, numDelta []int) (int, bool) {
+// 戻り値: NumDeltaPocs, NumPocTotalCurr 寄与(used 数), ok。
+func hevcParseShortTermRPSSlice(r *h264Reader, idx int, numDelta []int) (int, int, bool) {
 	interPred := false
 	if idx != 0 {
 		b, err := r.u1()
 		if err != nil {
-			return 0, false
+			return 0, 0, false
 		}
 		interPred = b == 1
 	}
@@ -232,53 +413,61 @@ func hevcParseShortTermRPSSlice(r *h264Reader, idx int, numDelta []int) (int, bo
 		// スライス内では delta_idx_minus1 が常に存在する
 		d, err := r.ue()
 		if err != nil {
-			return 0, false
+			return 0, 0, false
 		}
 		refIdx := idx - 1 - int(d)
 		if refIdx < 0 || refIdx >= len(numDelta) {
-			return 0, false
+			return 0, 0, false
 		}
 		if _, err := r.u1(); err != nil {
-			return 0, false
+			return 0, 0, false
 		}
 		if _, err := r.ue(); err != nil {
-			return 0, false
+			return 0, 0, false
 		}
-		count := 0
+		count, used := 0, 0
 		for j := 0; j <= numDelta[refIdx]; j++ {
-			used, err := r.u1()
+			u, err := r.u1()
 			if err != nil {
-				return 0, false
+				return 0, 0, false
 			}
 			useDelta := 1
-			if used == 0 {
+			if u == 0 {
 				ud, err := r.u1()
 				if err != nil {
-					return 0, false
+					return 0, 0, false
 				}
 				useDelta = int(ud)
 			}
-			if used == 1 || useDelta == 1 {
+			if u == 1 {
+				used++
+			}
+			if u == 1 || useDelta == 1 {
 				count++
 			}
 		}
-		return count, true
+		return count, used, true
 	}
 	nNeg, err := r.ue()
 	if err != nil || nNeg > 16 {
-		return 0, false
+		return 0, 0, false
 	}
 	nPos, err := r.ue()
 	if err != nil || nPos > 16 {
-		return 0, false
+		return 0, 0, false
 	}
+	used := 0
 	for i := 0; i < int(nNeg)+int(nPos); i++ {
 		if _, err := r.ue(); err != nil {
-			return 0, false
+			return 0, 0, false
 		}
-		if _, err := r.u1(); err != nil {
-			return 0, false
+		u, err := r.u1()
+		if err != nil {
+			return 0, 0, false
+		}
+		if u == 1 {
+			used++
 		}
 	}
-	return int(nNeg) + int(nPos), true
+	return int(nNeg) + int(nPos), used, true
 }
