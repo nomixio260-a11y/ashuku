@@ -49,6 +49,57 @@ func TestBase64RoundTrip(t *testing.T) {
 	}
 }
 
+// b64Wrap は base64 文字列を幅 w で折り、各行(末尾含む)を sep で終える。
+func b64WrapTest(s string, w int, sep string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i += w {
+		e := i + w
+		if e > len(s) {
+			e = len(s)
+		}
+		b.WriteString(s[i:e])
+		b.WriteString(sep)
+	}
+	return b.String()
+}
+
+// TestBase64Wrapped は行折り返し(PEM/MIME)base64 が 1 セグメントに畳まれ、
+// 各種セパレータ・パディング・末尾区切りで往復一致することを確認する。
+func TestBase64Wrapped(t *testing.T) {
+	blobText := func(n int, seed int64) []byte {
+		r := rand.New(rand.NewSource(seed))
+		var b bytes.Buffer
+		for b.Len() < n {
+			fmt.Fprintf(&b, "line %d user=alice status=ok region=us\n", r.Intn(100))
+		}
+		return b.Bytes()[:n]
+	}
+	enc := base64.StdEncoding.EncodeToString(blobText(6000, 1))
+	cases := map[string]string{
+		"pem-lf-trail":     "-----BEGIN X-----\n" + b64WrapTest(enc, 64, "\n") + "-----END X-----\n",
+		"mime-crlf-trail":  "Content:\r\n" + b64WrapTest(enc, 76, "\r\n") + "--boundary--\r\n",
+		"lf-no-trail":      "data=" + strings.TrimSuffix(b64WrapTest(enc, 64, "\n"), "\n") + " end",
+		"width-60":         "x\n" + b64WrapTest(enc, 60, "\n") + "y\n",
+	}
+	for name, data := range cases {
+		d := []byte(data)
+		u, ok := TryUnwrapBase64(d, 1<<20)
+		if !ok {
+			t.Logf("%s: 非採用(安全)", name)
+			continue
+		}
+		rt, err := ReconstructBase64(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(rt, d) {
+			t.Fatalf("%s: 折り返し往復不一致: err=%v", name, err)
+		}
+		// 折り返しは 1 セグメントに畳まれるはず。
+		if len(u.Recipe.Segments) != 1 || u.Recipe.Segments[0].LineW == 0 {
+			t.Errorf("%s: 折り返しが 1 セグメントに畳まれていない(segs=%d LineW=%d)",
+				name, len(u.Recipe.Segments), u.Recipe.Segments[0].LineW)
+		}
+	}
+}
+
 func TestBase64Compresses(t *testing.T) {
 	// 少数の大きめ・ユニークな圧縮可能バイナリを base64 した文書(証明書束・
 	// ペイロードダンプ等)は、復号採用で明確に縮むはず。

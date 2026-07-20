@@ -33,6 +33,10 @@ type Base64Segment struct {
 	RawLen  int  `json:"n"`           // 復号バイナリ長(plains 分割用)
 	URL     bool `json:"u,omitempty"` // URL-safe アルファベット(-_)
 	Pad     bool `json:"d,omitempty"` // '=' パディング付き
+	// 行折り返し(PEM/MIME)。LineW>0 で復元時に幅 LineW ごとに Sep で折る。
+	LineW int  `json:"w,omitempty"` // 0=連続。>0=折り返し幅
+	CRLF  bool `json:"r,omitempty"` // 区切りが \r\n(既定 \n)
+	Trail bool `json:"t,omitempty"` // 最終行の後にも区切りが付く
 }
 
 // Base64Recipe は base64 分解の再構成レシピ。Chunked = 骨格 + 復号バイナリ列。
@@ -142,6 +146,134 @@ func scanB64Region(orig []byte, start int) (seg Base64Segment, end int, plain []
 	return Base64Segment{RawLen: len(dec), URL: url, Pad: padded}, j, dec, true
 }
 
+// b64Rewrap は base64 文字列 chars を幅 w ごとに sep で折る(PEM/MIME 復元)。
+func b64Rewrap(chars string, w int, crlf, trail bool) []byte {
+	sep := "\n"
+	if crlf {
+		sep = "\r\n"
+	}
+	var out []byte
+	for i := 0; i < len(chars); i += w {
+		e := i + w
+		if e > len(chars) {
+			e = len(chars)
+		}
+		out = append(out, chars[i:e]...)
+		if e < len(chars) || trail {
+			out = append(out, sep...)
+		}
+	}
+	return out
+}
+
+// isB64Data は c が base64 データ文字か(パディングと区切りは除く)を返し、
+// アルファベット種別を更新する。
+func isB64Data(c byte, hasStd, hasURL *bool) bool {
+	if b64IsAlnum(c) {
+		return true
+	}
+	if c == '+' || c == '/' {
+		*hasStd = true
+		return true
+	}
+	if c == '-' || c == '_' {
+		*hasURL = true
+		return true
+	}
+	return false
+}
+
+// scanB64Wrapped は orig[start] から始まる**行折り返し**(均一幅+一定区切り)の
+// base64 ブロックを 1 セグメントとして解析する。PEM/MIME(証明書束・大きな添付)
+// を多数の行別セグメントに割らず、レシピを小さく保つ。均一でない/1 行のみは
+// ok=false(連続スキャナへ委ねる)。復元 rewrap が領域と厳密一致する時のみ採用。
+func scanB64Wrapped(orig []byte, start int) (seg Base64Segment, end int, plain []byte, ok bool) {
+	n := len(orig)
+	var hasStd, hasURL bool
+	// 1 行目
+	i := start
+	for i < n && isB64Data(orig[i], &hasStd, &hasURL) {
+		i++
+	}
+	w := i - start
+	if w < 24 { // 折り返しとみなすには狭すぎ(連続スキャナに任せる)
+		return seg, 0, nil, false
+	}
+	var crlf bool
+	if i < n && orig[i] == '\n' {
+		crlf = false
+	} else if i+1 < n && orig[i] == '\r' && orig[i+1] == '\n' {
+		crlf = true
+	} else {
+		return seg, 0, nil, false // 区切りなし=折り返しでない
+	}
+	sepLen := 1
+	if crlf {
+		sepLen = 2
+	}
+	var b64 []byte
+	b64 = append(b64, orig[start:i]...)
+	j := i
+	lines := 1
+	trail := false
+	for {
+		// 区切りを消費
+		j += sepLen
+		ls := j
+		for j < n && isB64Data(orig[j], &hasStd, &hasURL) {
+			j++
+		}
+		lineW := j - ls
+		pad := 0
+		for pad < 2 && j < n && orig[j] == '=' {
+			pad++
+			j++
+		}
+		total := lineW + pad
+		if total == 0 { // 区切りの直後がすぐ非 base64 → 直前の区切りは末尾
+			trail = true
+			break
+		}
+		if total > w {
+			return seg, 0, nil, false // 幅が広がる=均一でない
+		}
+		b64 = append(b64, orig[ls:j]...)
+		lines++
+		// 次に同種区切り+続きがあるか
+		var nextSep bool
+		if !crlf && j < n && orig[j] == '\n' {
+			nextSep = true
+		} else if crlf && j+1 < n && orig[j] == '\r' && orig[j+1] == '\n' {
+			nextSep = true
+		}
+		if total == w && pad == 0 && nextSep {
+			continue // 満行 → 続行
+		}
+		// 最終行(短い/パディング/次に区切りなし)
+		if nextSep {
+			trail = true
+			j += sepLen
+		}
+		break
+	}
+	if lines < 2 || hasStd && hasURL {
+		return seg, 0, nil, false // 1 行のみ or 混在アルファベット
+	}
+	region := orig[start:j]
+	url := hasURL
+	padded := len(b64) > 0 && b64[len(b64)-1] == '='
+	enc := b64Encoding(url, padded)
+	dec, err := enc.Strict().DecodeString(string(b64))
+	if err != nil || len(dec) == 0 {
+		return seg, 0, nil, false
+	}
+	// 正準性 + 折り返し再現が領域と厳密一致すること。
+	if !bytes.Equal(b64Rewrap(enc.EncodeToString(dec), w, crlf, trail), region) {
+		return seg, 0, nil, false
+	}
+	return Base64Segment{RawLen: len(dec), URL: url, Pad: padded, LineW: w, CRLF: crlf, Trail: trail}, j, dec, true
+}
+
 // TryUnwrapBase64 は base64 領域を復号してチャンク化内容へ差し替える。
 func TryUnwrapBase64(orig []byte, maxPlain int64) (*Base64Unwrapped, bool) {
 	if maxPlain <= 0 || maxPlain > maxPlainTotal {
@@ -158,6 +290,16 @@ func TryUnwrapBase64(orig []byte, maxPlain int64) (*Base64Unwrapped, bool) {
 	for i < n {
 		c := orig[i]
 		if b64IsAlnum(c) || c == '+' || c == '/' || c == '-' || c == '_' {
+			// 折り返しブロックを優先(PEM/MIME を 1 セグメントに畳む)、
+			// だめなら連続 1 行として解析。
+			if seg, end, plain, ok := scanB64Wrapped(orig, i); ok {
+				seg.SkelPos = len(skel)
+				recipe.Segments = append(recipe.Segments, seg)
+				plains = append(plains, plain...)
+				coded++
+				i = end
+				continue
+			}
 			seg, end, plain, ok := scanB64Region(orig, i)
 			if ok {
 				seg.SkelPos = len(skel)
@@ -230,7 +372,12 @@ func ReconstructBase64(recipe *Base64Recipe, chunked []byte) ([]byte, error) {
 		out = append(out, skel[skelPrev:sg.SkelPos]...)
 		bin := plains[plainOff : plainOff+sg.RawLen]
 		enc := b64Encoding(sg.URL, sg.Pad)
-		out = append(out, enc.EncodeToString(bin)...)
+		chars := enc.EncodeToString(bin)
+		if sg.LineW > 0 { // 折り返し(PEM/MIME)を再現
+			out = append(out, b64Rewrap(chars, sg.LineW, sg.CRLF, sg.Trail)...)
+		} else {
+			out = append(out, chars...)
+		}
 		skelPrev = sg.SkelPos
 		plainOff += sg.RawLen
 	}
