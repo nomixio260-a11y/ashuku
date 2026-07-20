@@ -234,6 +234,8 @@ type FileManifest struct {
 	PrecompTS *precomp.TSRecipe `json:"precomp_ts,omitempty"`
 	// PrecompMP3 は MP3 の再構成レシピ。
 	PrecompMP3 *precomp.MP3Recipe `json:"precomp_mp3,omitempty"`
+	// PrecompAAC は AAC(ADTS)の再構成レシピ。
+	PrecompAAC *precomp.AACRecipe `json:"precomp_aac,omitempty"`
 	// OrigSHA256 は元ストリームの SHA-256(復元時の最終検証用)。
 	OrigSHA256 string `json:"orig_sha256,omitempty"`
 	// ChunkedSize はチャンク化された内容のサイズ。precompression 適用時は
@@ -293,6 +295,8 @@ const (
 	EncodingTSV1 = "ts-h264-v1"
 	// EncodingMP3V1 は MP3 を骨格分離+文脈算術で保存。
 	EncodingMP3V1 = "mp3-v1"
+	// EncodingAACV1 は AAC(ADTS)を骨格分離+文脈算術で保存。
+	EncodingAACV1 = "aac-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

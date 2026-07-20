@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -712,6 +712,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		}
 		m.Encoding = EncodingMP3V1
 		m.PrecompMP3 = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsAAC(buf):
+		u, ok := precomp.TryUnwrapAAC(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingAACV1
+		m.PrecompAAC = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsJSONL(buf):
 		if u, ok := precomp.TryUnwrapJSONL(buf, s.precompMax); ok {
@@ -1371,6 +1379,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructTS(m.PrecompTS, plain.Bytes())
 	case EncodingMP3V1:
 		orig, err = precomp.ReconstructMP3(m.PrecompMP3, plain.Bytes())
+	case EncodingAACV1:
+		orig, err = precomp.ReconstructAAC(m.PrecompAAC, plain.Bytes())
 	default:
 		err = fmt.Errorf("未知のエンコーディング %q", m.Encoding)
 	}
