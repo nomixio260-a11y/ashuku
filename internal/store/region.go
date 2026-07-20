@@ -578,6 +578,20 @@ func (s *Store) compactRegions(res *OptimizeResult) error {
 	return nil
 }
 
+// dissolveReadFailHook はテストがメンバー読み出しの一過性失敗を注入するための
+// フック(本番は nil)。指定ハッシュに対して error を返せば readChunk が失敗した
+// 状況を決定的に再現できる。
+var dissolveReadFailHook func(hash string) error
+
+func (s *Store) readChunkForDissolve(hash string) ([]byte, error) {
+	if dissolveReadFailHook != nil {
+		if err := dissolveReadFailHook(hash); err != nil {
+			return nil, err
+		}
+	}
+	return s.readChunk(hash)
+}
+
 // dissolveRegion はリージョンの生き残りメンバーを独立 zstd 表現に戻し、
 // リージョンを削除する(buildRegions が次パスで詰め直す)。
 func (s *Store) dissolveRegion(regionID string, res *OptimizeResult) error {
@@ -595,9 +609,15 @@ func (s *Store) dissolveRegion(regionID string, res *OptimizeResult) error {
 		return err
 	}
 	for _, hash := range live {
-		data, err := s.readChunk(hash)
+		data, err := s.readChunkForDissolve(hash)
 		if err != nil {
-			continue
+			// メンバーを 1 つでも独立表現へ戻せないなら、このリージョンを削除しては
+			// ならない。リージョンファイルはそのメンバーの唯一の保管先であり、
+			// 末尾の deleteRegionMeta+os.Remove まで進むと未変換メンバーが恒久的に
+			// 読めなくなる(=データ損失)。読み出し失敗は一過性(EMFILE/EIO 等)の
+			// こともあるため、今回の解体は中止して次の Optimize/scrub に委ねる。
+			// 既に変換済みのメンバーはリージョン未削除なので無害(次パスで再走査)。
+			return nil
 		}
 		out := s.compressChunk(data, "balanced")
 		comp := compressionZstd
