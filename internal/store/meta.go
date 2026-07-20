@@ -230,6 +230,8 @@ type FileManifest struct {
 	PrecompMP4HEVC *precomp.MP4HEVCRecipe `json:"precomp_mp4_hevc,omitempty"`
 	// PrecompHEIF は HEIC/HEIF(HEVC イントラ)の再構成レシピ。
 	PrecompHEIF *precomp.HEIFRecipe `json:"precomp_heif,omitempty"`
+	// PrecompM4A は MP4/M4A 入り AAC の再構成レシピ。
+	PrecompM4A *precomp.M4ARecipe `json:"precomp_m4a,omitempty"`
 	// PrecompTS は MPEG-TS コンテナ入り H.264 の再構成レシピ。
 	PrecompTS *precomp.TSRecipe `json:"precomp_ts,omitempty"`
 	// PrecompMP3 は MP3 の再構成レシピ。
@@ -297,6 +299,8 @@ const (
 	EncodingMP3V1 = "mp3-v1"
 	// EncodingAACV1 は AAC(ADTS)を骨格分離+文脈算術で保存。
 	EncodingAACV1 = "aac-v1"
+	// EncodingM4AV1 は MP4/M4A 内の AAC を骨格分離+文脈算術で保存。
+	EncodingM4AV1 = "m4a-v1"
 )
 
 // ChunkMeta はユニークチャンク1件のメタデータ。

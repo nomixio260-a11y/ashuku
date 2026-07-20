@@ -671,12 +671,18 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 			m.precompPlain = u.Chunked
 			break
 		}
-		u, ok := precomp.TryUnwrapMP4HEVC(buf, s.precompMax)
+		if u, ok := precomp.TryUnwrapMP4HEVC(buf, s.precompMax); ok {
+			m.Encoding = EncodingMP4HEVCV1
+			m.PrecompMP4HEVC = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		u, ok := precomp.TryUnwrapM4A(buf, s.precompMax)
 		if !ok {
 			return false
 		}
-		m.Encoding = EncodingMP4HEVCV1
-		m.PrecompMP4HEVC = u.Recipe
+		m.Encoding = EncodingM4AV1
+		m.PrecompM4A = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsH264(buf) || precomp.IsHEVC(buf):
 		// NAL 先頭バイトのエイリアスがあるため両方を順に試す
@@ -1373,6 +1379,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructHEVC(m.PrecompHEVC, plain.Bytes())
 	case EncodingMP4HEVCV1:
 		orig, err = precomp.ReconstructMP4HEVC(m.PrecompMP4HEVC, plain.Bytes())
+	case EncodingM4AV1:
+		orig, err = precomp.ReconstructM4A(m.PrecompM4A, plain.Bytes())
 	case EncodingHEIFV1:
 		orig, err = precomp.ReconstructHEIF(m.PrecompHEIF, plain.Bytes())
 	case EncodingTSV1:
