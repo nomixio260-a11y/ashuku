@@ -173,15 +173,25 @@
   CABAC は情報理論的に既に密なため CAVLC(−5〜8%)ほどは縮みませんが、
   「縮まない」とされてきた領域からの確実な回収です(RESEARCH.md §4.35〜4.37)。
   断片化 MP4(fMP4/DASH/画面録画)のサンプル表(moof/trun)にも対応しています。
-- **HEVC(H.265)イントラの可逆再圧縮**: HEVC の I スライス CABAC
-  (全イントラ収録・IRAP、4:2:0、WPP 対応)を FFmpeg と同一の文脈導出で
-  走査し、「学習型二次算術 × CABAC 状態確率」の混合モデルへ載せ替えます。
-  生ストリーム(Annex B)・MP4/MOV(hvc1/hev1)・MPEG-TS(stream_type
-  0x24)の 3 コンテナに対応し、混在 GOP では I スライスだけ再符号化して
-  P/B は原文のまま保持、常に全体をバイト一致検証してから採用します。
-  実測: 1080p 静止画(HEIC 様)−1.0%、720p 全イントラ −0.9〜1.8%
-  (対 zstd 上乗せ)。VP9・AV1 は対象外のまま安全に素通しします
-  (重複排除のみ有効)。
+- **HEVC(H.265)動画の可逆再圧縮 — スマホ動画本体**: HEVC の CABAC を
+  FFmpeg と同一の文脈導出で走査し、「学習型二次算術 × CABAC 状態確率」の
+  混合モデルへ載せ替えます。I スライス(全イントラ・IRAP)に加え、
+  **スマホ動画の大半のバイトを占める P/B(inter)スライスにフル対応**:
+  cu_skip_flag・merge/AMVP・inter_pred_idc・参照インデックス・mvd_coding・
+  part_mode(AMP 含む)を規格通りに復号します(動きベクトルや参照ピクチャは
+  ビットのパースに不要なので追跡しません)。生ストリーム(Annex B)・
+  MP4/MOV(hvc1/hev1、断片化含む)・MPEG-TS(stream_type 0x24)の 3
+  コンテナ対応で、混在 GOP も含めた**動画全体**を再符号化します。
+  4:2:0・WPP 対応。常に全体をバイト一致検証してから採用します。
+  検証は instrumented FFmpeg との構文トレース完全一致(30 スライス・840
+  CTU・87747 行、B フレーム含む)で担保。実測(対 zstd 上乗せ、往復検証つき):
+  720p GOP 動画 生 −1.7% / MP4 −1.9% / MPEG-TS −2.4%、全イントラ −0.9〜1.8%。
+- **HEIC/HEIF(iPhone 写真)の可逆再圧縮**: iPhone 標準の写真形式 HEIC は
+  HEVC イントラを ISOBMFF の meta/iloc/iinf アイテム構造で格納します。
+  iloc からアイテムのバイト範囲と hvcC のパラメータセットを取り出し、
+  上記 HEVC エンジンでイントラ再符号化します(単一 hvc1 アイテム・
+  construction_method 0)。実測 −1.0%。VP9・AV1 は対象外のまま安全に
+  素通しします(重複排除のみ有効)。
 
 > **運用ノート**: デルタは「新しい世代 → 古い世代への差分」の順方向チェーンなので、
 > 古い世代を削除した直後は、新しい世代が参照しているベースチャンクが
@@ -206,7 +216,8 @@
 | H.264 動画(CAVLC = 監視・ドラレコ・DVR・旧機。生/MP4) | **1.05〜1.1倍**(−5〜8%、ビット一致復元) |
 | H.264 動画(CABAC = スマホ・現行機の実機構成 I/P/B+8x8。生/MP4/**TS**) | **1.02〜1.04倍**(−2〜4%、ビット一致復元) |
 | MPEG-TS 録画(ドラレコ・DVR・テレビ録画・HLS セグメント) | 中の H.264/HEVC を再符号化(−2〜3%、ビット一致復元) |
-| HEVC 全イントラ・静止画系(生/MP4 hvc1/TS) | 素の zstd 比 −1〜2% 上乗せ(I スライスのみ再符号化、ビット一致復元) |
+| HEVC スマホ動画(生/MP4 hvc1/MOV/TS、I+P+B 全体) | 素の zstd 比 −1.7〜2.4% 上乗せ(動画全体を再符号化、ビット一致復元) |
+| HEIC/HEIF 写真(iPhone 標準) | 素の zstd 比 −1% 上乗せ(HEVC イントラを再符号化、ビット一致復元) |
 | MP3 音声 | 骨格分離+文脈算術で素の zstd 比 −0.5〜3% 上乗せ(全 MP3 採用、ビット一致復元) |
 | BMP/TIFF(非圧縮ラスタ画像) | **約2倍**(行予測フィルタ、写真調 BMP で −51%、ビット一致復元) |
 | WAV/AIFF(非圧縮 PCM 音声) | **1.3〜2倍以上**(16bit で −25〜−38%、24bit・低エントロピー音源はさらに大 −88〜96%) |
@@ -462,7 +473,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC イントラ(生/MP4/TS) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス

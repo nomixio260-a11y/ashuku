@@ -2083,6 +2083,79 @@ HEVC 固有の壁がいくつもあった。
   イントラそのもの。コンテナ解析の追加のみ。
 - VP9/AV1・AAC 本体・WebP: 対象外継続。
 
+## 4.40 独自研究(2026-07-20): HEVC P/B(inter)スライス — スマホ動画本体の可逆再圧縮
+
+§4.39 の HEVC イントラは静止画・全イントラ収録止まりだった。スマホ動画の
+実体は **P/B(inter)スライスが大半のバイトを占める**。ここに対応して初めて
+「スマホ動画の圧縮」が成立する。イントラで確立した走査系(FFmpeg と同一の
+文脈導出 → 二次算術)へ inter 構文を追加した。
+
+### (a) 決定的な発見: 動きベクトルはパースに不要
+inter の肝は「何をパースに要求されるか」の見極めだった。結論は明快で、
+**merge_idx・inter_pred_idc・ref_idx・mvd・mvp_flag を読み終えた後の
+動きベクトル導出(AMVP/merge 候補構築)は CABAC から 1 bit も消費しない**。
+参照ピクチャ・MV フィールド・マージ候補リストは一切追跡不要。inter で
+新規に必要な永続近傍状態は cu_skip_flag 配列(min-CB 粒度、左/上参照)のみ。
+これで実装量が激減し、イントラの走査系にほぼ差分だけで載った。
+
+### (b) 実装した inter 構文(すべて FFmpeg=規格と同一)
+- coding_unit: cu_skip_flag(左/上 skip 文脈)・pred_mode_flag・part_mode の
+  完全二値化(2Nx2N/2NxN/Nx2N/NxN + AMP 4 種、min-CB 特例、amp_enabled 依存)・
+  rqt_root_cbf(2Nx2N かつ merge でスキップ)
+- prediction_unit: merge_flag / merge_idx、非 merge は inter_pred_idc
+  (nPbW+nPbH==12 で BI 禁止の 1 bin 特例、B のみ)→ L0/L1 各方向の
+  ref_idx_lX(L0/L1 で文脈共用)・mvd_coding・mvp_lX_flag。mvd_l1_zero 対応
+- mvd_coding: abs_mvd_greater0(文脈 31)・greater1(文脈 34、+1)・
+  abs_mvd_minus2(EG1 バイパス)・符号。x/y の読み順
+- transform_tree: inter の cbf_luma 暗黙化(depth0 で色差 cbf 無し→1)、
+  inter_split 強制分割、スキャンは inter で常に対角
+- スライスヘッダ P/B: num_ref_idx override・ref list modification・
+  NumPocTotalCurr(RPS の used_by_curr 数)・collocated・pred_weight_table・
+  five_minus_max_num_merge_cand。長期参照/SCC は稀なので素通し維持
+
+### (c) 検証: instrumented FFmpeg との構文トレース完全一致
+FFmpeg の hevcdec.c/cabac.c に構文要素ごとの fprintf を注入し、Go 側の
+トレースと**行単位で照合**。B フレーム 3 枚を含む GOP(3 I / 6 P / 21 B、
+840 CTU、87747 トレース行)が完全一致。唯一差分に見えた 1 CTU は FFmpeg の
+stderr メタデータダンプがトレース行に混線した出力アーティファクト(生ファイルで
+確認)で、パースは bit 完全一致だった。
+
+### (d) 実測(採用+往復バイト一致、素 zstd 比の上乗せ)
+| 素材 | 上乗せ |
+|---|---|
+| P/B 小片(416x240、GOP) | **−2.26%** |
+| 720p GOP 動画 Annex B | **−1.69%** |
+| 同 MP4 hvc1 | **−1.87%** |
+| 同 MPEG-TS | **−2.41%** |
+| ノイズ入り 720p(実機に近い) | −1.56% |
+
+イントラのみ(−0.9%)の 2 倍以上。P/B は skip/merge/MVD といった冗長ビンが
+多く、二次算術の効きしろが大きい。偏りのあるバイパスビン(MVD の EG1 継続、
+merge_idx/ref_idx の単項継続)も二次側でクラス別に文脈化した。
+
+正直な評価: CABAC は既に密なので**lossless の上限は数%**(ノイズの多い実写では
+さらに薄い)。それでも「スマホ動画の本体(P/B)を丸ごと確実に回収する」という
+目標は達成し、全対応の原則(膨張ゼロ・ビット一致・非対応は安全素通し)を守った。
+
+## 4.41 独自研究(2026-07-20): HEIC/HEIF — iPhone 写真への到達
+
+iPhone 標準の写真形式 HEIC は HEVC イントラを ISOBMFF の meta/iloc/iinf
+アイテム構造で格納する。§4.39 の HEVC イントラエンジンをそのまま使い、
+コンテナ層(meta 内の iinf で hvc1 アイテム特定 → iprp/ipco/hvcC で
+パラメータセット → iloc でバイト範囲)だけを追加した。ペイロードは
+長さ前置 NAL 列で MP4/TS の HEVC 経路と共通。construction_method 0・
+単一 extent の標準構成のみ対象。
+
+本環境に HEIC 生成手段(libheif/HEIF muxer)が無いため、実 HEVC イントラを
+spec 準拠の HEIF に手組みした合成 HEIC で分解→復元のバイト一致を検証
+(−1.05%)。実 iPhone HEIC は未検証だが、**採用前の全体バイト一致検証**が
+安全弁として働くため、想定外の HEIF 構成でも破損はあり得ず素通しに落ちる。
+
+### 残る素通し(更新)
+- HEVC 長期参照/SCC/タイル: 稀。必要なら追加可能
+- VP9/AV1(Android/YouTube)・AAC 本体・WebP: 対象外継続
+- 実 iPhone HEIC での実測: 生成環境が整い次第
+
 ## 5. 再現方法
 
 ```sh
