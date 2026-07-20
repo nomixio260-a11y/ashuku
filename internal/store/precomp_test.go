@@ -765,6 +765,56 @@ func TestJSONLPrecompEndToEnd(t *testing.T) {
 	}
 }
 
+// TestLogPrecompEndToEnd は nginx combined ログを投入→骨格+列指向で分解採用→
+// 読み戻しビット一致→行指向素通しより物理が小さい、を実ストアで確認する。
+func TestLogPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewSource(21))
+	methods := []string{"GET", "GET", "POST", "HEAD"}
+	paths := []string{"/", "/index.html", "/api/v1/users", "/static/app.js", "/favicon.ico"}
+	codes := []int{200, 200, 304, 404, 500}
+	uas := []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0", "curl/7.68.0", "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0)"}
+	var b bytes.Buffer
+	sec := 0
+	for i := 0; i < 20000; i++ {
+		sec += rng.Intn(3)
+		fmt.Fprintf(&b, "10.%d.%d.%d - - [%02d/Jul/2026:%02d:%02d:%02d +0000] \"%s %s HTTP/1.1\" %d %d \"-\" \"%s\"\n",
+			rng.Intn(256), rng.Intn(256), rng.Intn(256), 1+rng.Intn(28),
+			(sec/3600)%24, (sec/60)%60, sec%60, methods[rng.Intn(len(methods))], paths[rng.Intn(len(paths))],
+			codes[rng.Intn(len(codes))], rng.Intn(50000), uas[rng.Intn(len(uas))])
+	}
+	data := b.Bytes()
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "access.log", data)
+	if m.Encoding != EncodingLogV1 {
+		t.Fatalf("ログが列指向分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+
+	s2 := newTestStore(t)
+	m2, err := s2.PutWithOptions("access.log", bytes.NewReader(data), PutOptions{DisablePrecomp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Encoding != "" {
+		t.Fatalf("DisablePrecomp なのに分解された: %q", m2.Encoding)
+	}
+	st1, _ := s.Stats()
+	st2, _ := s2.Stats()
+	t.Logf("列指向 物理=%d / 行指向素通し 物理=%d (-%.1f%%)",
+		st1.PhysicalBytes, st2.PhysicalBytes,
+		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
+	if st1.PhysicalBytes >= st2.PhysicalBytes {
+		t.Fatalf("列指向が行指向より縮んでいない: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻し再確認が一致しない")
+	}
+}
+
 // TestH264PrecompEndToEnd は CAVLC の H.264 を投入→文脈算術で分解採用→
 // 読み戻しビット一致→物理縮小、を実ストアで確認する。
 func TestH264PrecompEndToEnd(t *testing.T) {

@@ -220,6 +220,8 @@ type FileManifest struct {
 	PrecompCSV *precomp.CSVRecipe `json:"precomp_csv,omitempty"`
 	// PrecompJSONL は列指向 JSONL 変換の再構成レシピ。
 	PrecompJSONL *precomp.JSONLRecipe `json:"precomp_jsonl,omitempty"`
+	// PrecompLog は空白区切りログ列指向変換の再構成レシピ。
+	PrecompLog *precomp.LogRecipe `json:"precomp_log,omitempty"`
 	// PrecompH264 は H.264 CAVLC 再圧縮の再構成レシピ。
 	PrecompH264 *precomp.H264Recipe `json:"precomp_h264,omitempty"`
 	// PrecompMP4 は MP4 コンテナ入り H.264 CAVLC の再構成レシピ。
@@ -283,6 +285,8 @@ const (
 	EncodingCSVV1 = "csv-columnar-v1"
 	// EncodingJSONLV1 は同一スキーマ JSONL を骨格+列指向値に分解して保存。
 	EncodingJSONLV1 = "jsonl-columnar-v1"
+	// EncodingLogV1 は空白区切りログを骨格+列指向値に分解して保存。
+	EncodingLogV1 = "log-columnar-v1"
 	// EncodingH264V1 は H.264 CAVLC(Annex B)を文脈算術へ再符号化して保存。
 	EncodingH264V1 = "h264-cavlc-v1"
 	// EncodingMP4V1 は MP4 内の H.264 CAVLC サンプルを再符号化して保存。

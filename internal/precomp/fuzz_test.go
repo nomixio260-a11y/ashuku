@@ -461,6 +461,25 @@ func FuzzTryUnwrapTS(f *testing.F) {
 	})
 }
 
+// FuzzTryUnwrapLog は攻撃者制御の空白区切りログでの分解が panic せず、採用
+// 入力が必ずビット一致で戻ることを検証する。
+func FuzzTryUnwrapLog(f *testing.F) {
+	seed := bytes.Repeat([]byte(`10.0.0.1 - - [20/Jul/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 123 "-" "curl/7"`+"\n"), 10)
+	f.Add(seed)
+	f.Add([]byte("a b c d e f g h\n1 2 3 4 5 6 7 8\n"))
+	f.Add([]byte(`x - - [z] "q w e" 1 2 "-" "unterminated`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapLog(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructLog(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した Log がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
 // globSeed はシード用にファイルを読み込む(存在しなければ空)。
 func globSeed(pattern string) [][]byte {
 	files, _ := filepath.Glob(pattern)

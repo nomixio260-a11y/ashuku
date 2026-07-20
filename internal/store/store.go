@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head) || precomp.IsLog(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -763,6 +763,14 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 		}
 		m.Encoding = EncodingCSVV1
 		m.PrecompCSV = u.Recipe
+		m.precompPlain = u.Chunked
+	case precomp.IsLog(buf):
+		u, ok := precomp.TryUnwrapLog(buf, s.precompMax)
+		if !ok {
+			return false
+		}
+		m.Encoding = EncodingLogV1
+		m.PrecompLog = u.Recipe
 		m.precompPlain = u.Chunked
 	default:
 		return false
@@ -1385,6 +1393,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructCSV(m.PrecompCSV, plain.Bytes())
 	case EncodingJSONLV1:
 		orig, err = precomp.ReconstructJSONL(m.PrecompJSONL, plain.Bytes())
+	case EncodingLogV1:
+		orig, err = precomp.ReconstructLog(m.PrecompLog, plain.Bytes())
 	case EncodingH264V1:
 		orig, err = precomp.ReconstructH264(m.PrecompH264, plain.Bytes())
 	case EncodingMP4V1:

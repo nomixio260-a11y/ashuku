@@ -90,6 +90,14 @@
   構造化ログ(実運用の主流)も対象になります(従来は素通しだったクラスを
   行指向比 −20% 前後で取り込み)。同一スキーマ行のみ対象で、スキーマ違いは
   素通し。復元バイト一致検証+読み出し時 SHA-256。純Go。
+- **空白区切りログ(nginx / Apache combined)の列指向変換**: カンマでも JSON でも
+  ない**空白区切りアクセスログ**も、骨格分離+列指向で縮めます。核心は
+  **`"..."` と `[...]` を途中の空白ごと1フィールドとして原子的に扱う**こと——
+  nginx combined は毎行 9 フィールド(IP・日時・"リクエスト"・ステータス・
+  バイト・"UA" 等)に固定され転置できます。各列は raw/delta/dict(二進 ID)を
+  best-of(リクエスト/UA/ステータスは dict、IP/バイトは raw)。実測で
+  **物理 −28.5%**(従来は素通しだったクラス。RESEARCH.md §4.47)。骨格が全行
+  一致しない行は素通し。復元バイト一致検証+読み出し時 SHA-256。純Go。
 - **raw フォールバック**: 画像・動画など既に圧縮済みのデータは zstd では縮まないため、
   自動的に無圧縮で保存し、サイズ・CPU の無駄を防ぎます。
 - **参照カウント GC**: ファイル削除時、どのファイルからも参照されなくなったチャンク
@@ -236,6 +244,7 @@
 | ログ・テキスト | 5〜45倍 |
 | CSV/区切りテキスト(矩形) | **6〜60倍**(列指向転置+列別 dict(二進ID)/delta(ナノ秒対応)/raw、CRLF 対応で行指向比 −31〜50%、ビット一致復元) |
 | JSONL(構造化ログ・同一スキーマ) | **6〜60倍**(骨格分離+列別 dict(二進ID)/delta/raw で行指向比 −22〜33%、ビット一致復元) |
+| 空白区切りログ(nginx/Apache combined) | **6〜60倍**(引用符/角括弧を原子化した骨格分離+列指向で物理 −28.5%、ビット一致復元) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
 | H.264 動画(CAVLC = 監視・ドラレコ・DVR・旧機。生/MP4) | **1.05〜1.1倍**(−5〜8%、ビット一致復元) |
@@ -499,7 +508,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL列指向 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL・空白区切りログ列指向 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
