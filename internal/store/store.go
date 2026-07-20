@@ -1043,6 +1043,7 @@ type preparedChunk struct {
 	// errChunkVanished を返し、呼び出し側がロック外で再 prepare する。
 	compressed []byte
 	features   []uint64
+	minhash    []uint64
 	baseHash   string
 	deltaData  []byte
 }
@@ -1077,6 +1078,11 @@ func (s *Store) fillPrepared(pc *preparedChunk) {
 	if s.delta {
 		pc.features = computeFeatures(pc.data)
 		pc.baseHash, pc.deltaData = s.tryDelta(pc.features, pc.data, len(pc.compressed))
+	}
+	// 小チャンクはファイル横断ソリッド圧縮のクラスタリングに min-hash を使う
+	// (大チャンクはファイル内リージョン化されるので不要=保存も省く)。
+	if int64(len(pc.data)) <= smallChunkMax {
+		pc.minhash = computeMinHash(pc.data)
 	}
 }
 
@@ -1126,7 +1132,7 @@ func (s *Store) applyChunk(tx *bolt.Tx, pc *preparedChunk, cleanup *[]string) er
 
 	// サーバー経路の取り込みはこの場でデルタ判定済みなので、
 	// オフラインデルタパスの対象から外す。
-	newMeta := &ChunkMeta{RawSize: int64(len(pc.data)), RefCount: 1, Features: pc.features, DeltaTried: true}
+	newMeta := &ChunkMeta{RawSize: int64(len(pc.data)), RefCount: 1, Features: pc.features, MinHash: pc.minhash, DeltaTried: true}
 	var stored []byte
 	switch {
 	case baseHash != "":

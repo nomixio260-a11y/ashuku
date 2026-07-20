@@ -139,6 +139,10 @@ func (s *Store) PutChunkVerified(hash string, stored []byte, compression string,
 	// 類似検索用の特徴はここで計算しておく(1パスのローリングハッシュで安価)。
 	// デルタ圧縮そのものはオフラインパスに任せる。
 	features := computeFeatures(raw)
+	var minhash []uint64
+	if rawSize <= smallChunkMax { // 小チャンクのみクラスタリング用 min-hash
+		minhash = computeMinHash(raw)
+	}
 
 	return s.batchUpdate(func(tx *bolt.Tx) error {
 		meta, err := getChunkMeta(tx, hash)
@@ -159,6 +163,7 @@ func (s *Store) PutChunkVerified(hash string, stored []byte, compression string,
 			RefCount:    0,
 			Staged:      time.Now().Unix(),
 			Features:    features,
+			MinHash:     minhash,
 		}
 		if err := applyRepLocation(tx, newMeta, "", loc, int64(len(stored))); err != nil {
 			return err

@@ -352,6 +352,11 @@ type ChunkMeta struct {
 	RecompressTried bool `json:"rct,omitempty"`
 	// Features は類似検索索引に登録した特徴値(削除時の索引掃除に使う)。
 	Features []uint64 `json:"features,omitempty"`
+	// MinHash は小チャンクのファイル横断クラスタリング用 min-hash 署名
+	// (K 個)。max ベースのスーパー特徴が近重複しか捉えないのに対し、
+	// 同一スキーマ・異値のチャンクの共有語彙(Jaccard)を捉えて隣接させる。
+	// 小チャンク(<= smallChunkMax)のみ持つ。無い旧チャンクは従来並びに退避。
+	MinHash []uint64 `json:"mh,omitempty"`
 }
 
 func openMetaDB(path string) (*bolt.DB, error) {

@@ -89,3 +89,55 @@ func computeFeatures(data []byte) []uint64 {
 	}
 	return features
 }
+
+// mhK は min-hash 署名の要素数(K)。
+const mhK = 4
+
+// mhBase は 8 バイトシングルのローリング多項式ハッシュの基数(FNV 素数)。
+const mhBase = 1099511628211
+
+// mhBasePow8 = mhBase^8(窓から抜けるバイトを取り除くため)。
+var mhBasePow8 = func() uint64 {
+	p := uint64(1)
+	for i := 0; i < 8; i++ {
+		p *= mhBase
+	}
+	return p
+}()
+
+// computeMinHash は 8 バイトシングル上の K-min-hash 署名(Broder)を返す。
+// max ベースのスーパー特徴が「近重複」しか捉えないのに対し、min-hash は
+// n-gram 集合の Jaccard 類似=「共有語彙」を捉える。同一スキーマ・異値の
+// チャンク(ログ・JSON・設定)を高確率で近接させ、ファイル横断ソリッド圧縮
+// (region.go)の効きを上げる。実測(疑似異種コーパス)で小チャンクリージョンが
+// -4.5%(RESEARCH §4.48)。ローリングハッシュで O(n)。8 バイト未満は nil。
+func computeMinHash(data []byte) []uint64 {
+	if len(data) < 8 {
+		return nil
+	}
+	sig := make([]uint64, mhK)
+	for i := range sig {
+		sig[i] = ^uint64(0)
+	}
+	var h uint64
+	for i := 0; i < len(data); i++ {
+		h = h*mhBase + uint64(data[i])
+		if i >= 8 {
+			h -= uint64(data[i-8]) * mhBasePow8
+		}
+		if i < 7 {
+			continue // 窓が満ちるまで
+		}
+		w := h // 8 バイト窓 [i-7..i] のハッシュを混ぜて分散を良くする
+		w ^= w >> 33
+		w *= 0xff51afd7ed558ccd
+		w ^= w >> 33
+		for k := 0; k < mhK; k++ {
+			v := w*featureMuls[k] + featureAdds[k]
+			if v < sig[k] {
+				sig[k] = v
+			}
+		}
+	}
+	return sig
+}

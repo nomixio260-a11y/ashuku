@@ -295,6 +295,7 @@ type smallChunk struct {
 	hash    string
 	raw     int64
 	feature uint64
+	minhash []uint64
 }
 
 // smallChunkCandidate はメタが小チャンクソリッド圧縮の対象かを判定する。
@@ -307,7 +308,7 @@ func smallChunkCandidate(hash string, meta *ChunkMeta) (smallChunk, bool) {
 		if len(meta.Features) > 0 {
 			f = meta.Features[0]
 		}
-		return smallChunk{hash: hash, raw: meta.RawSize, feature: f}, true
+		return smallChunk{hash: hash, raw: meta.RawSize, feature: f, minhash: meta.MinHash}, true
 	}
 	return smallChunk{}, false
 }
@@ -318,13 +319,31 @@ func (s *Store) buildSmallChunkRegionsFrom(chunks []smallChunk, res *OptimizeRes
 	if len(chunks) < 2 {
 		return nil
 	}
-	// 内容の近いチャンク(共有スーパーフィーチャ)を隣接させ、ソリッド圧縮の
-	// 効きを最大化する。特徴が無い/一致しないチャンクはハッシュ順で安定化。
+	// 内容の近いチャンクを隣接させ、ソリッド圧縮の効きを最大化する。
+	// min-hash 署名(共有語彙=Jaccard)を持つものはそれで並べる。max ベースの
+	// スーパー特徴(Features[0])は近重複しか捉えず、同一スキーマ・異値の
+	// チャンクではほぼ無情報(実測 adjacency ~ ランダム)だった。min-hash は
+	// 同スキーマを高確率で近接させる(RESEARCH §4.48)。min-hash を持つ
+	// チャンクを前方に集め、その中は署名の辞書順、無いものは従来の feature 順。
 	sort.Slice(chunks, func(i, j int) bool {
-		if chunks[i].feature != chunks[j].feature {
-			return chunks[i].feature < chunks[j].feature
+		a, b := chunks[i], chunks[j]
+		ha, hb := len(a.minhash) == mhK, len(b.minhash) == mhK
+		if ha != hb {
+			return ha // min-hash 持ちを前に
 		}
-		return chunks[i].hash < chunks[j].hash
+		if ha { // 両方 min-hash: 署名を辞書順で比較
+			for k := 0; k < mhK; k++ {
+				if a.minhash[k] != b.minhash[k] {
+					return a.minhash[k] < b.minhash[k]
+				}
+			}
+			return a.hash < b.hash
+		}
+		// どちらも min-hash 無し(旧チャンク): 従来の feature 順で退避。
+		if a.feature != b.feature {
+			return a.feature < b.feature
+		}
+		return a.hash < b.hash
 	})
 
 	var run []string
