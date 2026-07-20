@@ -224,6 +224,12 @@ type FileManifest struct {
 	PrecompLog *precomp.LogRecipe `json:"precomp_log,omitempty"`
 	// PrecompBase64 は base64 復号分解の再構成レシピ。
 	PrecompBase64 *precomp.Base64Recipe `json:"precomp_base64,omitempty"`
+	// InnerEncoding は再帰 precompression の内側変換(gzip 等の展開データに
+	// さらにテキスト系の列指向を重ねた場合の内側方式)。空なら再帰なし。
+	// 内側レシピは対応する Precomp{CSV,JSONL,Log} フィールドを共用する
+	// (外側が gzip 等のとき、それらは内側レシピを指す。外側がテキスト系の
+	// ときは InnerEncoding は空で、これらが外側レシピを指す=衝突しない)。
+	InnerEncoding string `json:"inner_enc,omitempty"`
 	// PrecompH264 は H.264 CAVLC 再圧縮の再構成レシピ。
 	PrecompH264 *precomp.H264Recipe `json:"precomp_h264,omitempty"`
 	// PrecompMP4 は MP4 コンテナ入り H.264 CAVLC の再構成レシピ。

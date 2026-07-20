@@ -816,6 +816,52 @@ func TestLogPrecompEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRecursivePrecompGzipColumnar は .log.gz / .csv.gz を投入→ gzip 展開
+// →内側で列指向化(再帰 precompression)→読み戻しビット一致→内側なし
+// (gzip 展開のみ)より物理が小さい、を実ストアで確認する。
+func TestRecursivePrecompGzipColumnar(t *testing.T) {
+	t.Parallel()
+	if !precomp.Supported() {
+		t.Skip("CGO 無効(zlib 産 gzip を作れない)")
+	}
+	// nginx combined ログを gzip したデータ。
+	rng := rand.New(rand.NewSource(41))
+	methods := []string{"GET", "GET", "POST", "HEAD"}
+	paths := []string{"/", "/index.html", "/api/v1/users", "/static/app.js", "/favicon.ico"}
+	codes := []int{200, 200, 304, 404, 500}
+	uas := []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0", "curl/7.68.0"}
+	var logbuf bytes.Buffer
+	sec := 0
+	for i := 0; i < 15000; i++ {
+		sec += rng.Intn(3)
+		fmt.Fprintf(&logbuf, "10.%d.%d.%d - - [%02d/Jul/2026:%02d:%02d:%02d +0000] \"%s %s HTTP/1.1\" %d %d \"-\" \"%s\"\n",
+			rng.Intn(256), rng.Intn(256), rng.Intn(256), 1+rng.Intn(28),
+			(sec/3600)%24, (sec/60)%60, sec%60, methods[rng.Intn(len(methods))], paths[rng.Intn(len(paths))],
+			codes[rng.Intn(len(codes))], rng.Intn(50000), uas[rng.Intn(len(uas))])
+	}
+	data := zlibGzip(t, logbuf.Bytes(), 6) // zlib 産 gzip(precomp が展開できる)
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "access.log.gz", data)
+	if m.Encoding != EncodingGzipZlibV1 {
+		t.Fatalf("gzip 展開されなかった: encoding=%q", m.Encoding)
+	}
+	if m.InnerEncoding != EncodingLogV1 {
+		t.Fatalf("内側でログ列指向化されなかった: inner=%q", m.InnerEncoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない(gzip+内側列指向の合成)")
+	}
+	if _, err := s.Optimize(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("Optimize 後の読み戻しが一致しない")
+	}
+	st1, _ := s.Stats()
+	t.Logf("gzip+内側列指向 物理=%d(元 gzip=%dB, 展開=%dB)", st1.PhysicalBytes, len(data), logbuf.Len())
+}
+
 // TestBase64PrecompEndToEnd は base64 で符号化した圧縮可能バイナリの束
 // (証明書束・ペイロードダンプ様)を投入→復号分解採用→読み戻しビット一致→
 // base64 素通しより物理が小さい、を実ストアで確認する。

@@ -573,10 +573,12 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 			m.PrecompHeader = u.Header
 			m.PrecompLevel = u.Level
 			m.precompPlain = u.Plain
+			s.tryInnerText(m) // .csv.gz / .log.gz / .json.gz を再帰的に列指向化
 		} else if plain, members, ok := precomp.TryUnwrapGzipMulti(buf, s.precompMax); ok {
 			m.Encoding = EncodingGzipMultiV1
 			m.PrecompMembers = members
 			m.precompPlain = plain
+			s.tryInnerText(m) // ローテートlog等: 連結が同一スキーマなら列指向化
 		} else {
 			return false
 		}
@@ -614,6 +616,7 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 		m.PrecompHeader = u.Header
 		m.PrecompLevel = u.Level
 		m.precompPlain = u.Plain
+		s.tryInnerText(m)
 	case precomp.IsJPEG(buf):
 		u, ok := precomp.TryUnwrapJPEG(buf, s.precompMax)
 		if !ok {
@@ -791,6 +794,51 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 	}
 	m.OrigSHA256 = hex.EncodeToString(sum[:])
 	return true
+}
+
+// tryInnerText は展開データ(gzip/zlib の中身)にさらにテキスト系の列指向
+// 変換を重ねる再帰 precompression。.csv.gz / .log.gz / .json.gz など「圧縮済み
+// ログ・表アーカイブ」は、展開しただけでは列指向の利得を取り逃す。内側変換は
+// それ自身が採用ゲート(列指向が展開データより縮む時のみ)と復元バイト一致
+// 検証を持つので、外側 gzip と合成しても可逆。採用時 m.precompPlain を内側
+// チャンク化内容に置き換え、内側方式とレシピを記録する。
+func (s *Store) tryInnerText(m *FileManifest) {
+	plain := m.precompPlain
+	if len(plain) == 0 {
+		return
+	}
+	if u, ok := precomp.TryUnwrapJSONL(plain, s.precompMax); ok {
+		m.InnerEncoding = EncodingJSONLV1
+		m.PrecompJSONL = u.Recipe
+		m.precompPlain = u.Chunked
+		return
+	}
+	if u, ok := precomp.TryUnwrapCSV(plain, s.precompMax); ok {
+		m.InnerEncoding = EncodingCSVV1
+		m.PrecompCSV = u.Recipe
+		m.precompPlain = u.Chunked
+		return
+	}
+	if u, ok := precomp.TryUnwrapLog(plain, s.precompMax); ok {
+		m.InnerEncoding = EncodingLogV1
+		m.PrecompLog = u.Recipe
+		m.precompPlain = u.Chunked
+		return
+	}
+}
+
+// reconstructInner は内側テキスト変換を復元し、外側(gzip 等)の展開データに戻す。
+func (s *Store) reconstructInner(m *FileManifest, chunked []byte) ([]byte, error) {
+	switch m.InnerEncoding {
+	case EncodingJSONLV1:
+		return precomp.ReconstructJSONL(m.PrecompJSONL, chunked)
+	case EncodingCSVV1:
+		return precomp.ReconstructCSV(m.PrecompCSV, chunked)
+	case EncodingLogV1:
+		return precomp.ReconstructLog(m.PrecompLog, chunked)
+	default:
+		return nil, fmt.Errorf("未知の内側 encoding: %q", m.InnerEncoding)
+	}
 }
 
 // tryB64Precomp は buf を base64 復号分解として試し、成功したらマニフェストに
@@ -1396,6 +1444,16 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 			return nil, fmt.Errorf("チャンク %s の読み出しに失敗: %w", hash[:12], err)
 		}
 		plain.Write(data)
+	}
+	// 再帰 precompression: 内側テキスト変換があれば、外側(gzip 等)の展開
+	// データに先に戻してから外側を復元する。
+	if m.InnerEncoding != "" {
+		inner, ierr := s.reconstructInner(m, plain.Bytes())
+		if ierr != nil {
+			return nil, ierr
+		}
+		plain.Reset()
+		plain.Write(inner)
 	}
 	var orig []byte
 	var err error
