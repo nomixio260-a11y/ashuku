@@ -123,6 +123,39 @@ func TestColumnarNanoTimestamp(t *testing.T) {
 	}
 }
 
+// TestColumnarLegacyDelta19Digit は「桁上限 18→19 の緩和」が旧形式レシピの
+// 復元を壊さないことの回帰。旧エンコーダは 19桁 row0 を parseCanonInt(18桁上限)で
+// 弾き、基準 0 で delta を格納した。新 parseCanonInt(19桁)で基準を計算すると
+// 全データ行が V0 ぶんずれ、既存保存物が読めなくなる(データ損失)。旧経路は
+// 当時の 18桁上限で基準を再現しなければならない。
+func TestColumnarLegacyDelta19Digit(t *testing.T) {
+	// 値: [19桁, 5, 6, 7, 8, 9, 10, 11]。旧エンコードは基準 0 起点なので
+	// delta 列は [5, 1, 1, 1, 1, 1, 1](row0 は逐語)。
+	blob := []byte("1234567890123456789\n5\n1\n1\n1\n1\n1\n1\n" + "a\nb\nc\nd\ne\nf\ng\nh\n")
+	recipe := &CSVRecipe{Cols: 2, Rows: 8, Delta: []bool{true, false}} // ColBytes==nil → 旧経路
+	out, err := ReconstructCSV(recipe, blob)
+	if err != nil {
+		t.Fatalf("旧形式 19桁 delta 復元エラー: %v", err)
+	}
+	want := []byte("1234567890123456789,a\n5,b\n6,c\n7,d\n8,e\n9,f\n10,g\n11,h")
+	if !bytes.Equal(out, want) {
+		t.Fatalf("19桁 row0 の旧形式 delta が壊れた\n want=%q\n got=%q", want, out)
+	}
+	// JSONL の旧経路も同様に確認(骨格 {"n":<v>})。
+	skel := []byte(`{"n":` + "\x00" + `}`)
+	jrecipe := &JSONLRecipe{Skeleton: skel, Cols: 1, Rows: 8, Delta: []bool{true}}
+	jblob := []byte("1234567890123456789\n5\n1\n1\n1\n1\n1\n1\n")
+	jout, err := ReconstructJSONL(jrecipe, jblob)
+	if err != nil {
+		t.Fatalf("JSONL 旧形式 19桁 delta 復元エラー: %v", err)
+	}
+	jwant := []byte(`{"n":1234567890123456789}` + "\n" + `{"n":5}` + "\n" + `{"n":6}` + "\n" +
+		`{"n":7}` + "\n" + `{"n":8}` + "\n" + `{"n":9}` + "\n" + `{"n":10}` + "\n" + `{"n":11}`)
+	if !bytes.Equal(jout, jwant) {
+		t.Fatalf("JSONL 19桁 row0 の旧形式 delta が壊れた\n want=%q\n got=%q", jwant, jout)
+	}
+}
+
 // TestColumnarLegacyRecipe は旧形式レシピ(Delta ベース・ColBytes 無し)が
 // 引き続きバイト一致で復元できることを確認する(既存保存ファイルの後方互換)。
 func TestColumnarLegacyRecipe(t *testing.T) {

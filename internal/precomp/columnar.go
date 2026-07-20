@@ -212,7 +212,9 @@ func decodeLegacyGrid(blob []byte, delta []bool, ncol, nrows int) ([][][]byte, e
 		if isDelta {
 			row0 := parts[base]
 			grid[0][c] = row0
-			prev, _ := parseCanonInt(row0) // 非intなら 0
+			// 旧形式は当時の 18桁上限で基準を再現する(19桁 row0 の既存保存物が
+			// 壊れないため。詳細は parseCanonIntLegacy のコメント)。
+			prev, _ := parseCanonIntLegacy(row0) // 非intなら 0
 			for r := 1; r < nrows; r++ {
 				d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
 				if err != nil {

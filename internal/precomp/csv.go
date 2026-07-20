@@ -90,6 +90,28 @@ func parseCanonInt(b []byte) (int64, bool) {
 	return v, true
 }
 
+// parseCanonIntLegacy は桁上限を 19 へ緩める(§4.45)より前の parseCanonInt
+// (18桁上限)。**旧形式レシピ(decodeLegacyGrid)の delta 基準 row0 は、当時の
+// 規則で計算しないと既存保存物の復元が食い違う**:旧エンコーダは 19桁 row0 を
+// parseCanonInt(18桁上限)で弾いて基準 0 として delta を格納した。新 parseCanonInt
+// で復号すると基準が V0 になり全データ行が V0 ぶんずれる(読み出し SHA-256 で
+// 検出され、読めていた物が読めなくなる=データ損失)。よって旧経路は当時の
+// 18桁上限で基準を再現する。新形式はエンコード/デコードとも 19桁で一貫するので
+// 影響しない。
+func parseCanonIntLegacy(b []byte) (int64, bool) {
+	if len(b) == 0 || len(b) > 18 {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if strconv.FormatInt(v, 10) != string(b) {
+		return 0, false
+	}
+	return v, true
+}
+
 // TryUnwrapCSV は矩形 CSV を列指向(+数値列 delta)に変換する。
 func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 	if maxPlain <= 0 || maxPlain > maxPlainTotal {
