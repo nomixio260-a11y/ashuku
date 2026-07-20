@@ -235,7 +235,9 @@ func scanB64Wrapped(orig []byte, start int) (seg Base64Segment, end int, plain [
 			break
 		}
 		if total > w {
-			return seg, 0, nil, false // 幅が広がる=均一でない
+			// 幅が広がる=均一でない。前方走査位置 ls を返して呼び出し側が
+			// この範囲での折り返し再試行を抑止できるようにする(O(n^2) 回避)。
+			return seg, ls, nil, false
 		}
 		b64 = append(b64, orig[ls:j]...)
 		lines++
@@ -287,18 +289,27 @@ func TryUnwrapBase64(orig []byte, maxPlain int64) (*Base64Unwrapped, bool) {
 	i := 0
 	n := len(orig)
 	coded := 0
+	// noWrapUntil: 均一幅ラン直後に広い行が来て scanB64Wrapped が失敗した前方位置。
+	// その範囲では折り返しは決して成立しない(どの開始点も同じ広い行で失敗する)ため、
+	// ここまで折り返し試行を抑止して 1 行ずつ再走査する O(n^2) を防ぐ。
+	noWrapUntil := 0
 	for i < n {
 		c := orig[i]
 		if b64IsAlnum(c) || c == '+' || c == '/' || c == '-' || c == '_' {
 			// 折り返しブロックを優先(PEM/MIME を 1 セグメントに畳む)、
 			// だめなら連続 1 行として解析。
-			if seg, end, plain, ok := scanB64Wrapped(orig, i); ok {
-				seg.SkelPos = len(skel)
-				recipe.Segments = append(recipe.Segments, seg)
-				plains = append(plains, plain...)
-				coded++
-				i = end
-				continue
+			if i >= noWrapUntil {
+				if seg, end, plain, ok := scanB64Wrapped(orig, i); ok {
+					seg.SkelPos = len(skel)
+					recipe.Segments = append(recipe.Segments, seg)
+					plains = append(plains, plain...)
+					coded++
+					i = end
+					continue
+				} else if end > noWrapUntil {
+					// total>w で前方まで走査して失敗 → その範囲は折り返し不成立。
+					noWrapUntil = end
+				}
 			}
 			seg, end, plain, ok := scanB64Region(orig, i)
 			if ok {

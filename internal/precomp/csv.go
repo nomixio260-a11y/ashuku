@@ -96,8 +96,7 @@ func parseCanonInt(b []byte) (int64, bool) {
 // parseCanonInt(18桁上限)で弾いて基準 0 として delta を格納した。新 parseCanonInt
 // で復号すると基準が V0 になり全データ行が V0 ぶんずれる(読み出し SHA-256 で
 // 検出され、読めていた物が読めなくなる=データ損失)。よって旧経路は当時の
-// 18桁上限で基準を再現する。新形式はエンコード/デコードとも 19桁で一貫するので
-// 影響しない。
+// 18桁上限で基準を再現する。新経路の基準導出は下記 deltaBaseCanon に凍結した。
 func parseCanonIntLegacy(b []byte) (int64, bool) {
 	if len(b) == 0 || len(b) > 18 {
 		return 0, false
@@ -110,6 +109,31 @@ func parseCanonIntLegacy(b []byte) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// deltaBaseCanon は新形式(ColBytes)colDelta の「delta 基準値」を row0 から導出する
+// 凍結境界。基準が無い(row0 が正準 int でない)なら 0 を返す。
+//
+// **この関数の意味論は絶対に変えてはならない。** 基準は encode と decode の
+// 両方で使われ、しかも保存済みレシピは「保存時の規則」で復元されねばならない。
+// parseCanonInt は列の delta 適格性判定(データ行が正準 int か)にも使われており、
+// 将来その桁上限等を性能・網羅目的で変える動機がありうる。かつて parseCanonInt を
+// 18→19桁へ広げた際、それが基準導出に波及して旧 delta レシピを壊した(データ損失)。
+// 適格性判定(parseCanonInt)と基準導出(本関数)を分離し、後者を現行 19桁で凍結する
+// ことで、parseCanonInt が今後変わっても保存物の復元は不変に保たれる。桁規則を
+// 変えたい場合は本関数を編集せず、新しいコーデックバージョンを追加すること。
+func deltaBaseCanon(b []byte) int64 {
+	if len(b) == 0 || len(b) > 19 {
+		return 0
+	}
+	v, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0
+	}
+	if strconv.FormatInt(v, 10) != string(b) {
+		return 0
+	}
+	return v
 }
 
 // TryUnwrapCSV は矩形 CSV を列指向(+数値列 delta)に変換する。

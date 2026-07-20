@@ -5,8 +5,11 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/bits"
+	"strings"
 	"testing"
+	"time"
 )
 
 // hevcBitWriter は MSB-first のビット列を組み立てる(h264Reader と同じ並び)。
@@ -208,5 +211,117 @@ func TestPDFFlateScanInflationBudget(t *testing.T) {
 
 	if _, _, ok := TryUnwrapPDF(pdf.Bytes(), maxPlain); ok {
 		t.Fatal("伸長予算が効かず、ボムの先の有効ストリームが採用された(増幅DoS)")
+	}
+}
+
+// TestDecodeColumnsRowsBound は decodeColumns が破損 recipe の過大な行数/列数を
+// grid 確保前に弾き、recover 不能な OOM を防ぐことを確認する。原文不変量
+// (nrows*ncol <= maxPlainTotal)超過は即エラーで、確保は一切行わない。
+func TestDecodeColumnsRowsBound(t *testing.T) {
+	// nrows を上限超えに設定。個別ガードが make の前に弾くので確保は起きない。
+	huge := (1 << 30) + 1
+	if _, err := decodeColumns([]byte("x\n"), []uint8{colRaw}, []int{2}, 1, huge); err == nil {
+		t.Fatal("過大な nrows が拒否されなかった(OOM 防御の欠落)")
+	}
+}
+
+// TestDecodeColumnsConstColumnNotRejected は「小さな blob・多い行数」という
+// 正当なケース(dictBin の定数列は npal=1 で ID 幅 0 のため行数に依らず数バイト)
+// を上限ガードが誤って弾かない=データ損失を起こさないことを確認する回帰テスト。
+// 原文サイズ不変量ではなく blob 長で縛ると、この列が誤拒否されて読み出し不能になる。
+func TestDecodeColumnsConstColumnNotRejected(t *testing.T) {
+	const nrows = 200000
+	// 全 nrows 行が "X" の定数列を dictBin 直列化したもの("1\nX\n" の 4 バイト)。
+	blob := []byte("1\nX\n")
+	grid, err := decodeColumns(blob, []uint8{colDictBin}, []int{len(blob)}, 1, nrows)
+	if err != nil {
+		t.Fatalf("定数 dictBin 列(小 blob・多行)が誤って拒否された: %v", err)
+	}
+	if len(grid) != nrows {
+		t.Fatalf("行数不一致: got %d want %d", len(grid), nrows)
+	}
+	for _, r := range []int{0, nrows / 2, nrows - 1} {
+		if string(grid[r][0]) != "X" {
+			t.Fatalf("row %d: got %q want \"X\"", r, grid[r][0])
+		}
+	}
+}
+
+// TestDeltaBaseCanonFrozen は colDelta の基準導出(凍結境界)の意味論を金値で
+// 固定する。基準は encode/decode 双方で使われ、保存物の復元に用いられるため、
+// ここが変わると「読めていた物が読めなくなる」データ損失を招く。19桁受理・
+// 20桁拒否・非正準拒否を固定し、うっかりした桁規則変更を検知する。
+func TestDeltaBaseCanonFrozen(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"1700000000123457789", 1700000000123457789}, // 19桁 ns タイムスタンプ
+		{"9223372036854775807", 9223372036854775807}, // int64 最大(19桁)
+		{"0", 0},
+		{"-123456789012345678", -123456789012345678},
+		{"12345678901234567890", 0}, // 20桁 → 非対象(基準 0)
+		{"9223372036854775808", 0},  // int64 範囲外 → 0
+		{"007", 0},                  // 先頭ゼロ非正準 → 0
+		{"+5", 0},                   // '+' 非正準 → 0
+		{"", 0},
+		{"abc", 0},
+	}
+	for _, c := range cases {
+		if got := deltaBaseCanon([]byte(c.in)); got != c.want {
+			t.Errorf("deltaBaseCanon(%q)=%d want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestFormatFixedDecMinInt64 は formatFixedDec が math.MinInt64 でも二重マイナスの
+// 不正文字列("--...")を生成せず、単一符号の正しい固定小数を返すことを確認する。
+func TestFormatFixedDecMinInt64(t *testing.T) {
+	got := formatFixedDec(math.MinInt64, 1)
+	if strings.HasPrefix(got, "--") {
+		t.Fatalf("二重マイナスの不正文字列: %q", got)
+	}
+	if got != "-922337203685477580.8" {
+		t.Fatalf("formatFixedDec(MinInt64,1)=%q want -922337203685477580.8", got)
+	}
+	// 通常値の挙動が変わっていないこと(回帰防止)。
+	if s := formatFixedDec(-5, 2); s != "-0.05" {
+		t.Fatalf("formatFixedDec(-5,2)=%q want -0.05", s)
+	}
+	if s := formatFixedDec(1234, 2); s != "12.34" {
+		t.Fatalf("formatFixedDec(1234,2)=%q want 12.34", s)
+	}
+}
+
+// TestBase64WrappedScanNotQuadratic は base64 折り返し走査が均一幅ランの直後に
+// 広い行が来る入力で O(n^2) にならないことを確認する。修正前は各行頭で
+// scanB64Wrapped が残り全行を再走査し、K=12000 で数秒〜十数秒を要した。
+func TestBase64WrappedScanNotQuadratic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("長時間入力のためショートモードでは省略")
+	}
+	line := bytes.Repeat([]byte("A"), 64) // RawStd(48 ゼロバイト)= "A"×64(正準)
+	var in bytes.Buffer
+	const K = 12000
+	for i := 0; i < K; i++ {
+		in.Write(line)
+		in.WriteByte('\n')
+	}
+	in.Write(bytes.Repeat([]byte("A"), 68)) // 幅の広い末尾行(均一性を崩す)
+	in.WriteByte('\n')
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		TryUnwrapBase64(in.Bytes(), 8<<20)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if el := time.Since(start); el > 3*time.Second {
+			t.Fatalf("base64 折り返し走査が遅すぎる(%v)— O(n^2) 回帰の疑い", el)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("base64 折り返し走査が完了しない — O(n^2) 回帰")
 	}
 }

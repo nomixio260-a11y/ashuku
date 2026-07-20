@@ -114,7 +114,7 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 	var b bytes.Buffer
 	b.Write(grid[0][c])
 	b.WriteByte('\n')
-	prev, _ := parseCanonInt(grid[0][c])
+	prev := deltaBaseCanon(grid[0][c]) // 基準導出は凍結境界(parseCanonInt の変更から隔離)
 	for r := 1; r < nrows; r++ {
 		b.WriteString(strconv.FormatInt(vals[r]-prev, 10))
 		b.WriteByte('\n')
@@ -126,6 +126,14 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 // parseFixedDec は b が固定小数(整数部 '.' 小数部、小数桁 >=1)として正準
 // 往復する(parse→format が元と一致)なら、スケール整数と小数桁を返す。
 // 先頭ゼロ・'+'・"-0.00"・整数(小数点なし)は非対象=false。
+//
+// **正準化の意味論を変える場合は要注意(凍結境界)。** 本関数は列の適格性判定に
+// 加えて colDeltaDec の delta 基準 row0 の導出(colEncodeDeltaDec と colDecode の
+// 両方)にも使われる。基準は保存済みレシピの復元に用いられるため、受理条件を
+// 緩める/厳しくすると、当時と異なる基準で復号して保存物が読めなくなる(=データ
+// 損失。parseCanonInt を 18→19桁に広げて旧 delta レシピを壊したのと同型)。
+// 挙動を変えたい時は新しいコーデックバージョンを追加し、既存経路の基準導出は
+// 現行の意味論のまま保つこと。
 func parseFixedDec(b []byte) (scaled int64, scale int, ok bool) {
 	s := string(b)
 	if len(s) < 3 || len(s) > 19 {
@@ -167,12 +175,14 @@ func parseFixedDec(b []byte) (scaled int64, scale int, ok bool) {
 
 // formatFixedDec はスケール整数と小数桁から固定小数文字列を作る。
 func formatFixedDec(v int64, scale int) string {
-	neg := v < 0
-	u := v
+	// 桁部分は FormatInt(v) から符号を外して得る。u=-v による絶対値化は
+	// v==math.MinInt64 でオーバフローして負のまま残り、"--..." の不正文字列に
+	// なる(FormatInt は MinInt64 も正しく "-9223..." にする)。
+	str := strconv.FormatInt(v, 10)
+	neg := len(str) > 0 && str[0] == '-'
 	if neg {
-		u = -u
+		str = str[1:]
 	}
-	str := strconv.FormatInt(u, 10)
 	for len(str) <= scale { // 小数桁を満たすよう先頭ゼロ詰め
 		str = "0" + str
 	}
@@ -372,6 +382,19 @@ func decodeColumns(blob []byte, codecs []uint8, colBytes []int, ncol, nrows int)
 	if len(codecs) != ncol || len(colBytes) != ncol {
 		return nil, errors.New("列コーデック/長さの数が列数と不一致")
 	}
+	// 過大確保の防御(recover では捕捉できない OOM を未然に防ぐ):
+	// grid は make([][][]byte, nrows) を recipe の nrows/ncol だけで先に確保する
+	// ため、破損・改竄で巨大な Rows/Cols が来ると小さな blob からでも数十GB を
+	// 確保して落ちる。blob 長では縛れない(dictBin の定数列は npal=1 で ID 幅 0 と
+	// なり、行数に依らず数バイトに圧縮されるため)。代わりに原文サイズ不変量で縛る:
+	// 元テキストは 1 行あたり最低 ncol バイト(区切り+改行)を要し、precomp 対象の
+	// 原文は必ず maxPlainTotal 以下なので、有効な recipe では nrows*ncol <=
+	// maxPlainTotal。これを超える寸法は破損とみなし確保前に弾く。
+	// 個別上限を先に課すことで、以降の nrows*ncol 乗算が int64 で溢れないことも保証する。
+	if nrows < 0 || ncol < 0 || nrows > maxPlainTotal || ncol > maxPlainTotal ||
+		int64(nrows)*int64(ncol) > maxPlainTotal {
+		return nil, errors.New("列グリッド寸法が原文上限に対して過大")
+	}
 	grid := make([][][]byte, nrows)
 	for r := 0; r < nrows; r++ {
 		grid[r] = make([][]byte, ncol)
@@ -420,7 +443,7 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 			return errors.New("delta 列の行数不一致")
 		}
 		grid[0][c] = parts[0]
-		prev, _ := parseCanonInt(parts[0])
+		prev := deltaBaseCanon(parts[0]) // encode と同一の凍結境界で基準を再現
 		for r := 1; r < nrows; r++ {
 			d, err := strconv.ParseInt(string(parts[r]), 10, 64)
 			if err != nil {
