@@ -279,11 +279,10 @@ func ReconstructM4A(recipe *M4ARecipe, chunked []byte) ([]byte, error) {
 	type sample struct {
 		off  int64
 		size int
-		idx  int
 	}
 	samples := make([]sample, len(tr.offsets))
 	for i := range tr.offsets {
-		samples[i] = sample{tr.offsets[i], tr.sizes[i], i}
+		samples[i] = sample{tr.offsets[i], tr.sizes[i]}
 	}
 	sort.Slice(samples, func(a, b int) bool { return samples[a].off < samples[b].off })
 	vb := map[int]bool{}
@@ -295,7 +294,9 @@ func ReconstructM4A(recipe *M4ARecipe, chunked []byte) ([]byte, error) {
 	var out []byte
 	sp := 0 // 骨格読み位置
 	origPos := int64(0)
-	for _, s := range samples {
+	// 退避サンプルはソート後の位置で識別する(TryUnwrapM4A も同じ順で記録)。
+	// off は検証済みで厳密増加ゆえ、両者の sort 結果は一致する。
+	for i, s := range samples {
 		gap := int(s.off - origPos) // 非サンプルバイト
 		if gap < 0 || sp+gap > len(skel) {
 			return nil, errH264BadRecipe
@@ -303,7 +304,7 @@ func ReconstructM4A(recipe *M4ARecipe, chunked []byte) ([]byte, error) {
 		out = append(out, skel[sp:sp+gap]...)
 		sp += gap
 		origPos = s.off
-		if vb[s.idx] {
+		if vb[i] {
 			if sp+s.size > len(skel) {
 				return nil, errH264BadRecipe
 			}
