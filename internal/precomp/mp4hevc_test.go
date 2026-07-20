@@ -29,3 +29,26 @@ func TestMP4HEVCRoundTrip(t *testing.T) {
 			100*(float64(len(zc))-float64(len(zo)))/float64(len(zo)))
 	}
 }
+
+// TestTSHEVCRoundTrip は HEVC 入り MPEG-TS の分解→復元のバイト一致を確認する。
+func TestTSHEVCRoundTrip(t *testing.T) {
+	orig, err := os.ReadFile("testdata/hevc/cam_hevc.ts")
+	if err != nil {
+		t.Skip(err)
+	}
+	u, ok := TryUnwrapTS(orig, 0)
+	if !ok {
+		t.Fatal("不採用")
+	}
+	if u.Recipe.HEVC == nil {
+		t.Fatal("HEVC レシピが選ばれていない")
+	}
+	rt, err := ReconstructTS(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatal("往復不一致")
+	}
+	zo := jpegProbeEncoder.EncodeAll(orig, nil)
+	zc := jpegProbeEncoder.EncodeAll(u.Chunked, nil)
+	t.Logf("%dB zstd比 %d→%d(%.2f%%)", len(orig), len(zo), len(zc),
+		100*(float64(len(zc))-float64(len(zo)))/float64(len(zo)))
+}

@@ -37,11 +37,13 @@ type TSRun struct {
 	N   int `json:"n,omitempty"` // 省略時 1
 }
 
-// TSRecipe は TS 再構成レシピ。Chunked = 骨格ブロブ + H264 の Chunked。
+// TSRecipe は TS 再構成レシピ。Chunked = 骨格ブロブ + 映像 ES の Chunked。
+// H264 / HEVC はどちらか一方が入る。
 type TSRecipe struct {
 	Runs  []TSRun     `json:"runs"`
 	SkelN int         `json:"sn"`
-	H264  *H264Recipe `json:"h264"`
+	H264  *H264Recipe `json:"h264,omitempty"`
+	HEVC  *HEVCRecipe `json:"hevc,omitempty"`
 }
 
 // TSUnwrapped は分解結果。
@@ -115,7 +117,7 @@ func tsParse(orig []byte) ([]TSRun, []byte, bool) {
 				st := sec[i]
 				esPID := int(sec[i+1]&0x1F)<<8 | int(sec[i+2])
 				esLen := int(sec[i+3]&0x0F)<<8 | int(sec[i+4])
-				if st == 0x1B { // H.264
+				if st == 0x1B || st == 0x24 { // H.264 / HEVC
 					if videoPID >= 0 && videoPID != esPID {
 						return nil, nil, false // 複数映像 PID は対象外
 					}
@@ -215,11 +217,26 @@ func TryUnwrapTS(orig []byte, maxPlain int64) (*TSUnwrapped, bool) {
 		return nil, false
 	}
 	runs, es, ok := tsParse(orig)
-	if !ok || !IsH264(es) {
+	if !ok {
 		return nil, false
 	}
-	u, ok := TryUnwrapH264(es, maxPlain)
-	if !ok {
+	// NAL 先頭バイトのエイリアス(HEVC AUD 0x46 が H.264 SEI に見える等)が
+	// あるため、判定は順に試す。
+	var esChunked []byte
+	recipe := &TSRecipe{Runs: runs}
+	if IsH264(es) {
+		if u, ok := TryUnwrapH264(es, maxPlain); ok {
+			recipe.H264 = u.Recipe
+			esChunked = u.Chunked
+		}
+	}
+	if esChunked == nil && IsHEVC(es) {
+		if u, ok := TryUnwrapHEVC(es, maxPlain); ok {
+			recipe.HEVC = u.Recipe
+			esChunked = u.Chunked
+		}
+	}
+	if esChunked == nil {
 		return nil, false
 	}
 	// 骨格 = ES を除いた全バイト
@@ -231,11 +248,18 @@ func TryUnwrapTS(orig []byte, maxPlain int64) (*TSUnwrapped, bool) {
 			pos += r.Raw + r.ES
 		}
 	}
-	recipe := &TSRecipe{Runs: runs, SkelN: len(skel), H264: u.Recipe}
-	chunked := make([]byte, 0, len(skel)+len(u.Chunked))
+	recipe.SkelN = len(skel)
+	chunked := make([]byte, 0, len(skel)+len(esChunked))
 	chunked = append(chunked, skel...)
-	chunked = append(chunked, u.Chunked...)
-	if len(chunked)+len(runs)*16+96 >= len(orig) {
+	chunked = append(chunked, esChunked...)
+	if recipe.HEVC != nil {
+		// HEVC は算術⇔CABAC の差が薄いので zstd 概算で比較する
+		zo := jpegProbeEncoder.EncodeAll(orig, nil)
+		zc := jpegProbeEncoder.EncodeAll(chunked, nil)
+		if len(zc)+len(runs)*8+128 >= len(zo) {
+			return nil, false
+		}
+	} else if len(chunked)+len(runs)*16+96 >= len(orig) {
 		return nil, false
 	}
 	rt, err := ReconstructTS(recipe, chunked)
@@ -247,11 +271,18 @@ func TryUnwrapTS(orig []byte, maxPlain int64) (*TSUnwrapped, bool) {
 
 // ReconstructTS はレシピと Chunked から元の TS をバイト単位で戻す。
 func ReconstructTS(recipe *TSRecipe, chunked []byte) ([]byte, error) {
-	if recipe == nil || recipe.H264 == nil || recipe.SkelN < 0 || recipe.SkelN > len(chunked) {
+	if recipe == nil || (recipe.H264 == nil && recipe.HEVC == nil) ||
+		recipe.SkelN < 0 || recipe.SkelN > len(chunked) {
 		return nil, errH264BadRecipe
 	}
 	skel := chunked[:recipe.SkelN]
-	es, err := ReconstructH264(recipe.H264, chunked[recipe.SkelN:])
+	var es []byte
+	var err error
+	if recipe.H264 != nil {
+		es, err = ReconstructH264(recipe.H264, chunked[recipe.SkelN:])
+	} else {
+		es, err = ReconstructHEVC(recipe.HEVC, chunked[recipe.SkelN:])
+	}
 	if err != nil {
 		return nil, err
 	}

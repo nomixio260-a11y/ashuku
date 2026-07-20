@@ -670,22 +670,25 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		m.Encoding = EncodingMP4HEVCV1
 		m.PrecompMP4HEVC = u.Recipe
 		m.precompPlain = u.Chunked
-	case precomp.IsH264(buf):
-		u, ok := precomp.TryUnwrapH264(buf, s.precompMax)
-		if !ok {
-			return false
+	case precomp.IsH264(buf) || precomp.IsHEVC(buf):
+		// NAL 先頭バイトのエイリアスがあるため両方を順に試す
+		if precomp.IsH264(buf) {
+			if u, ok := precomp.TryUnwrapH264(buf, s.precompMax); ok {
+				m.Encoding = EncodingH264V1
+				m.PrecompH264 = u.Recipe
+				m.precompPlain = u.Chunked
+				break
+			}
 		}
-		m.Encoding = EncodingH264V1
-		m.PrecompH264 = u.Recipe
-		m.precompPlain = u.Chunked
-	case precomp.IsHEVC(buf):
-		u, ok := precomp.TryUnwrapHEVC(buf, s.precompMax)
-		if !ok {
-			return false
+		if precomp.IsHEVC(buf) {
+			if u, ok := precomp.TryUnwrapHEVC(buf, s.precompMax); ok {
+				m.Encoding = EncodingHEVCV1
+				m.PrecompHEVC = u.Recipe
+				m.precompPlain = u.Chunked
+				break
+			}
 		}
-		m.Encoding = EncodingHEVCV1
-		m.PrecompHEVC = u.Recipe
-		m.precompPlain = u.Chunked
+		return false
 	case precomp.IsTS(buf):
 		u, ok := precomp.TryUnwrapTS(buf, s.precompMax)
 		if !ok {
