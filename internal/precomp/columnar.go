@@ -102,20 +102,23 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 	if nrows < 2 {
 		return nil, false
 	}
+	// 値は 1 度だけ parse する(適格性判定と符号化で二重 parse しない)。
+	vals := make([]int64, nrows)
 	for r := 1; r < nrows; r++ {
-		if _, ok := parseCanonInt(grid[r][c]); !ok {
+		v, ok := parseCanonInt(grid[r][c])
+		if !ok {
 			return nil, false
 		}
+		vals[r] = v
 	}
 	var b bytes.Buffer
 	b.Write(grid[0][c])
 	b.WriteByte('\n')
 	prev, _ := parseCanonInt(grid[0][c])
 	for r := 1; r < nrows; r++ {
-		v, _ := parseCanonInt(grid[r][c])
-		b.WriteString(strconv.FormatInt(v-prev, 10))
+		b.WriteString(strconv.FormatInt(vals[r]-prev, 10))
 		b.WriteByte('\n')
-		prev = v
+		prev = vals[r]
 	}
 	return b.Bytes(), true
 }

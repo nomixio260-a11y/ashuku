@@ -480,6 +480,63 @@ func FuzzTryUnwrapLog(f *testing.F) {
 	})
 }
 
+// FuzzTryUnwrapHEVC は攻撃者制御の生 HEVC(Annex B)での分解が panic せず、
+// 採用入力が必ずビット一致で戻ることを検証する(CABAC 再符号化の堅牢化)。
+func FuzzTryUnwrapHEVC(f *testing.F) {
+	for _, fn := range globSeed("testdata/hevc/*.h265") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\x00\x00\x00\x01\x40\x01 garbage hevc vps nal"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapHEVC(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructHEVC(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した HEVC がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapMP4HEVC は攻撃者制御の MP4(hvc1)での分解が panic せず、
+// 採用入力がビット一致で戻ることを検証する。
+func FuzzTryUnwrapMP4HEVC(f *testing.F) {
+	for _, fn := range globSeed("testdata/hevc/*.mp4") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42hvc1 garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapMP4HEVC(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructMP4HEVC(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した MP4-HEVC がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
+// FuzzTryUnwrapMP3 は攻撃者制御の MP3(フレーム同期・side_info・ビット
+// リザーバ)での分解が panic せず、採用入力がビット一致で戻ることを検証する。
+func FuzzTryUnwrapMP3(f *testing.F) {
+	for _, fn := range globSeed("testdata/mp3/*.mp3") {
+		f.Add(fn)
+	}
+	f.Add([]byte("\xFF\xFB\x90\x00 garbage mp3 frame with sync word"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapMP3(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructMP3(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した MP3 がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
 // globSeed はシード用にファイルを読み込む(存在しなければ空)。
 func globSeed(pattern string) [][]byte {
 	files, _ := filepath.Glob(pattern)
