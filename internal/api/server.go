@@ -448,9 +448,11 @@ const maxListLimit = 10000
 // handleList はファイル一覧を作成日時の降順で返す。
 // ?limit=N でページ件数を制限でき(最大10000)、続きがある場合は
 // レスポンスの next_cursor を次の ?after= に渡す(カーソルページング)。
-// limit 省略時は全件(後方互換)。
+// limit 省略時も既定で maxListLimit 件に制限する。以前は省略=全件だったが、
+// 大量のファイルを持つ所有者が 1 リクエストで全件をメモリに載せて OOM に
+// できたため、既定でページングし、全件取得はカーソルで辿る方式に統一する。
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, a authed) {
-	limit := 0
+	limit := maxListLimit
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {

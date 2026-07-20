@@ -196,8 +196,7 @@ func (s *Store) CommitClientManifest(name, owner string, hashes []string, quota,
 	err := s.batchUpdate(func(tx *bolt.Tx) error {
 		missing = missing[:0] // Batch 再実行に備え毎回リセット
 		total := int64(0)
-		metas := make([]*ChunkMeta, len(hashes))
-		for i, h := range hashes {
+		for _, h := range hashes {
 			if !validChunkHash(h) {
 				return fmt.Errorf("不正なチャンクハッシュ: %q", h)
 			}
@@ -209,8 +208,7 @@ func (s *Store) CommitClientManifest(name, owner string, hashes []string, quota,
 				missing = append(missing, h)
 				continue
 			}
-			metas[i] = meta
-			total += meta.RawSize
+			total += meta.RawSize // 同一ハッシュが複数回出れば出現ごとに加算(論理サイズ)
 		}
 		if len(missing) > 0 {
 			return ErrChunksMissing
@@ -225,8 +223,21 @@ func (s *Store) CommitClientManifest(name, owner string, hashes []string, quota,
 		if quota > 0 && used+total > quota {
 			return ErrQuotaExceeded
 		}
-		for i, h := range hashes {
-			meta := metas[i]
+		// 参照カウントは出現ごとに「最新値」を読み直して +1 する。位置ごとに
+		// 事前スナップショットした meta を ++ すると、同一ハッシュの各スナップ
+		// ショットが同じ基準値から +1 して putChunkMeta で上書きし合い、k 回
+		// 出現しても実質 +1 にしかならない(lost update)。一方 releaseChunksTx は
+		// m.Chunks を出現ごとに -1 するため、削除時に参照カウントが 0 まで枯れ、
+		// 他ファイルがまだ参照しているチャンクを物理削除する(=データ損失)。
+		// サーバ取り込みの applyChunk と同じく都度読み直して出現数と一致させる。
+		for _, h := range hashes {
+			meta, err := getChunkMeta(tx, h)
+			if err != nil {
+				return err
+			}
+			if meta == nil {
+				return ErrChunksMissing // 上で検証済みだが防御的に
+			}
 			meta.RefCount++
 			meta.Staged = 0
 			if err := putChunkMeta(tx, h, meta); err != nil {
@@ -316,6 +327,10 @@ func (s *Store) ChunkRep(hash string) (data []byte, compression string, rawSize 
 // パラメータで分割しないと重複排除が効かない)。
 func (s *Store) AvgChunkSize() int { return s.chunkSize }
 
+// sweepBetweenPhases はテストが sweep の走査フェーズと削除フェーズの間に
+// 割り込みを差し込むためのフック(本番は nil)。
+var sweepBetweenPhases func()
+
 // sweepStagedChunks は TTL を過ぎた未コミットチャンクを掃除する
 // (Optimize から呼ばれる)。
 func (s *Store) sweepStagedChunks(res *OptimizeResult) error {
@@ -332,6 +347,11 @@ func (s *Store) sweepStagedChunks(res *OptimizeResult) error {
 	if err != nil || len(stale) == 0 {
 		return err
 	}
+	// テスト専用: View と Update の間に別リクエスト(HasChunks 等)が割り込む
+	// 状況を決定的に再現するためのフック。本番では nil。
+	if sweepBetweenPhases != nil {
+		sweepBetweenPhases()
+	}
 	var orphans []string
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		for _, hash := range stale {
@@ -339,8 +359,13 @@ func (s *Store) sweepStagedChunks(res *OptimizeResult) error {
 			if err != nil {
 				return err
 			}
-			if meta == nil || meta.RefCount != 0 {
-				continue // 掃除の合間にコミットされた
+			// View で選定した時点の値ではなく、削除直前の最新値で staleness を
+			// 再判定する。RefCount だけを見ると、View と Update の間に HasChunks が
+			// TTL を延長(Staged=now)したチャンクを削除してしまい、「存在する」と
+			// 通知したのにコミットが ErrChunksMissing で失敗する(HasChunks が
+			// TTL を延ばす目的を無にする)。同一 cutoff で全条件を再確認する。
+			if meta == nil || meta.RefCount != 0 || meta.Staged <= 0 || meta.Staged >= cutoff {
+				continue // コミット済み or TTL が更新された
 			}
 			if err := deleteChunkMeta(tx, hash); err != nil {
 				return err
