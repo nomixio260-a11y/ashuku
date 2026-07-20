@@ -41,7 +41,10 @@ const (
 	hevcBypMPM       = 20 // +bit(0/1) → 20,21
 	hevcBypRemMode   = 22 // +bit(0..4) → 22..26
 	hevcBypChroma    = 27 // +bit(0/1) → 27,28
-	hevcBypNumCls    = 29
+	hevcBypMvdEG     = 29 // abs_mvd_minus2 EG1 継続、+min(k,8) → 29..37
+	hevcBypMergeIdx  = 38 // merge_idx 単項継続、+min(pos,3) → 38..41
+	hevcBypRefIdx    = 42 // ref_idx 単項継続、+min(pos,2) → 42..44
+	hevcBypNumCls    = 45
 )
 
 // hevcClassedSink はクラス付きバイパスを二次算術で文脈符号化できるシンク。
@@ -55,6 +58,14 @@ func (w *hevcWalk) bypC(cls int) int {
 		return cs.bypassCls(cls)
 	}
 	return w.sink.bypass()
+}
+
+// bypCPos は単項継続などの位置付きバイパス(base + min(pos,cap))。
+func (w *hevcWalk) bypCPos(base, pos, cap int) int {
+	if pos > cap {
+		pos = cap
+	}
+	return w.bypC(base + pos)
 }
 
 // hevcCtxOps は文脈状態列の初期化/退避/復元(WPP)と、サブストリーム
@@ -591,7 +602,7 @@ func (w *hevcWalk) predictionUnit(nPbW, nPbH, partIdx int, skip bool) bool {
 		if sl.maxNumMerge > 1 {
 			idx = s.decision(hevcCtxMergeIdx)
 			if idx != 0 {
-				for idx < sl.maxNumMerge-1 && s.bypass() == 1 {
+				for idx < sl.maxNumMerge-1 && w.bypCPos(hevcBypMergeIdx, idx-1, 3) == 1 {
 					idx++
 				}
 			}
@@ -656,7 +667,7 @@ func (w *hevcWalk) refIdx(list, numRef int) {
 			i++
 		}
 		if i == 2 {
-			for i < max && s.bypass() == 1 {
+			for i < max && w.bypCPos(hevcBypRefIdx, i-2, 2) == 1 {
 				i++
 			}
 		}
@@ -685,9 +696,9 @@ func (w *hevcWalk) mvdCoding() {
 func (w *hevcWalk) mvdComponent(v int) {
 	s := w.sink
 	switch v {
-	case 2: // abs_mvd_minus2: EG1 bypass prefix+suffix, 符号
+	case 2: // abs_mvd_minus2: EG1 bypass prefix(継続=偏り)+suffix+符号
 		k := 1
-		for k < 31 && s.bypass() == 1 {
+		for k < 31 && w.bypCPos(hevcBypMvdEG, k-1, 8) == 1 {
 			k++
 		}
 		if k >= 31 {
@@ -696,7 +707,7 @@ func (w *hevcWalk) mvdComponent(v int) {
 		}
 		for k > 0 {
 			k--
-			s.bypass()
+			s.bypass() // suffix ビット(ほぼ等確率)
 		}
 		s.bypass() // sign
 	case 1:
