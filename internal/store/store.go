@@ -657,12 +657,18 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) bool {
 		m.PrecompTIFF = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsMP4(buf):
-		u, ok := precomp.TryUnwrapMP4H264(buf, s.precompMax)
+		if u, ok := precomp.TryUnwrapMP4H264(buf, s.precompMax); ok {
+			m.Encoding = EncodingMP4V1
+			m.PrecompMP4 = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		u, ok := precomp.TryUnwrapMP4HEVC(buf, s.precompMax)
 		if !ok {
 			return false
 		}
-		m.Encoding = EncodingMP4V1
-		m.PrecompMP4 = u.Recipe
+		m.Encoding = EncodingMP4HEVCV1
+		m.PrecompMP4HEVC = u.Recipe
 		m.precompPlain = u.Chunked
 	case precomp.IsH264(buf):
 		u, ok := precomp.TryUnwrapH264(buf, s.precompMax)
@@ -1346,6 +1352,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
 		orig, err = precomp.ReconstructMP4H264(m.PrecompMP4, plain.Bytes())
 	case EncodingHEVCV1:
 		orig, err = precomp.ReconstructHEVC(m.PrecompHEVC, plain.Bytes())
+	case EncodingMP4HEVCV1:
+		orig, err = precomp.ReconstructMP4HEVC(m.PrecompMP4HEVC, plain.Bytes())
 	case EncodingTSV1:
 		orig, err = precomp.ReconstructTS(m.PrecompTS, plain.Bytes())
 	case EncodingMP3V1:

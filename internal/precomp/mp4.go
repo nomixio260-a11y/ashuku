@@ -91,11 +91,13 @@ func findBox(b []byte, typ string) []byte {
 
 // mp4Track は1ビデオトラックのサンプル表。
 type mp4Track struct {
+	codec      string // "avc" / "hevc"
 	lenSize    int
 	trackID    uint32
 	fragmented bool
 	spsList    [][]byte
 	ppsList    [][]byte
+	psNALs     [][]byte // hevc: hvcC 内の VPS/SPS/PPS(NAL ヘッダ込み)
 	sizes      []int
 	offsets    []int64
 }
@@ -139,28 +141,53 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 			return true
 		}
 		etyp := string(entry[4:8])
-		if etyp != "avc1" && etyp != "avc3" {
+		isAVC := etyp == "avc1" || etyp == "avc3"
+		isHEVC := etyp == "hvc1" || etyp == "hev1"
+		if !isAVC && !isHEVC {
 			return true // 他コーデックのトラックは無視(スケルトンに残る)
 		}
 		if tr != nil { // 複数ビデオトラックは対象外
 			okAll = false
 			return false
 		}
-		// avc1: サイズ(4)+typ(4)+予約等 78 バイトの後に子ボックス(avcC)
+		// サンプルエントリ: サイズ(4)+typ(4)+予約等 78 バイトの後に子ボックス
 		if len(entry) < 8+78 {
 			return true
 		}
-		var avcC []byte
+		var avcC, hvcC []byte
 		mp4Boxes(entry[8+78:], func(ct string, cb []byte) bool {
 			if ct == "avcC" && avcC == nil {
 				avcC = cb
 			}
+			if ct == "hvcC" && hvcC == nil {
+				hvcC = cb
+			}
 			return true
 		})
+		var t2 *mp4Track
+		if isHEVC {
+			ps, lenSize, ok := parseHvcC(hvcC)
+			if !ok {
+				return true
+			}
+			t2 = &mp4Track{codec: "hevc", lenSize: lenSize, fragmented: fragmented, psNALs: ps}
+			if tkhd := findBox(body, "tkhd"); len(tkhd) >= 24 {
+				if tkhd[0] == 0 {
+					t2.trackID = binary.BigEndian.Uint32(tkhd[12:])
+				} else {
+					t2.trackID = binary.BigEndian.Uint32(tkhd[20:])
+				}
+			}
+			if !mp4SampleTable(stbl, t2, fragmented) {
+				return true
+			}
+			tr = t2
+			return true
+		}
 		if avcC == nil || len(avcC) < 7 {
 			return true
 		}
-		t2 := &mp4Track{lenSize: int(avcC[4]&3) + 1, fragmented: fragmented}
+		t2 = &mp4Track{codec: "avc", lenSize: int(avcC[4]&3) + 1, fragmented: fragmented}
 		if tkhd := findBox(body, "tkhd"); len(tkhd) >= 24 {
 			if tkhd[0] == 0 {
 				t2.trackID = binary.BigEndian.Uint32(tkhd[12:])
@@ -200,89 +227,7 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 			t2.ppsList = append(t2.ppsList, avcC[p:p+l])
 			p += l
 		}
-		// stsz
-		stsz := findBox(stbl, "stsz")
-		if stsz == nil || len(stsz) < 12 {
-			return true
-		}
-		uniform := int(binary.BigEndian.Uint32(stsz[4:8]))
-		cnt := int(binary.BigEndian.Uint32(stsz[8:12]))
-		if cnt == 0 && fragmented {
-			// fMP4: サンプルは moof/trun 側。空のトラックとして受理。
-			tr = t2
-			return true
-		}
-		if cnt <= 0 || cnt > 1<<22 {
-			return true
-		}
-		t2.sizes = make([]int, cnt)
-		if uniform != 0 {
-			for i := range t2.sizes {
-				t2.sizes[i] = uniform
-			}
-		} else {
-			if len(stsz) < 12+4*cnt {
-				return true
-			}
-			for i := 0; i < cnt; i++ {
-				t2.sizes[i] = int(binary.BigEndian.Uint32(stsz[12+4*i:]))
-			}
-		}
-		// stco / co64(チャンク先頭オフセット)
-		var chunkOff []int64
-		if stco := findBox(stbl, "stco"); stco != nil && len(stco) >= 8 {
-			n := int(binary.BigEndian.Uint32(stco[4:8]))
-			if len(stco) < 8+4*n {
-				return true
-			}
-			for i := 0; i < n; i++ {
-				chunkOff = append(chunkOff, int64(binary.BigEndian.Uint32(stco[8+4*i:])))
-			}
-		} else if co64 := findBox(stbl, "co64"); co64 != nil && len(co64) >= 8 {
-			n := int(binary.BigEndian.Uint32(co64[4:8]))
-			if len(co64) < 8+8*n {
-				return true
-			}
-			for i := 0; i < n; i++ {
-				chunkOff = append(chunkOff, int64(binary.BigEndian.Uint64(co64[8+8*i:])))
-			}
-		} else {
-			return true
-		}
-		// stsc(チャンクごとのサンプル数)→ サンプルごとのオフセット
-		stsc := findBox(stbl, "stsc")
-		if stsc == nil || len(stsc) < 8 {
-			return true
-		}
-		ne := int(binary.BigEndian.Uint32(stsc[4:8]))
-		if len(stsc) < 8+12*ne || ne <= 0 {
-			return true
-		}
-		type stscEnt struct{ first, per int }
-		ents := make([]stscEnt, ne)
-		for i := 0; i < ne; i++ {
-			ents[i] = stscEnt{
-				first: int(binary.BigEndian.Uint32(stsc[8+12*i:])),
-				per:   int(binary.BigEndian.Uint32(stsc[8+12*i+4:])),
-			}
-		}
-		t2.offsets = make([]int64, 0, cnt)
-		si := 0
-		for ci := 0; ci < len(chunkOff) && si < cnt; ci++ {
-			per := 0
-			for _, e := range ents {
-				if e.first <= ci+1 {
-					per = e.per
-				}
-			}
-			off := chunkOff[ci]
-			for k := 0; k < per && si < cnt; k++ {
-				t2.offsets = append(t2.offsets, off)
-				off += int64(t2.sizes[si])
-				si++
-			}
-		}
-		if si != cnt {
+		if !mp4SampleTable(stbl, t2, fragmented) {
 			return true
 		}
 		tr = t2
@@ -292,6 +237,121 @@ func parseMP4VideoTrack(file []byte) (*mp4Track, bool) {
 		return nil, false
 	}
 	return tr, true
+}
+
+// mp4SampleTable は stbl からサンプル表(sizes/offsets)を t2 に読み込む。
+// fMP4(空 stbl)は空のまま受理する。
+func mp4SampleTable(stbl []byte, t2 *mp4Track, fragmented bool) bool {
+	stsz := findBox(stbl, "stsz")
+	if stsz == nil || len(stsz) < 12 {
+		return false
+	}
+	uniform := int(binary.BigEndian.Uint32(stsz[4:8]))
+	cnt := int(binary.BigEndian.Uint32(stsz[8:12]))
+	if cnt == 0 && fragmented {
+		return true // fMP4: サンプルは moof/trun 側
+	}
+	if cnt <= 0 || cnt > 1<<22 {
+		return false
+	}
+	t2.sizes = make([]int, cnt)
+	if uniform != 0 {
+		for i := range t2.sizes {
+			t2.sizes[i] = uniform
+		}
+	} else {
+		if len(stsz) < 12+4*cnt {
+			return false
+		}
+		for i := 0; i < cnt; i++ {
+			t2.sizes[i] = int(binary.BigEndian.Uint32(stsz[12+4*i:]))
+		}
+	}
+	var chunkOff []int64
+	if stco := findBox(stbl, "stco"); stco != nil && len(stco) >= 8 {
+		n := int(binary.BigEndian.Uint32(stco[4:8]))
+		if len(stco) < 8+4*n {
+			return false
+		}
+		for i := 0; i < n; i++ {
+			chunkOff = append(chunkOff, int64(binary.BigEndian.Uint32(stco[8+4*i:])))
+		}
+	} else if co64 := findBox(stbl, "co64"); co64 != nil && len(co64) >= 8 {
+		n := int(binary.BigEndian.Uint32(co64[4:8]))
+		if len(co64) < 8+8*n {
+			return false
+		}
+		for i := 0; i < n; i++ {
+			chunkOff = append(chunkOff, int64(binary.BigEndian.Uint64(co64[8+8*i:])))
+		}
+	} else {
+		return false
+	}
+	stsc := findBox(stbl, "stsc")
+	if stsc == nil || len(stsc) < 8 {
+		return false
+	}
+	ne := int(binary.BigEndian.Uint32(stsc[4:8]))
+	if len(stsc) < 8+12*ne || ne <= 0 {
+		return false
+	}
+	type stscEnt struct{ first, per int }
+	ents := make([]stscEnt, ne)
+	for i := 0; i < ne; i++ {
+		ents[i] = stscEnt{
+			first: int(binary.BigEndian.Uint32(stsc[8+12*i:])),
+			per:   int(binary.BigEndian.Uint32(stsc[8+12*i+4:])),
+		}
+	}
+	t2.offsets = make([]int64, 0, cnt)
+	si := 0
+	for ci := 0; ci < len(chunkOff) && si < cnt; ci++ {
+		per := 0
+		for _, e := range ents {
+			if e.first <= ci+1 {
+				per = e.per
+			}
+		}
+		off := chunkOff[ci]
+		for k := 0; k < per && si < cnt; k++ {
+			t2.offsets = append(t2.offsets, off)
+			off += int64(t2.sizes[si])
+			si++
+		}
+	}
+	return si == cnt
+}
+
+// parseHvcC は HEVCDecoderConfigurationRecord から PS NAL 群と NAL 長
+// フィールド幅を取り出す。
+func parseHvcC(hvcC []byte) ([][]byte, int, bool) {
+	if len(hvcC) < 23 {
+		return nil, 0, false
+	}
+	lenSize := int(hvcC[21]&3) + 1
+	nArr := int(hvcC[22])
+	var ps [][]byte
+	p := 23
+	for a := 0; a < nArr; a++ {
+		if p+3 > len(hvcC) {
+			return nil, 0, false
+		}
+		nNal := int(binary.BigEndian.Uint16(hvcC[p+1:]))
+		p += 3
+		for k := 0; k < nNal; k++ {
+			if p+2 > len(hvcC) {
+				return nil, 0, false
+			}
+			l := int(binary.BigEndian.Uint16(hvcC[p:]))
+			p += 2
+			if p+l > len(hvcC) {
+				return nil, 0, false
+			}
+			ps = append(ps, hvcC[p:p+l])
+			p += l
+		}
+	}
+	return ps, lenSize, true
 }
 
 // mp4FragmentSamples は moof/traf/trun からビデオサンプルの (off,size) を集める。
@@ -447,7 +507,7 @@ func TryUnwrapMP4H264(orig []byte, maxPlain int64) (*MP4H264Unwrapped, bool) {
 		return nil, false
 	}
 	tr, ok := parseMP4VideoTrack(orig)
-	if !ok || (len(tr.offsets) == 0 && !tr.fragmented) {
+	if !ok || tr.codec != "avc" || (len(tr.offsets) == 0 && !tr.fragmented) {
 		return nil, false
 	}
 	// サンプルをファイルオフセット順に(重複・範囲外は対象外)
