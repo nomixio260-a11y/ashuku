@@ -114,8 +114,10 @@ func TestColumnarNanoTimestamp(t *testing.T) {
 	if !ok {
 		t.Fatal("採用されなかった")
 	}
-	if u.Recipe.Codec[0] != colDelta {
-		t.Errorf("19桁 ns 列は delta 期待、実際 codec=%d", u.Recipe.Codec[0])
+	// 間隔が 1 ずつ漸増する加速列なので delta/delta2 のどちらかが選ばれる
+	// (この列は二階差分が定数になり delta2 が最小になる。§4.52)。
+	if u.Recipe.Codec[0] != colDelta && u.Recipe.Codec[0] != colDelta2 {
+		t.Errorf("19桁 ns 列は delta 系期待、実際 codec=%d", u.Recipe.Codec[0])
 	}
 	rt, err := ReconstructCSV(u.Recipe, u.Chunked)
 	if err != nil || !bytes.Equal(rt, orig) {
@@ -256,4 +258,31 @@ func FuzzColumnarDecode(f *testing.F) {
 			_ = colDecode(seg, codec, 0, nrows, grid) // パニックしないこと
 		}
 	})
+}
+
+// TestColumnarDelta2 は二階差分コーデック(colDelta2)が加速する整数時系列で
+// 選択され、byte 一致で往復することを確認する。
+func TestColumnarDelta2(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString("t,label\n")
+	// 間隔が線形に増える加速列(retry backoff / 三角数など)。二階差分が定数→潰れる。
+	t0 := int64(1000000000)
+	step := int64(50)
+	for i := 0; i < 400; i++ {
+		t0 += step
+		step += 3
+		fmt.Fprintf(&b, "%d,row%d\n", t0, i%7)
+	}
+	orig := b.Bytes()
+	u, ok := TryUnwrapCSV(orig, 1<<20)
+	if !ok {
+		t.Fatal("採用されなかった")
+	}
+	if u.Recipe.Codec[0] != colDelta2 {
+		t.Errorf("加速列は delta2 期待、実際 codec=%d", u.Recipe.Codec[0])
+	}
+	rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatalf("往復不一致: err=%v", err)
+	}
 }

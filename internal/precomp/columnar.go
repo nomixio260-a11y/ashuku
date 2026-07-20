@@ -32,6 +32,7 @@ const (
 	colDict     uint8 = 2 // パレット + ASCII-ID(改行区切り)
 	colDictBin  uint8 = 3 // パレット + 固定幅 LE 二進 ID(区切り無し)
 	colDeltaDec uint8 = 4 // 固定小数(同一小数桁)のスケール整数隣接差分
+	colDelta2   uint8 = 5 // 正準 int の二階差分(間隔が漸増/大ジッタの時系列)
 )
 
 // colDictMaxCard は dict を試すカーディナリティ上限(パレットが大きすぎると
@@ -53,6 +54,13 @@ func encodeColumns(grid [][][]byte, ncol, nrows int) (blob []byte, codecs []uint
 		if d, ok := colEncodeDelta(grid, c, nrows); ok {
 			if pl := probeLen(d); pl < bestPL {
 				best, bestCodec, bestPL = d, colDelta, pl
+			}
+		}
+		// 二階差分。間隔が漸増する/一階差分の振れが大きい時系列で colDelta を上回る
+		// (RESEARCH §4.52)。効かない列は probeLen で選ばれないので無害。
+		if d, ok := colEncodeDelta2(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colDelta2, pl
 			}
 		}
 		// 固定小数(気温・価格・センサ値)の隣接差分。**隣接値が相関する(漸増)
@@ -119,6 +127,39 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		b.WriteString(strconv.FormatInt(vals[r]-prev, 10))
 		b.WriteByte('\n')
 		prev = vals[r]
+	}
+	return b.Bytes(), true
+}
+
+// colEncodeDelta2 は正準 int 列を「row0 逐語 + 一階差分の初項 + 以降は二階差分」で
+// 直列化する。間隔が漸増(加速)する列や、一階差分の振れ幅が大きいジッタ時系列で
+// colDelta を上回る(二階差分が 0 付近の小さな値に潰れて縮む)。best-of で probeLen が
+// 最小のときだけ採用されるので、効かない列では選ばれず無害。整数演算のラップは
+// encode/decode で対称なので、桁溢れがあっても厳密に往復する(採否は byte 一致で担保)。
+func colEncodeDelta2(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 3 {
+		return nil, false // 2 行以下は colDelta と等価
+	}
+	vals := make([]int64, nrows)
+	for r := 1; r < nrows; r++ {
+		v, ok := parseCanonInt(grid[r][c])
+		if !ok {
+			return nil, false
+		}
+		vals[r] = v
+	}
+	vals[0] = deltaBaseCanon(grid[0][c]) // 基準は凍結境界(colDelta と共通)
+	var b bytes.Buffer
+	b.Write(grid[0][c])
+	b.WriteByte('\n')
+	prevDiff := vals[1] - vals[0] // 一階差分の初項
+	b.WriteString(strconv.FormatInt(prevDiff, 10))
+	b.WriteByte('\n')
+	for r := 2; r < nrows; r++ {
+		diff := vals[r] - vals[r-1]
+		b.WriteString(strconv.FormatInt(diff-prevDiff, 10)) // 二階差分
+		b.WriteByte('\n')
+		prevDiff = diff
 	}
 	return b.Bytes(), true
 }
@@ -452,6 +493,28 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 			v := prev + d
 			grid[r][c] = []byte(strconv.FormatInt(v, 10))
 			prev = v
+		}
+	case colDelta2:
+		if len(parts) != nrows || nrows < 3 {
+			return errors.New("delta2 列の行数不一致")
+		}
+		grid[0][c] = parts[0]
+		base := deltaBaseCanon(parts[0])
+		d1, err := strconv.ParseInt(string(parts[1]), 10, 64) // 一階差分の初項
+		if err != nil {
+			return errors.New("delta2 初項の解析に失敗")
+		}
+		prevVal := base + d1 // vals[1]
+		grid[1][c] = []byte(strconv.FormatInt(prevVal, 10))
+		prevDiff := d1
+		for r := 2; r < nrows; r++ {
+			dd, err := strconv.ParseInt(string(parts[r]), 10, 64) // 二階差分
+			if err != nil {
+				return errors.New("delta2 二階差分の解析に失敗")
+			}
+			prevDiff += dd
+			prevVal += prevDiff
+			grid[r][c] = []byte(strconv.FormatInt(prevVal, 10))
 		}
 	case colDeltaDec:
 		if len(parts) != nrows+1 { // 小数桁 + row0 + (nrows-1) 差分
