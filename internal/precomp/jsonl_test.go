@@ -66,6 +66,53 @@ func TestJSONLCompresses(t *testing.T) {
 	}
 }
 
+// TestJSONLNested は入れ子(オブジェクト/配列)を含む行が不透明スパンとして
+// 畳まれ、往復一致し、採用されることを確認する(k8s/OTel ログの主対象)。
+func TestJSONLNested(t *testing.T) {
+	// 往復一致(構文バリエーション)。
+	cases := map[string][]byte{
+		"nested-obj":   bytes.Repeat([]byte(`{"ts":1,"k8s":{"pod":"p","ns":"prod"},"msg":"x"}`+"\n"), 20),
+		"nested-arr":   bytes.Repeat([]byte(`{"ts":1,"tags":["a","b","c"],"n":5}`+"\n"), 20),
+		"deep-nest":    bytes.Repeat([]byte(`{"a":{"b":{"c":[1,2,{"d":3}]}},"e":9}`+"\n"), 20),
+		"brace-in-str": bytes.Repeat([]byte(`{"o":{"m":"has } and ] inside"},"n":1}`+"\n"), 20),
+		"empty-nest":   bytes.Repeat([]byte(`{"o":{},"a":[],"n":1}`+"\n"), 20),
+	}
+	for name, data := range cases {
+		u, ok := TryUnwrapJSONL(data, 1<<20)
+		if !ok {
+			t.Logf("%s: 非採用(安全)", name)
+			continue
+		}
+		rt, err := ReconstructJSONL(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(rt, data) {
+			t.Fatalf("%s: 入れ子の往復不一致: err=%v", name, err)
+		}
+	}
+	// 実ログ様(可変な入れ子値)で採用され、行指向より縮むこと。
+	rng := rand.New(rand.NewSource(3))
+	svcs := []string{"checkout", "payments", "inventory", "gateway"}
+	var b bytes.Buffer
+	ts := 1700000000
+	for i := 0; i < 4000; i++ {
+		ts += rng.Intn(50)
+		fmt.Fprintf(&b, `{"ts":%d,"level":"info","k8s":{"pod":"%s-%d","ns":"prod"},"trace":{"id":"%08x"},"code":%d}`+"\n",
+			ts, svcs[rng.Intn(len(svcs))], rng.Intn(20), rng.Uint32(), 200+rng.Intn(3)*100)
+	}
+	data := b.Bytes()
+	u, ok := TryUnwrapJSONL(data, 1<<20)
+	if !ok {
+		t.Fatal("入れ子構造化ログが採用されなかった(以前は素通しだった)")
+	}
+	rt, err := ReconstructJSONL(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, data) {
+		t.Fatalf("往復不一致: err=%v", err)
+	}
+	if probeLen(u.Chunked) >= probeLen(data) {
+		t.Fatal("入れ子ログの列指向が縮んでいない")
+	}
+	t.Logf("入れ子ログ: 列指向が行指向より縮んだ(%d 値/行)", u.Recipe.Cols)
+}
+
 func TestJSONLRejects(t *testing.T) {
 	reject := map[string][]byte{
 		"nested":       bytes.Repeat([]byte(`{"a":{"b":1},"c":2}`+"\n"), 20),

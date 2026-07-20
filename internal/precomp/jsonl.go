@@ -62,9 +62,12 @@ func IsJSONL(head []byte) bool {
 	return bytes.IndexByte(line, '"') >= 0 && bytes.IndexByte(line, ':') >= 0
 }
 
-// skeletonizeFlat は平坦な JSON オブジェクト行を解析し、値のバイト範囲と
-// 骨格(値を 0x00 に置換した行)を返す。入れ子・配列値・想定外の構文は
-// ok=false(=素通し)。骨格+値の連結は構成上つねに元の行に一致する。
+// skeletonizeFlat は JSON オブジェクト行を解析し、値のバイト範囲と骨格
+// (値を 0x00 に置換した行)を返す。トップレベルのキーは平坦だが、**値が
+// 入れ子(オブジェクト/配列)の場合はその全体を1つの不透明スパンとして
+// 畳む**(k8s/OpenTelemetry 等、入れ子を持つ構造化ログが主対象)。想定外の
+// 構文は ok=false(=素通し)。骨格+値の連結は構成上つねに元の行に一致し、
+// 最終的に ReconstructJSONL のバイト一致検証も通した時のみ採用される。
 func skeletonizeFlat(line []byte) (skel []byte, vals [][]byte, ok bool) {
 	n := len(line)
 	if n < 2 || line[0] != '{' {
@@ -136,7 +139,44 @@ func skeletonizeFlat(line []byte) (skel []byte, vals [][]byte, ok bool) {
 			}
 			i++ // 閉じ "
 		case '{', '[':
-			return nil, nil, false // 入れ子は対象外
+			// 入れ子(オブジェクト/配列)は括弧の対応を取って全体を1値に畳む。
+			// 文字列リテラル内の括弧は数えない(エスケープも考慮)。値の中身は
+			// 一切解釈せず、[vstart:i] をそのまま不透明スパンとして扱う。
+			depth := 0
+			for i < n {
+				switch line[i] {
+				case '"':
+					i++
+					for i < n && line[i] != '"' {
+						if line[i] == '\\' {
+							i++
+							if i >= n {
+								return nil, nil, false
+							}
+						}
+						i++
+					}
+					if i >= n {
+						return nil, nil, false
+					}
+					i++ // 閉じ "
+					continue
+				case '{', '[':
+					depth++
+				case '}', ']':
+					depth--
+					if depth == 0 {
+						i++ // 閉じ括弧の次へ
+					}
+				}
+				if depth == 0 {
+					break
+				}
+				i++
+			}
+			if depth != 0 {
+				return nil, nil, false // 括弧が閉じない
+			}
 		default: // 数値・true・false・null
 			for i < n && line[i] != ',' && line[i] != '}' && line[i] != ' ' && line[i] != '\t' {
 				i++
