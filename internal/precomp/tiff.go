@@ -53,6 +53,13 @@ type TIFFUnwrapped struct {
 
 const tiffMaxStrips = 65536
 
+// tiffMaxIFDValues は 1 つの IFD 全体で確保する値(uint32)の総数上限。
+// 各エントリの値領域は入力 d 内で自由に重複できるため、per-entry の個数上限
+// (cnt<=1<<24)だけでは n(最大65535)× 個数 の増幅で確保量が入力サイズに
+// 比例せず膨張し、~1MB の入力から数十 GB を確保して OOM を起こしうる。適合
+// TIFF はストリップ 2 タグ(各最大 tiffMaxStrips)+ 少数タグで十分収まる。
+const tiffMaxIFDValues = 1 << 20
+
 // TryUnwrapTIFF は非圧縮 TIFF のストリップに行フィルタをかける。
 func TryUnwrapTIFF(orig []byte, maxPlain int64) (*TIFFUnwrapped, bool) {
 	if maxPlain <= 0 || maxPlain > maxPlainTotal {
@@ -226,6 +233,7 @@ func readIFD(d []byte, bo binary.ByteOrder, ifdOff int) (map[int][]uint32, bool)
 		return nil, false
 	}
 	tags := make(map[int][]uint32, n)
+	allocVals := 0
 	for i := 0; i < n; i++ {
 		e := ifdOff + 2 + i*12
 		tag := int(bo.Uint16(d[e:]))
@@ -249,6 +257,12 @@ func readIFD(d []byte, bo binary.ByteOrder, ifdOff int) (map[int][]uint32, bool)
 			valPos = int(bo.Uint32(d[e+8:]))
 		}
 		if valPos < 0 || valPos+total > len(d) {
+			return nil, false
+		}
+		// 集約ガード(防御): 値領域は d 内で重複できるため、IFD 全体の確保
+		// 総数を制限して n×個数 の増幅による OOM を防ぐ(per-entry 上限では不十分)。
+		allocVals += cnt
+		if allocVals > tiffMaxIFDValues {
 			return nil, false
 		}
 		vals := make([]uint32, cnt)

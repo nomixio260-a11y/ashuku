@@ -434,10 +434,24 @@ func parseHEVCSPS(rbsp []byte) (*hevcSPS, bool) {
 		return nil, false
 	}
 	// 以降(VUI/拡張)はスライス解析に不要。骨格に原文保持されるため読まない。
+	// 変換/CTB サイズの上限(防御): residual() の走査表(hevcDiagScan8x8Inv 等)と
+	// csbf グリッドは最大 32x32 変換(8x8 CG)・64x64 CTB を前提とした固定長。
+	// log2* は無制限の ue() なので、実 HEVC 仕様の上限(CtbLog2SizeY<=6,
+	// MaxTbLog2SizeY<=5, かつ MaxTb<=Ctb)を超える値は配列 OOB を招く。適合外は弾く。
+	if s.log2CtbSize > 6 || s.log2MaxTb > 5 || s.log2MaxTb > s.log2CtbSize {
+		return nil, false
+	}
 	ctb := 1 << uint(s.log2CtbSize)
 	s.ctbW = (s.width + ctb - 1) / ctb
 	s.ctbH = (s.height + ctb - 1) / ctb
 	if s.ctbW <= 0 || s.ctbH <= 0 {
+		return nil, false
+	}
+	// 画面寸法は min-CB サイズの整数倍でなければならない(実 HEVC の適合条件)。
+	// 満たさないと minCbW/minCbH = width>>log2MinCb が 0 に切り捨てられ、
+	// per-min-block 配列が空になって CTU 走査が空配列を索引し panic する。
+	minCb := 1 << uint(s.log2MinCb)
+	if s.width%minCb != 0 || s.height%minCb != 0 {
 		return nil, false
 	}
 	return s, true

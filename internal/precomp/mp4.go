@@ -648,6 +648,12 @@ func ReconstructMP4H264(recipe *MP4H264Recipe, chunked []byte) ([]byte, error) {
 	var out []byte
 	rp, hp := 0, 0
 	for _, sg := range recipe.Segs {
+		// 下限ガード: 負の長さは下の上限チェックを素通りして
+		// hdrBlob[hp:hp+HdrLen] のスライス境界 panic を起こす(AnnexB 版の
+		// ReconstructH264 は switch の >0 分岐で負値を弾いており、本関数も揃える)。
+		if sg.RawLen < 0 || sg.HdrLen < 0 {
+			return nil, errH264BadRecipe
+		}
 		if sg.RawLen > 0 && sg.HdrLen == 0 {
 			if rp+sg.RawLen > len(rawBlob) {
 				return nil, errH264BadRecipe

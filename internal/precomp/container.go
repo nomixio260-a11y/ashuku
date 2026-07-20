@@ -134,7 +134,8 @@ func TryUnwrapPDF(orig []byte, maxPlain int64) ([]byte, *ContainerRecipe, bool) 
 	}
 	token := []byte("stream")
 	var segs []rawSegment
-	var totalPlain int64
+	var totalPlain int64 // 採用したストリームの伸長合計(出力サイズの上限)
+	var inflated int64   // 走査中に伸長した総量(失敗候補も含む。CPU/メモリ増幅の上限)
 	pos := 0
 	for len(segs) < maxMembers {
 		i := bytes.Index(orig[pos:], token)
@@ -157,8 +158,17 @@ func TryUnwrapPDF(orig []byte, maxPlain int64) ([]byte, *ContainerRecipe, bool) 
 		// 2バイトヘッダ + deflate(消費バイト追跡)+ adler32(4バイト)
 		br := bytes.NewReader(orig[dataStart+2:])
 		fr := flate.NewReader(br)
-		plain, err := io.ReadAll(io.LimitReader(fr, maxPlain-totalPlain+1))
+		// 伸長予算は「走査全体で伸長した総量(inflated)」で絞る。失敗候補も
+		// 計上することで、adler 不一致等で continue する伸長爆弾を大量に並べても
+		// 総伸長量が maxPlain 程度で頭打ちになる。旧実装は成功時のみ totalPlain を
+		// 加算していたため、失敗候補が毎回 maxPlain まで伸長でき、~1000倍の
+		// 増幅型 CPU/メモリ DoS を許していた。
+		plain, err := io.ReadAll(io.LimitReader(fr, maxPlain-inflated+1))
 		fr.Close()
+		inflated += int64(len(plain))
+		if inflated > maxPlain {
+			break // 走査全体の伸長予算を使い切った(増幅 DoS 防御)
+		}
 		if err != nil || totalPlain+int64(len(plain)) > maxPlain {
 			continue
 		}

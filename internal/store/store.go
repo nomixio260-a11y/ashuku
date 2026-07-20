@@ -1445,7 +1445,18 @@ func (r *releaseReadCloser) Close() error {
 
 // reconstructPrecomp は precompression されたファイルの元ストリームを
 // レシピから再構成し、SHA-256 で検証して返す。
-func (s *Store) reconstructPrecomp(m *FileManifest) ([]byte, error) {
+func (s *Store) reconstructPrecomp(m *FileManifest) (result []byte, rerr error) {
+	// 防御(defense-in-depth): 復元器はどれも攻撃者由来になりうるレシピ/内容を
+	// 扱う。万一いずれかが panic(スライス境界・nil 参照等)しても、サーバ全体を
+	// 巻き込まず当該読み出しだけをクリーンにエラーにする。読み出し側は最終的に
+	// SHA-256 で照合するため、ここでの panic→error 化は安全側にしか倒れない。
+	// (ingest 側 tryPrecomp の recover とは別に、読み出し経路にも網を張る。)
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			rerr = fmt.Errorf("precompression の再構成中に内部エラー: %v", r)
+		}
+	}()
 	var plain bytes.Buffer
 	plain.Grow(int(m.ChunkedSize))
 	for _, hash := range m.Chunks {

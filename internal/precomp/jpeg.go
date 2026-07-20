@@ -362,6 +362,12 @@ func parseFrame(orig []byte) (*jpegFrame, int, error) {
 			if ns != len(f.comps) {
 				return nil, 0, errors.New("非インターリーブは未対応")
 			}
+			// SOF より前に SOS が来ると f.comps は空・hmax/vmax=0 になり、
+			// 上の ns==len(f.comps) が 0==0 で通過して 8*hmax による除算が
+			// ゼロ除算 panic を起こす。SOF 未検出/寸法ゼロは明示的に弾く。
+			if len(f.comps) == 0 || f.hmax == 0 || f.vmax == 0 || f.width == 0 || f.height == 0 {
+				return nil, 0, errors.New("SOS の前に有効な SOF がない")
+			}
 			entropyStart := i + segLen
 			f.mcuX = (f.width + 8*f.hmax - 1) / (8 * f.hmax)
 			f.mcuY = (f.height + 8*f.vmax - 1) / (8 * f.vmax)
