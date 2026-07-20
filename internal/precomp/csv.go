@@ -35,6 +35,7 @@ type CSVRecipe struct {
 	Cols       int     `json:"c"`            // 列数
 	Rows       int     `json:"r"`            // 行数(ヘッダ含む全行)
 	TrailingNL bool    `json:"t,omitempty"`  // 元が改行で終わるか
+	CRLF       bool    `json:"crlf,omitempty"` // 全行が '\r\n' 終端(復元時に '\r' を戻す)
 	Delta      []bool  `json:"d,omitempty"`  // 旧: 列ごとの数値 delta フラグ(後方互換)
 	Codec      []uint8 `json:"cc,omitempty"` // 新: 列ごとのコーデック(raw/delta/dict)
 	ColBytes   []int   `json:"cb,omitempty"` // 新: 列ごとのセグメントバイト長
@@ -71,8 +72,12 @@ func IsCSV(head []byte) bool {
 
 // parseCanonInt は b が int64 に正準往復する(parse→format が元と一致)
 // なら値と true を返す。先頭ゼロ・'+'・"-0" 等は正準でないので false。
+//
+// 桁数上限は 19(ナノ秒 Unix タイムスタンプ=19桁が delta 対象になる)。
+// 20 桁以上は int64 に必ず収まらないので弾く。19 桁でも int64 範囲外は
+// ParseInt がエラーにし、FormatInt==元 の正準検査も通らないので安全。
 func parseCanonInt(b []byte) (int64, bool) {
-	if len(b) == 0 || len(b) > 18 {
+	if len(b) == 0 || len(b) > 19 {
 		return 0, false
 	}
 	v, err := strconv.ParseInt(string(b), 10, 64)
@@ -103,6 +108,21 @@ func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 	if len(lines) < csvMinRows {
 		return nil, false
 	}
+	// CRLF 検出: 全行が '\r' 終端なら、末尾 '\r' を行区切りの一部とみなして
+	// 剥がす(最後の列に '\r' が閉じ込められて delta 化を妨げるのを解消)。
+	// 復元時に各行へ '\r' を戻す。剥がし+戻しは厳密な逆変換で、往復検証が保証。
+	crlf := true
+	for _, ln := range lines {
+		if len(ln) == 0 || ln[len(ln)-1] != '\r' {
+			crlf = false
+			break
+		}
+	}
+	if crlf {
+		for i := range lines {
+			lines[i] = lines[i][:len(lines[i])-1]
+		}
+	}
 	ncol := bytes.Count(lines[0], []byte{','}) + 1
 	if ncol < csvMinCols || ncol > csvMaxCols {
 		return nil, false
@@ -127,7 +147,7 @@ func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 	}
 
 	recipe := &CSVRecipe{
-		Cols: ncol, Rows: nrows, TrailingNL: trailingNL,
+		Cols: ncol, Rows: nrows, TrailingNL: trailingNL, CRLF: crlf,
 		Codec: codecs, ColBytes: colBytes,
 	}
 
@@ -158,37 +178,12 @@ func ReconstructCSV(recipe *CSVRecipe, blob []byte) ([]byte, error) {
 		}
 		fields = g
 	} else {
-		// 旧形式(後方互換): 各列 nrows 行の固定行グリッド + 一括 delta。
-		parts := bytes.Split(blob, []byte{'\n'})
-		if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
-			return nil, errors.New("CSV ブロブの要素数が不一致")
+		// 旧形式(後方互換): 固定行グリッド + 一括 delta(共有ヘルパ)。
+		g, err := decodeLegacyGrid(blob, recipe.Delta, ncol, nrows)
+		if err != nil {
+			return nil, err
 		}
-		fields = make([][][]byte, nrows)
-		for r := 0; r < nrows; r++ {
-			fields[r] = make([][]byte, ncol)
-		}
-		for c := 0; c < ncol; c++ {
-			base := c * nrows
-			isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
-			if isDelta {
-				row0 := parts[base]
-				fields[0][c] = row0
-				prev, _ := parseCanonInt(row0) // 非intなら 0
-				for r := 1; r < nrows; r++ {
-					d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
-					if err != nil {
-						return nil, errors.New("CSV delta の解析に失敗")
-					}
-					v := prev + d
-					fields[r][c] = []byte(strconv.FormatInt(v, 10))
-					prev = v
-				}
-			} else {
-				for r := 0; r < nrows; r++ {
-					fields[r][c] = parts[base+r]
-				}
-			}
-		}
+		fields = g
 	}
 	// 行を ',' で、行同士を '\n' で連結。
 	var out bytes.Buffer
@@ -202,6 +197,9 @@ func ReconstructCSV(recipe *CSVRecipe, blob []byte) ([]byte, error) {
 				out.WriteByte(',')
 			}
 			out.Write(fields[r][c])
+		}
+		if recipe.CRLF { // 各行末に '\r' を戻す('\r\n' 終端)
+			out.WriteByte('\r')
 		}
 	}
 	if recipe.TrailingNL {

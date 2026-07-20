@@ -27,9 +27,10 @@ import (
 
 // 列コーデック識別子(レシピに保存)。
 const (
-	colRaw   uint8 = 0
-	colDelta uint8 = 1
-	colDict  uint8 = 2
+	colRaw     uint8 = 0
+	colDelta   uint8 = 1
+	colDict    uint8 = 2 // パレット + ASCII-ID(改行区切り)
+	colDictBin uint8 = 3 // パレット + 固定幅 LE 二進 ID(区切り無し)
 )
 
 // colDictMaxCard は dict を試すカーディナリティ上限(パレットが大きすぎると
@@ -53,9 +54,19 @@ func encodeColumns(grid [][][]byte, ncol, nrows int) (blob []byte, codecs []uint
 				best, bestCodec, bestPL = d, colDelta, pl
 			}
 		}
-		if dv, ok := colEncodeDict(grid, c, nrows); ok {
-			if pl := probeLen(dv); pl < bestPL {
-				best, bestCodec, bestPL = dv, colDict, pl
+		// dict は ASCII-ID 版と二進-ID 版の両方を試して小さい方を採る。
+		// 二進 ID(固定幅 LE、区切り無し)は列挙・ステータス等でエントロピー
+		// 段が密にモデル化でき、実測で ASCII より縮む(RESEARCH §4.45)。
+		if order, ids, ok := colDictBuild(grid, c, nrows); ok {
+			if dv := colFormatDict(order, ids); dv != nil {
+				if pl := probeLen(dv); pl < bestPL {
+					best, bestCodec, bestPL = dv, colDict, pl
+				}
+			}
+			if dvb := colFormatDictBin(order, ids); dvb != nil {
+				if pl := probeLen(dvb); pl < bestPL {
+					best, bestCodec, bestPL = dvb, colDictBin, pl
+				}
 			}
 		}
 		codecs[c] = bestCodec
@@ -99,14 +110,11 @@ func colEncodeDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 	return b.Bytes(), true
 }
 
-// colEncodeDict は列 c を「npal + パレット + ID列」で直列化する
-// (カーディナリティが行数の半分未満かつ上限内の時のみ)。
-//
-// カーディナリティが閾値に達した時点で即座に打ち切る(全行を走査してから
-// 判定していた旧版は、高カーディナリティ列で無駄な O(n) スキャンと、
-// nrows/2 まで膨らむ seen マップの大量確保を招いた)。採否の判定は
-// 旧版と厳密に等価(最終 len(order) が閾値以上なら不採用)。
-func colEncodeDict(grid [][][]byte, c, nrows int) ([]byte, bool) {
+// colDictBuild は列 c のパレット(order)と行ごとの ID を作る。
+// カーディナリティが閾値(行数の半分未満かつ colDictMaxCard 未満)に達した
+// 時点で即座に打ち切る(高カーディナリティ列で無駄な O(n) スキャンと大量
+// 確保を避ける)。採否は旧版と厳密に等価(最終 len(order) が閾値以上で不採用)。
+func colDictBuild(grid [][][]byte, c, nrows int) (order [][]byte, ids []int, ok bool) {
 	// len(order) がこの値に達したら dict 不適(len(order)*2>=nrows または
 	// colDictMaxCard 到達と等価)。
 	limit := (nrows + 1) / 2
@@ -114,27 +122,36 @@ func colEncodeDict(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		limit = colDictMaxCard
 	}
 	if limit < 1 {
-		return nil, false
+		return nil, nil, false
 	}
 	hint := limit
 	if hint > 4096 { // 巨大な事前確保を防ぐ(以降は伸長に任せる)
 		hint = 4096
 	}
 	seen := make(map[string]int, hint+1)
-	order := make([][]byte, 0, 16)
+	order = make([][]byte, 0, 16)
+	// ids は事前確保しない(不採用列で nrows 分を無駄に確保しないため)。
 	for r := 0; r < nrows; r++ {
 		s := string(grid[r][c])
-		if _, ok := seen[s]; !ok {
-			seen[s] = len(order)
+		id, seenIt := seen[s]
+		if !seenIt {
+			id = len(order)
+			seen[s] = id
 			order = append(order, grid[r][c])
 			if len(order) >= limit { // カーディナリティ過大 → 早期打ち切り
-				return nil, false
+				return nil, nil, false
 			}
 		}
+		ids = append(ids, id)
 	}
 	if len(order) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
+	return order, ids, true
+}
+
+// colFormatDict は「npal + パレット + ASCII-ID列(改行区切り)」に直列化する。
+func colFormatDict(order [][]byte, ids []int) []byte {
 	var b bytes.Buffer
 	b.WriteString(strconv.Itoa(len(order)))
 	b.WriteByte('\n')
@@ -142,11 +159,76 @@ func colEncodeDict(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		b.Write(v)
 		b.WriteByte('\n')
 	}
-	for r := 0; r < nrows; r++ {
-		b.WriteString(strconv.Itoa(seen[string(grid[r][c])]))
+	for _, id := range ids {
+		b.WriteString(strconv.Itoa(id))
 		b.WriteByte('\n')
 	}
-	return b.Bytes(), true
+	return b.Bytes()
+}
+
+// colFormatDictBin は「npal + パレット + 固定幅 LE 二進 ID列(区切り無し)」に
+// 直列化する。ID 幅は npal を表すのに必要な最小バイト数(npal<=1 なら 0 幅)。
+func colFormatDictBin(order [][]byte, ids []int) []byte {
+	var b bytes.Buffer
+	b.WriteString(strconv.Itoa(len(order)))
+	b.WriteByte('\n')
+	for _, v := range order {
+		b.Write(v)
+		b.WriteByte('\n')
+	}
+	w := dictIDWidth(len(order))
+	for _, id := range ids {
+		for k := 0; k < w; k++ {
+			b.WriteByte(byte(id >> uint(8*k)))
+		}
+	}
+	return b.Bytes()
+}
+
+// dictIDWidth は npal 個の ID を表す固定バイト幅([0,npal-1] を格納可能な最小)。
+func dictIDWidth(npal int) int {
+	w := 0
+	for (1 << uint(8*w)) < npal {
+		w++
+	}
+	return w
+}
+
+// decodeLegacyGrid は旧形式(ColBytes 無し)ブロブを固定行グリッド + 一括
+// delta で復元する。CSV/JSONL の後方互換経路が共用する(以前は両者が
+// バイト単位で同一の復号を重複実装していた)。
+func decodeLegacyGrid(blob []byte, delta []bool, ncol, nrows int) ([][][]byte, error) {
+	parts := bytes.Split(blob, []byte{'\n'})
+	if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
+		return nil, errors.New("旧形式ブロブの要素数が不一致")
+	}
+	grid := make([][][]byte, nrows)
+	for r := 0; r < nrows; r++ {
+		grid[r] = make([][]byte, ncol)
+	}
+	for c := 0; c < ncol; c++ {
+		base := c * nrows
+		isDelta := delta != nil && c < len(delta) && delta[c]
+		if isDelta {
+			row0 := parts[base]
+			grid[0][c] = row0
+			prev, _ := parseCanonInt(row0) // 非intなら 0
+			for r := 1; r < nrows; r++ {
+				d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
+				if err != nil {
+					return nil, errors.New("旧形式 delta の解析に失敗")
+				}
+				v := prev + d
+				grid[r][c] = []byte(strconv.FormatInt(v, 10))
+				prev = v
+			}
+		} else {
+			for r := 0; r < nrows; r++ {
+				grid[r][c] = parts[base+r]
+			}
+		}
+	}
+	return grid, nil
 }
 
 // decodeColumns は encodeColumns の逆変換。blob を colBytes で列セグメントに
@@ -180,6 +262,11 @@ func decodeColumns(blob []byte, codecs []uint8, colBytes []int, ncol, nrows int)
 
 // colDecode は 1 列セグメントを grid の列 c へ復元する。
 func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
+	// 二進 ID の dict は末尾に 0x0A を含みうるので、汎用の '\n' split より前に
+	// 専用復号する。
+	if codec == colDictBin {
+		return colDecodeDictBin(seg, c, nrows, grid)
+	}
 	parts := bytes.Split(seg, []byte{'\n'})
 	if n := len(parts); n == 0 || len(parts[n-1]) != 0 {
 		return errors.New("列セグメントが '\\n' 終端でない")
@@ -230,6 +317,46 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 		}
 	default:
 		return errors.New("未知の列コーデック")
+	}
+	return nil
+}
+
+// colDecodeDictBin は二進 ID の dict セグメントを復元する。ヘッダ
+// (npal 行 + パレット npal 行)は '\n' 区切りで読み、残りを nrows*width の
+// 固定幅 LE ID 列として扱う。
+func colDecodeDictBin(seg []byte, c, nrows int, grid [][][]byte) error {
+	nl := bytes.IndexByte(seg, '\n')
+	if nl < 0 {
+		return errors.New("dictbin: npal 行がない")
+	}
+	npal, err := strconv.Atoi(string(seg[:nl]))
+	if err != nil || npal < 1 || npal >= colDictMaxCard {
+		return errors.New("dictbin: パレット数が不正")
+	}
+	pos := nl + 1
+	palette := make([][]byte, npal)
+	for i := 0; i < npal; i++ {
+		j := bytes.IndexByte(seg[pos:], '\n')
+		if j < 0 {
+			return errors.New("dictbin: パレットが途切れた")
+		}
+		palette[i] = seg[pos : pos+j]
+		pos += j + 1
+	}
+	w := dictIDWidth(npal)
+	if w*nrows != len(seg)-pos { // ID 列は厳密に nrows*width バイト
+		return errors.New("dictbin: ID 列の長さ不一致")
+	}
+	ids := seg[pos:]
+	for r := 0; r < nrows; r++ {
+		id := 0
+		for k := 0; k < w; k++ {
+			id |= int(ids[r*w+k]) << uint(8*k)
+		}
+		if id >= npal {
+			return errors.New("dictbin: ID が範囲外")
+		}
+		grid[r][c] = palette[id]
 	}
 	return nil
 }

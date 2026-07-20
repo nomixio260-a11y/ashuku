@@ -20,7 +20,6 @@ package precomp
 import (
 	"bytes"
 	"errors"
-	"strconv"
 )
 
 const (
@@ -237,37 +236,12 @@ func ReconstructJSONL(recipe *JSONLRecipe, blob []byte) ([]byte, error) {
 		}
 		vals = g
 	} else {
-		// 旧形式(後方互換): 固定行グリッド + 一括 delta。
-		parts := bytes.Split(blob, []byte{'\n'})
-		if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
-			return nil, errors.New("JSONL ブロブの要素数が不一致")
+		// 旧形式(後方互換): 固定行グリッド + 一括 delta(共有ヘルパ)。
+		g, err := decodeLegacyGrid(blob, recipe.Delta, ncol, nrows)
+		if err != nil {
+			return nil, err
 		}
-		vals = make([][][]byte, nrows)
-		for r := 0; r < nrows; r++ {
-			vals[r] = make([][]byte, ncol)
-		}
-		for c := 0; c < ncol; c++ {
-			base := c * nrows
-			isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
-			if isDelta {
-				row0 := parts[base]
-				vals[0][c] = row0
-				prev, _ := parseCanonInt(row0)
-				for r := 1; r < nrows; r++ {
-					d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
-					if err != nil {
-						return nil, errors.New("JSONL delta の解析に失敗")
-					}
-					v := prev + d
-					vals[r][c] = []byte(strconv.FormatInt(v, 10))
-					prev = v
-				}
-			} else {
-				for r := 0; r < nrows; r++ {
-					vals[r][c] = parts[base+r]
-				}
-			}
-		}
+		vals = g
 	}
 	// 各行 = seg[0] v0 seg[1] v1 ... seg[ncol-1] v(ncol-1) seg[ncol]。
 	var out bytes.Buffer
