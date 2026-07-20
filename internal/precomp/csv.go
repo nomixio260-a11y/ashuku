@@ -32,10 +32,12 @@ const (
 
 // CSVRecipe は列指向変換の再構成レシピ。
 type CSVRecipe struct {
-	Cols       int    `json:"c"`           // 列数
-	Rows       int    `json:"r"`           // 行数(ヘッダ含む全行)
-	TrailingNL bool   `json:"t,omitempty"` // 元が改行で終わるか
-	Delta      []bool `json:"d,omitempty"` // 列ごとの数値 delta 符号化フラグ
+	Cols       int     `json:"c"`            // 列数
+	Rows       int     `json:"r"`            // 行数(ヘッダ含む全行)
+	TrailingNL bool    `json:"t,omitempty"`  // 元が改行で終わるか
+	Delta      []bool  `json:"d,omitempty"`  // 旧: 列ごとの数値 delta フラグ(後方互換)
+	Codec      []uint8 `json:"cc,omitempty"` // 新: 列ごとのコーデック(raw/delta/dict)
+	ColBytes   []int   `json:"cb,omitempty"` // 新: 列ごとのセグメントバイト長
 }
 
 // CSVUnwrapped は分解結果。
@@ -116,69 +118,17 @@ func TryUnwrapCSV(orig []byte, maxPlain int64) (*CSVUnwrapped, bool) {
 		grid[i] = f
 	}
 
-	// 列ごとに delta 可否を判定(データ行 1..n-1 が全て正準 int)。
-	delta := make([]bool, ncol)
-	anyDelta := false
-	for c := 0; c < ncol; c++ {
-		ok := nrows > 1
-		for r := 1; r < nrows; r++ {
-			if _, canon := parseCanonInt(grid[r][c]); !canon {
-				ok = false
-				break
-			}
-		}
-		delta[c] = ok
-		anyDelta = anyDelta || ok
-	}
-
-	build := func(useDelta []bool) []byte {
-		var out bytes.Buffer
-		out.Grow(len(orig) + nrows)
-		for c := 0; c < ncol; c++ {
-			if useDelta[c] {
-				out.Write(grid[0][c]) // row0 は逐語
-				out.WriteByte('\n')
-				prev, _ := parseCanonInt(grid[0][c]) // 非intなら prev=0
-				for r := 1; r < nrows; r++ {
-					v, _ := parseCanonInt(grid[r][c])
-					out.WriteString(strconv.FormatInt(v-prev, 10))
-					out.WriteByte('\n')
-					prev = v
-				}
-			} else {
-				for r := 0; r < nrows; r++ {
-					out.Write(grid[r][c])
-					out.WriteByte('\n')
-				}
-			}
-		}
-		return out.Bytes()
-	}
-
-	noDelta := make([]bool, ncol)
-	// 転置のみ / 転置+delta の2候補を probe 圧縮して小さい方を採る。
-	plainBlob := build(noDelta)
-	chosen, chosenDelta := plainBlob, noDelta
-	if anyDelta {
-		dBlob := build(delta)
-		if probeLen(dBlob) < probeLen(plainBlob) {
-			chosen, chosenDelta = dBlob, delta
-		}
-	}
+	// 列ごとに最適コーデック(raw/delta/dict)を選び、連結ブロブを作る。
+	chosen, codecs, colBytes := encodeColumns(grid, ncol, nrows)
 
 	// 行指向(原文)より確実に縮む時だけ採用(probe 実測の best-of)。
 	if probeLen(chosen) >= probeLen(orig) {
 		return nil, false
 	}
 
-	recipe := &CSVRecipe{Cols: ncol, Rows: nrows, TrailingNL: trailingNL}
-	if chosenDelta != nil {
-		for _, d := range chosenDelta {
-			if d {
-				recipe.Delta = chosenDelta
-				break
-			}
-		}
+	recipe := &CSVRecipe{
+		Cols: ncol, Rows: nrows, TrailingNL: trailingNL,
+		Codec: codecs, ColBytes: colBytes,
 	}
 
 	// 最終安全弁: 復元して orig とバイト一致を確認。
@@ -199,35 +149,44 @@ func ReconstructCSV(recipe *CSVRecipe, blob []byte) ([]byte, error) {
 		return nil, errors.New("CSV レシピが不正です")
 	}
 	ncol, nrows := recipe.Cols, recipe.Rows
-	// ブロブは各列 nrows 値 + '\n'。split で ncol*nrows 個 + 末尾 '' を得る。
-	parts := bytes.Split(blob, []byte{'\n'})
-	if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
-		return nil, errors.New("CSV ブロブの要素数が不一致")
-	}
-	// 列 → 行のフィールド表を復元。
-	fields := make([][][]byte, nrows)
-	for r := 0; r < nrows; r++ {
-		fields[r] = make([][]byte, ncol)
-	}
-	for c := 0; c < ncol; c++ {
-		base := c * nrows
-		isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
-		if isDelta {
-			row0 := parts[base]
-			fields[0][c] = row0
-			prev, _ := parseCanonInt(row0) // 非intなら 0
-			for r := 1; r < nrows; r++ {
-				d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
-				if err != nil {
-					return nil, errors.New("CSV delta の解析に失敗")
+	var fields [][][]byte
+	if recipe.ColBytes != nil {
+		// 新形式: 列ごとのコーデック+セグメント長で復元。
+		g, err := decodeColumns(blob, recipe.Codec, recipe.ColBytes, ncol, nrows)
+		if err != nil {
+			return nil, err
+		}
+		fields = g
+	} else {
+		// 旧形式(後方互換): 各列 nrows 行の固定行グリッド + 一括 delta。
+		parts := bytes.Split(blob, []byte{'\n'})
+		if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
+			return nil, errors.New("CSV ブロブの要素数が不一致")
+		}
+		fields = make([][][]byte, nrows)
+		for r := 0; r < nrows; r++ {
+			fields[r] = make([][]byte, ncol)
+		}
+		for c := 0; c < ncol; c++ {
+			base := c * nrows
+			isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
+			if isDelta {
+				row0 := parts[base]
+				fields[0][c] = row0
+				prev, _ := parseCanonInt(row0) // 非intなら 0
+				for r := 1; r < nrows; r++ {
+					d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
+					if err != nil {
+						return nil, errors.New("CSV delta の解析に失敗")
+					}
+					v := prev + d
+					fields[r][c] = []byte(strconv.FormatInt(v, 10))
+					prev = v
 				}
-				v := prev + d
-				fields[r][c] = []byte(strconv.FormatInt(v, 10))
-				prev = v
-			}
-		} else {
-			for r := 0; r < nrows; r++ {
-				fields[r][c] = parts[base+r]
+			} else {
+				for r := 0; r < nrows; r++ {
+					fields[r][c] = parts[base+r]
+				}
 			}
 		}
 	}

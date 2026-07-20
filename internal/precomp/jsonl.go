@@ -31,11 +31,13 @@ const (
 
 // JSONLRecipe は JSONL 列指向変換の再構成レシピ。
 type JSONLRecipe struct {
-	Skeleton   []byte `json:"sk"`          // 値を 0x00 に置換した行の骨格(全行共通)
-	Cols       int    `json:"c"`           // 値(列)数
-	Rows       int    `json:"r"`           // 行数
-	TrailingNL bool   `json:"t,omitempty"` // 元が改行で終わるか
-	Delta      []bool `json:"d,omitempty"` // 列ごとの数値 delta フラグ
+	Skeleton   []byte  `json:"sk"`           // 値を 0x00 に置換した行の骨格(全行共通)
+	Cols       int     `json:"c"`            // 値(列)数
+	Rows       int     `json:"r"`            // 行数
+	TrailingNL bool    `json:"t,omitempty"`  // 元が改行で終わるか
+	Delta      []bool  `json:"d,omitempty"`  // 旧: 列ごとの数値 delta フラグ(後方互換)
+	Codec      []uint8 `json:"cc,omitempty"` // 新: 列ごとのコーデック(raw/delta/dict)
+	ColBytes   []int   `json:"cb,omitempty"` // 新: 列ごとのセグメントバイト長
 }
 
 // JSONLUnwrapped は分解結果。
@@ -199,64 +201,15 @@ func TryUnwrapJSONL(orig []byte, maxPlain int64) (*JSONLUnwrapped, bool) {
 		grid[r] = vs
 	}
 
-	// 列ごとに delta 可否(データ行 1..n-1 が全て正準 int)。
-	delta := make([]bool, ncol)
-	anyDelta := false
-	for c := 0; c < ncol; c++ {
-		okc := true
-		for r := 1; r < nrows; r++ {
-			if _, canon := parseCanonInt(grid[r][c]); !canon {
-				okc = false
-				break
-			}
-		}
-		delta[c] = okc
-		anyDelta = anyDelta || okc
-	}
-
-	build := func(useDelta []bool) []byte {
-		var out bytes.Buffer
-		out.Grow(len(orig) + nrows)
-		for c := 0; c < ncol; c++ {
-			if useDelta[c] {
-				out.Write(grid[0][c])
-				out.WriteByte('\n')
-				prev, _ := parseCanonInt(grid[0][c])
-				for r := 1; r < nrows; r++ {
-					v, _ := parseCanonInt(grid[r][c])
-					out.WriteString(strconv.FormatInt(v-prev, 10))
-					out.WriteByte('\n')
-					prev = v
-				}
-			} else {
-				for r := 0; r < nrows; r++ {
-					out.Write(grid[r][c])
-					out.WriteByte('\n')
-				}
-			}
-		}
-		return out.Bytes()
-	}
-
-	noDelta := make([]bool, ncol)
-	plain := build(noDelta)
-	chosen, chosenDelta := plain, noDelta
-	if anyDelta {
-		d := build(delta)
-		if probeLen(d) < probeLen(plain) {
-			chosen, chosenDelta = d, delta
-		}
-	}
+	// 列ごとに最適コーデック(raw/delta/dict)を選び、連結ブロブを作る。
+	chosen, codecs, colBytes := encodeColumns(grid, ncol, nrows)
 	if probeLen(chosen) >= probeLen(orig) {
 		return nil, false
 	}
 
-	recipe := &JSONLRecipe{Skeleton: append([]byte(nil), skel0...), Cols: ncol, Rows: nrows, TrailingNL: trailingNL}
-	for _, d := range chosenDelta {
-		if d {
-			recipe.Delta = chosenDelta
-			break
-		}
+	recipe := &JSONLRecipe{
+		Skeleton: append([]byte(nil), skel0...), Cols: ncol, Rows: nrows,
+		TrailingNL: trailingNL, Codec: codecs, ColBytes: colBytes,
 	}
 	if rt, err := ReconstructJSONL(recipe, chosen); err != nil || !bytes.Equal(rt, orig) {
 		return nil, false
@@ -275,34 +228,44 @@ func ReconstructJSONL(recipe *JSONLRecipe, blob []byte) ([]byte, error) {
 	if len(segs) != ncol+1 {
 		return nil, errors.New("JSONL 骨格のプレースホルダ数が不一致")
 	}
-	parts := bytes.Split(blob, []byte{'\n'})
-	if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
-		return nil, errors.New("JSONL ブロブの要素数が不一致")
-	}
-	// 列 → 行の値表を復元。
-	vals := make([][][]byte, nrows)
-	for r := 0; r < nrows; r++ {
-		vals[r] = make([][]byte, ncol)
-	}
-	for c := 0; c < ncol; c++ {
-		base := c * nrows
-		isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
-		if isDelta {
-			row0 := parts[base]
-			vals[0][c] = row0
-			prev, _ := parseCanonInt(row0)
-			for r := 1; r < nrows; r++ {
-				d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
-				if err != nil {
-					return nil, errors.New("JSONL delta の解析に失敗")
+	var vals [][][]byte
+	if recipe.ColBytes != nil {
+		// 新形式: 列ごとのコーデック+セグメント長で復元。
+		g, err := decodeColumns(blob, recipe.Codec, recipe.ColBytes, ncol, nrows)
+		if err != nil {
+			return nil, err
+		}
+		vals = g
+	} else {
+		// 旧形式(後方互換): 固定行グリッド + 一括 delta。
+		parts := bytes.Split(blob, []byte{'\n'})
+		if len(parts) != ncol*nrows+1 || len(parts[len(parts)-1]) != 0 {
+			return nil, errors.New("JSONL ブロブの要素数が不一致")
+		}
+		vals = make([][][]byte, nrows)
+		for r := 0; r < nrows; r++ {
+			vals[r] = make([][]byte, ncol)
+		}
+		for c := 0; c < ncol; c++ {
+			base := c * nrows
+			isDelta := recipe.Delta != nil && c < len(recipe.Delta) && recipe.Delta[c]
+			if isDelta {
+				row0 := parts[base]
+				vals[0][c] = row0
+				prev, _ := parseCanonInt(row0)
+				for r := 1; r < nrows; r++ {
+					d, err := strconv.ParseInt(string(parts[base+r]), 10, 64)
+					if err != nil {
+						return nil, errors.New("JSONL delta の解析に失敗")
+					}
+					v := prev + d
+					vals[r][c] = []byte(strconv.FormatInt(v, 10))
+					prev = v
 				}
-				v := prev + d
-				vals[r][c] = []byte(strconv.FormatInt(v, 10))
-				prev = v
-			}
-		} else {
-			for r := 0; r < nrows; r++ {
-				vals[r][c] = parts[base+r]
+			} else {
+				for r := 0; r < nrows; r++ {
+					vals[r][c] = parts[base+r]
+				}
 			}
 		}
 	}
