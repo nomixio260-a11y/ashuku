@@ -480,6 +480,25 @@ func FuzzTryUnwrapLog(f *testing.F) {
 	})
 }
 
+// FuzzTryUnwrapLogfmt は攻撃者制御の logfmt(key=value)ログでの分解が panic
+// せず、採用入力が必ずビット一致で戻ることを検証する。
+func FuzzTryUnwrapLogfmt(f *testing.F) {
+	f.Add(bytes.Repeat([]byte(`ts=1700000000 level=info component=api trace_id=deadbeef msg="ok done" latency=12ms`+"\n"), 10))
+	f.Add([]byte("a=1 b=2\nc=3 d=4\ne=5 f=6\ng=7 h=8\ni=9 j=0\nk=1 l=2\n"))
+	f.Add([]byte(`k="unterminated v=1` + "\n"))
+	f.Add([]byte("=novalue k=1\nbare token here\n"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		u, ok := TryUnwrapLogfmt(data, 8<<20)
+		if !ok {
+			return
+		}
+		back, err := ReconstructLogfmt(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(back, data) {
+			t.Fatalf("採用した Logfmt がビット一致で戻らない (err=%v)", err)
+		}
+	})
+}
+
 // FuzzTryUnwrapHEVC は攻撃者制御の生 HEVC(Annex B)での分解が panic せず、
 // 採用入力が必ずビット一致で戻ることを検証する(CABAC 再符号化の堅牢化)。
 func FuzzTryUnwrapHEVC(f *testing.F) {

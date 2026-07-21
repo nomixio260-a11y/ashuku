@@ -816,6 +816,52 @@ func TestLogPrecompEndToEnd(t *testing.T) {
 	}
 }
 
+// TestLogfmtPrecompEndToEnd は logfmt(key=value)ログを実ストアに投入し、
+// "key=" 骨格+列指向に分解され(EncodingLogfmtV1)、読み戻しビット一致し、
+// 素通しより物理が小さいことを確認する。
+func TestLogfmtPrecompEndToEnd(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewSource(23))
+	levels := []string{"info", "info", "warn", "error", "debug"}
+	msgs := []string{"request completed", "cache miss", "db query", "user logged in", "retry scheduled"}
+	comps := []string{"auth", "api", "db", "cache", "worker"}
+	var b bytes.Buffer
+	ts := int64(1_700_000_000)
+	for i := 0; i < 20000; i++ {
+		ts += int64(rng.Intn(5))
+		fmt.Fprintf(&b, "ts=%d level=%s component=%s trace_id=%08x%08x msg=%q latency=%dms\n",
+			ts, levels[rng.Intn(len(levels))], comps[rng.Intn(len(comps))], rng.Uint32(), rng.Uint32(),
+			msgs[rng.Intn(len(msgs))], rng.Intn(2000))
+	}
+	data := b.Bytes()
+
+	s := newTestStore(t)
+	m := putBytes(t, s, "app.log", data)
+	if m.Encoding != EncodingLogfmtV1 {
+		t.Fatalf("logfmt が列指向分解されなかった: encoding=%q", m.Encoding)
+	}
+	if !bytes.Equal(getBytes(t, s, m.ID), data) {
+		t.Fatal("読み戻しがビット一致しない")
+	}
+
+	s2 := newTestStore(t)
+	m2, err := s2.PutWithOptions("app.log", bytes.NewReader(data), PutOptions{DisablePrecomp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Encoding != "" {
+		t.Fatalf("DisablePrecomp なのに分解された: %q", m2.Encoding)
+	}
+	st1, _ := s.Stats()
+	st2, _ := s2.Stats()
+	t.Logf("logfmt列指向 物理=%d / 素通し 物理=%d (-%.1f%%)",
+		st1.PhysicalBytes, st2.PhysicalBytes,
+		float64(st2.PhysicalBytes-st1.PhysicalBytes)*100/float64(st2.PhysicalBytes))
+	if st1.PhysicalBytes >= st2.PhysicalBytes {
+		t.Fatalf("logfmt 列指向が縮んでいない: %d >= %d", st1.PhysicalBytes, st2.PhysicalBytes)
+	}
+}
+
 // TestRecursivePrecompGzipColumnar は .log.gz / .csv.gz を投入→ gzip 展開
 // →内側で列指向化(再帰 precompression)→読み戻しビット一致→内側なし
 // (gzip 展開のみ)より物理が小さい、を実ストアで確認する。

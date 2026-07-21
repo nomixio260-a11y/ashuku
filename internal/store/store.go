@@ -490,7 +490,7 @@ func (s *Store) PutWithOptions(name string, r io.Reader, opts PutOptions) (*File
 			precomp.IsPNG(head) || precomp.IsZip(head) || precomp.IsPDF(head))
 		jpegFmt := s.precompJPEG && (precomp.IsJPEG(head) || precomp.IsGIF(head) ||
 			precomp.IsAVI(head) || precomp.IsWAV(head) || precomp.IsAIFF(head) || precomp.IsBMP(head) ||
-			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head) || precomp.IsLog(head) || precomp.IsBase64(head))
+			precomp.IsTIFF(head) || precomp.IsH264(head) || precomp.IsHEIF(head) || precomp.IsMP4(head) || precomp.IsHEVC(head) || precomp.IsTS(head) || precomp.IsMP3(head) || precomp.IsAAC(head) || precomp.IsJSONL(head) || precomp.IsCSV(head) || precomp.IsLogfmt(head) || precomp.IsLog(head) || precomp.IsBase64(head))
 		if (zlibFmt || jpegFmt) && s.acquirePrecomp() {
 			buf, overflow, err := readUpTo(rest, int(s.precompMax))
 			if err != nil {
@@ -774,6 +774,25 @@ func (s *Store) tryPrecomp(m *FileManifest, buf []byte) (ok bool) {
 		m.Encoding = EncodingCSVV1
 		m.PrecompCSV = u.Recipe
 		m.precompPlain = u.Chunked
+	case precomp.IsLogfmt(buf):
+		// logfmt 行は IsLog も通るため、先に "key=" 骨格分解を試す。
+		if u, ok := precomp.TryUnwrapLogfmt(buf, s.precompMax); ok {
+			m.Encoding = EncodingLogfmtV1
+			m.PrecompLogfmt = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		// logfmt として矩形化できなくても空白区切りログとして拾えることがある。
+		if u, ok := precomp.TryUnwrapLog(buf, s.precompMax); ok {
+			m.Encoding = EncodingLogV1
+			m.PrecompLog = u.Recipe
+			m.precompPlain = u.Chunked
+			break
+		}
+		if tryB64Precomp(s, m, buf) {
+			break
+		}
+		return false
 	case precomp.IsLog(buf):
 		u, ok := precomp.TryUnwrapLog(buf, s.precompMax)
 		if !ok {
@@ -820,6 +839,14 @@ func (s *Store) tryInnerText(m *FileManifest) {
 		m.precompPlain = u.Chunked
 		return
 	}
+	if precomp.IsLogfmt(plain) {
+		if u, ok := precomp.TryUnwrapLogfmt(plain, s.precompMax); ok {
+			m.InnerEncoding = EncodingLogfmtV1
+			m.PrecompLogfmt = u.Recipe
+			m.precompPlain = u.Chunked
+			return
+		}
+	}
 	if u, ok := precomp.TryUnwrapLog(plain, s.precompMax); ok {
 		m.InnerEncoding = EncodingLogV1
 		m.PrecompLog = u.Recipe
@@ -844,6 +871,8 @@ func (s *Store) reconstructInner(m *FileManifest, chunked []byte) ([]byte, error
 		return precomp.ReconstructCSV(m.PrecompCSV, chunked)
 	case EncodingLogV1:
 		return precomp.ReconstructLog(m.PrecompLog, chunked)
+	case EncodingLogfmtV1:
+		return precomp.ReconstructLogfmt(m.PrecompLogfmt, chunked)
 	case EncodingBase64V1:
 		return precomp.ReconstructBase64(m.PrecompBase64, chunked)
 	default:
@@ -1531,6 +1560,8 @@ func (s *Store) reconstructPrecomp(m *FileManifest) (result []byte, rerr error) 
 		orig, err = precomp.ReconstructJSONL(m.PrecompJSONL, plain.Bytes())
 	case EncodingLogV1:
 		orig, err = precomp.ReconstructLog(m.PrecompLog, plain.Bytes())
+	case EncodingLogfmtV1:
+		orig, err = precomp.ReconstructLogfmt(m.PrecompLogfmt, plain.Bytes())
 	case EncodingBase64V1:
 		orig, err = precomp.ReconstructBase64(m.PrecompBase64, plain.Bytes())
 	case EncodingH264V1:

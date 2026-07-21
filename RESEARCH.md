@@ -2654,6 +2654,27 @@ raw に落とす前に、**表現上のオーバーヘッド(ASCII hex=2倍、�
 =hex 床)。UUID+ISO タイムスタンプのアクセスログ CSV(30k 行)end-to-end で素zstd比 −32.1%。
 大文字UUID・非UTCオフセット・不正日時は安全に非採用。
 
+## 4.57 独自研究(2026-07-21): logfmt(key=value)ログの列指向変換
+
+多エージェント第2弾(第2位、+40.9%、低複雑度)。Go サービス・Heroku・Docker・
+多くのクラウドログの主流形式 `ts=... level=info msg="..." latency=12ms` は、キーが
+値に貼り付いたまま毎行繰り返され、しかも msg の引用有無でフィールド数が変わって
+空白区切りログ経路(logline.go)では矩形化できず取り逃していた。新モジュール
+`internal/precomp/logfmt.go`:
+
+- **"key=" を骨格へ、値だけを列へ**分離する。値は「裸トークン(次の空白まで)」
+  または「引用文字列(エスケープ透過、引用符は値側に含める)」。引用の有無が
+  混在しても骨格 `key0=\x00key1=\x00...` は同一になり、全行の骨格が一致するときだけ
+  対象。これで ts が正準 int(delta)、trace_id が hex(hexpack)、level/component が
+  dict になり、共有 `encodeColumns` の列別 best-of がそのまま効く。
+- store は logfmt 行が `IsLog` も通るため、**`IsLogfmt` を `IsLog` の前に**試す
+  (先に空白区切りログ経路が食って矩形化に失敗するのを防ぐ)。非採用時は空白区切り
+  ログ→base64 へフォールバック。採用前に復元しバイト一致検証。EncodingLogfmtV1。
+- 再帰 precompression(`.log.gz` 等)の内側変換にも配線。
+
+**実測**: 単列 probe −32.9%、実ストア end-to-end(Go サービスログ 20k 行、素通し比)
+−30.0% 物理。裸トークンのみ/JSON/散文/非矩形は安全に非採用。
+
 ## 5. 再現方法
 
 ```sh

@@ -109,6 +109,14 @@
   best-of(リクエスト/UA/ステータスは dict、IP/バイトは raw)。実測で
   **物理 −28.5%**(従来は素通しだったクラス。RESEARCH.md §4.47)。骨格が全行
   一致しない行は素通し。復元バイト一致検証+読み出し時 SHA-256。純Go。
+- **logfmt(key=value ログ)の列指向変換**: Go サービス・Heroku・Docker・多くの
+  クラウドログの主流形式 `ts=... level=info msg="..." latency=12ms` は、キーが値に
+  貼り付いたまま毎行繰り返され、msg の引用有無でフィールド数も変わるため空白区切り
+  ログ経路では矩形化できませんでした。ここでは **`key=` を骨格へ、値だけを列へ**
+  分離します(値は裸トークン or 引用文字列、引用符は値側に含めるので引用の有無が
+  混在しても骨格は同一)。これで ts が正準 int(delta)、trace_id が hex、level/
+  component が dict になり縮みます。実測で **物理 −30.0%**(RESEARCH.md §4.57)。
+  骨格が全行一致しない行は素通し。復元バイト一致検証+読み出し時 SHA-256。純Go。
 - **base64 の復号→再圧縮**: base64 はバイナリを 4/3 に膨らませてバイト境界を
   ずらし、元の反復構造を圧縮器から隠します。そこで **base64 領域を復号して
   素のバイナリに戻して**から圧縮します(骨格に位置を記録、復元時に同じ符号器で
@@ -270,6 +278,7 @@
 | CSV/区切りテキスト(矩形) | **6〜60倍**(列指向転置+列別 dict(二進ID)/delta(ナノ秒対応)/raw、CRLF 対応で行指向比 −31〜50%、ビット一致復元) |
 | JSONL(構造化ログ・同一スキーマ) | **6〜60倍**(骨格分離+列別 dict(二進ID)/delta/raw で行指向比 −22〜33%、ビット一致復元) |
 | 空白区切りログ(nginx/Apache combined) | **6〜60倍**(引用符/角括弧を原子化した骨格分離+列指向で物理 −28.5%、ビット一致復元) |
+| logfmt(key=value ログ:Go/Heroku/Docker) | **6〜60倍**(`key=` を骨格・値を列へ分離、ts=delta/trace_id=hex/level=dict で物理 −30.0%、ビット一致復元) |
 | base64(証明書束・data:URI・JWT・ペイロード) | **下地が圧縮可能なら −7〜36%**(復号して素のバイナリに戻す、ビット一致復元。既圧縮メディアは不採用) |
 | 一般ドキュメント(Office・PDF等) | 2〜5倍 |
 | JPEG 写真・GIF・MJPEG 動画 | **1.4〜7倍**(JPEG −29〜34% / GIF −75〜86% / MJPEG −27〜46%、すべてビット一致復元) |
@@ -534,7 +543,7 @@ cmd/ashuku-cli/      クライアントCLI(クライアント側圧縮・展開)
 cmd/ashuku-bench/    削減率ベンチマークツール
 internal/chunker/    FastCDC チャンカー(自前実装・gear テーブル読取専用で並行安全)
 internal/store/      ストレージエンジン(dedup / 類似デルタ / リージョン / refcount GC / bbolt)
-internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL・空白区切りログ列指向 / base64復号 分解、cgo: zlib)
+internal/precomp/    precompression(gzip / zlib / PNG / ZIP / PDF / JPEG / GIF / MJPEG / H.264 CAVLC+CABAC(生/MP4/TS) / HEVC I+P+B(生/MP4/TS/HEIC) / AAC-LC(ADTS/M4A) / MP3 / WAV / AIFF / BMP / TIFF / CSV・JSONL・空白区切りログ・logfmt 列指向 / base64復号 分解、cgo: zlib)
 internal/zstdc/      本家 libzstd ラッパー(level 19/22、cgo)
 internal/client/     クライアント支援プロトコル実装
 internal/api/        REST API ハンドラ + Web コンソール + メトリクス
