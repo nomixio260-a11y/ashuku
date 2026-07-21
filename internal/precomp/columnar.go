@@ -23,7 +23,74 @@ import (
 	"bytes"
 	"errors"
 	"strconv"
+	"time"
 )
+
+// isoLayout は ISO-8601 系日時の候補レイアウトと、UnixNano を割って桁を減らす単位。
+type isoLayout struct {
+	layout string
+	unit   int64
+}
+
+// isoLayouts は byte 一致往復を確認しながら順に試す候補(UTC/"Z"/無TZ に限定)。
+// **順序と内容は凍結**(レシピにインデックスで保存されるので、既存保存物の復元が
+// 食い違わないよう、末尾追加のみ可・既存要素の変更/削除/並べ替えは不可)。
+var isoLayouts = []isoLayout{
+	{"2006-01-02T15:04:05Z07:00", 1e9},
+	{"2006-01-02T15:04:05.000Z07:00", 1e6},
+	{"2006-01-02T15:04:05.000000Z07:00", 1e3},
+	{"2006-01-02T15:04:05.000000000Z07:00", 1},
+	{"2006-01-02T15:04:05", 1e9},
+	{"2006-01-02T15:04:05.000", 1e6},
+	{"2006-01-02T15:04:05.000000", 1e3},
+	{"2006-01-02 15:04:05", 1e9},
+	{"2006-01-02 15:04:05.000", 1e6},
+	{"2006-01-02 15:04:05.000000", 1e3},
+	{"2006-01-02", 1e9},
+	{"2006/01/02 15:04:05", 1e9},
+}
+
+// colEncodeISO8601 は列の全データ行が同一 ISO-8601 レイアウトで byte 一致往復する
+// なら、epoch 整数(レイアウト精度)の隣接差分にする。ISO 文字列のタイムスタンプ列
+// (アクセス/構造化ログの主成分)は従来 raw 落ちだった。往復確認を通ったレイアウト
+// だけ採用するので可逆(採否は最終的に ingest の byte 一致ゲートでも担保)。
+func colEncodeISO8601(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	for idx := range isoLayouts {
+		L := isoLayouts[idx]
+		ok := true
+		vs := make([]int64, nrows)
+		for r := 1; r < nrows; r++ {
+			s := string(grid[r][c])
+			t, err := time.Parse(L.layout, s)
+			if err != nil || t.UTC().Format(L.layout) != s {
+				ok = false
+				break
+			}
+			vs[r] = t.UnixNano() / L.unit
+		}
+		if !ok {
+			continue
+		}
+		var b bytes.Buffer
+		b.Write(grid[0][c])
+		b.WriteByte('\n')
+		b.WriteString(strconv.Itoa(idx))
+		b.WriteByte('\n')
+		prev := int64(0)
+		for r := 1; r < nrows; r++ {
+			b.WriteString(strconv.FormatInt(vs[r]-prev, 10))
+			b.WriteByte('\n')
+			prev = vs[r]
+		}
+		return b.Bytes(), true
+	}
+	return nil, false
+}
+
+// parseFixedDec は b が固定小数(整数部 '.' 小数部、小数桁 >=1)として正準
 
 // 列コーデック識別子(レシピに保存)。
 const (
@@ -36,6 +103,8 @@ const (
 	colHexPack  uint8 = 6 // 固定偶数幅・小文字hex を nibble パック(二進、区切り無し)
 	colHexDelta uint8 = 7 // 固定幅・小文字hex の整数(uint64)隣接差分(単調hexカウンタ)
 	colZPadDlt  uint8 = 8 // 固定幅・ゼロ埋め10進の整数隣接差分(ゼロ埋め連番)
+	colUUID     uint8 = 9 // ダッシュ付き UUID(8-4-4-4-12 小文字hex)→ ダッシュ除去+nibble パック(二進)
+	colISO8601  uint8 = 10 // ISO-8601 日時 → epoch int64 の隣接差分(書式を凍結保存)
 )
 
 // colDictMaxCard は dict を試すカーディナリティ上限(パレットが大きすぎると
@@ -81,6 +150,18 @@ func encodeColumns(grid [][][]byte, ncol, nrows int) (blob []byte, codecs []uint
 		if d, ok := colEncodeZPadDelta(grid, c, nrows); ok {
 			if pl := probeLen(d); pl < bestPL {
 				best, bestCodec, bestPL = d, colZPadDlt, pl
+			}
+		}
+		// ダッシュ付き UUID(主キー・トレース ID)/ ISO-8601 日時(ログの主成分)。
+		// dict が弾く全ユニーク列・parseCanonInt 非対象を取り込む(RESEARCH §4.56)。
+		if d, ok := colEncodeUUID(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colUUID, pl
+			}
+		}
+		if d, ok := colEncodeISO8601(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colISO8601, pl
 			}
 		}
 		// 固定小数(気温・価格・センサ値)の隣接差分。**隣接値が相関する(漸増)
@@ -363,6 +444,92 @@ func colEncodeZPadDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		prev = vals[r]
 	}
 	return b.Bytes(), true
+}
+
+// isUUIDDash は b が "8-4-4-4-12" の小文字hex UUID(36文字)かを判定する。
+func isUUIDDash(b []byte) bool {
+	if len(b) != 36 || b[8] != '-' || b[13] != '-' || b[18] != '-' || b[23] != '-' {
+		return false
+	}
+	for i, ch := range b {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// colEncodeUUID はダッシュ付き UUID 列を「ダッシュ除去 32hex を nibble パック
+// (16バイト)」で直列化する。全ユニークで dict が弾く UUID(主キー・トレース ID)を
+// ASCII 36 バイトから 16 バイトへ詰め、hex のエントロピー床まで縮める。
+func colEncodeUUID(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	for r := 1; r < nrows; r++ {
+		if !isUUIDDash(grid[r][c]) {
+			return nil, false
+		}
+	}
+	var b bytes.Buffer
+	b.Write(grid[0][c]) // row0(ヘッダ)は逐語
+	b.WriteByte('\n')
+	hx := make([]byte, 0, 32)
+	tmp := make([]byte, 16)
+	for r := 1; r < nrows; r++ {
+		v := grid[r][c]
+		hx = hx[:0]
+		for i := 0; i < 36; i++ {
+			if i == 8 || i == 13 || i == 18 || i == 23 {
+				continue
+			}
+			hx = append(hx, v[i]) // 各hexグループは偶数長なのでペアは境界を跨がない
+		}
+		for k := 0; k < 16; k++ {
+			tmp[k] = hexNibble(hx[2*k])<<4 | hexNibble(hx[2*k+1])
+		}
+		b.Write(tmp)
+	}
+	return b.Bytes(), true
+}
+
+// colDecodeUUID は colEncodeUUID の逆。区切り無しの二進なので汎用 split の前に
+// 専用復号する。
+func colDecodeUUID(seg []byte, c, nrows int, grid [][][]byte) error {
+	nl := bytes.IndexByte(seg, '\n')
+	if nl < 0 {
+		return errors.New("uuid: row0 行がない")
+	}
+	grid[0][c] = seg[:nl]
+	packed := seg[nl+1:]
+	if len(packed) != (nrows-1)*16 {
+		return errors.New("uuid: パック長不一致")
+	}
+	pos := 0
+	for r := 1; r < nrows; r++ {
+		// 16 バイト → 32 hex 文字、位置 8/13/18/23 にダッシュを戻す。
+		out := make([]byte, 36)
+		hn := 0 // hex文字インデックス(0..31)
+		for i := 0; i < 36; i++ {
+			if i == 8 || i == 13 || i == 18 || i == 23 {
+				out[i] = '-'
+				continue
+			}
+			bb := packed[pos+hn/2]
+			if hn%2 == 0 {
+				out[i] = hexDigits[bb>>4]
+			} else {
+				out[i] = hexDigits[bb&0x0f]
+			}
+			hn++
+		}
+		pos += 16
+		grid[r][c] = out
+	}
+	return nil
 }
 
 // parseFixedDec は b が固定小数(整数部 '.' 小数部、小数桁 >=1)として正準
@@ -670,6 +837,9 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 	if codec == colHexPack {
 		return colDecodeHexPack(seg, c, nrows, grid)
 	}
+	if codec == colUUID {
+		return colDecodeUUID(seg, c, nrows, grid)
+	}
 	parts := bytes.Split(seg, []byte{'\n'})
 	if n := len(parts); n == 0 || len(parts[n-1]) != 0 {
 		return errors.New("列セグメントが '\\n' 終端でない")
@@ -755,6 +925,25 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 			}
 			prev += d
 			grid[r][c] = padLeft(strconv.FormatInt(prev, 10), w)
+		}
+	case colISO8601:
+		if len(parts) != nrows+1 { // row0 + レイアウトidx + (nrows-1) 差分
+			return errors.New("iso 列の要素数不一致")
+		}
+		grid[0][c] = parts[0]
+		li, err := strconv.Atoi(string(parts[1]))
+		if err != nil || li < 0 || li >= len(isoLayouts) {
+			return errors.New("iso レイアウトが不正")
+		}
+		L := isoLayouts[li]
+		prev := int64(0)
+		for r := 1; r < nrows; r++ {
+			d, err := strconv.ParseInt(string(parts[r+1]), 10, 64)
+			if err != nil {
+				return errors.New("iso 値の解析に失敗")
+			}
+			prev += d
+			grid[r][c] = []byte(time.Unix(0, prev*L.unit).UTC().Format(L.layout))
 		}
 	case colDeltaDec:
 		if len(parts) != nrows+1 { // 小数桁 + row0 + (nrows-1) 差分

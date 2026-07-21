@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // TestColumnarCodecSelection は列ごとに raw/delta/dict が正しく選ばれることを
@@ -375,6 +376,58 @@ func TestColumnarHexAndZPad(t *testing.T) {
 		rt, err := ReconstructCSV(u.Recipe, u.Chunked)
 		if err != nil || !bytes.Equal(rt, edge) {
 			t.Fatalf("hex エッジ 往復不一致: err=%v", err)
+		}
+	}
+}
+
+// TestColumnarUUIDAndISO は UUID(ダッシュ付き)/ISO-8601 日時の列コーデックが
+// 選択され byte 一致で往復することを確認する。
+func TestColumnarUUIDAndISO(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	var b bytes.Buffer
+	b.WriteString("id,ts,tsz,val\n")
+	base := int64(1700000000)
+	for i := 0; i < 3000; i++ {
+		base += int64(1 + rng.Intn(3))
+		u := make([]byte, 36)
+		hn := 0
+		for j := 0; j < 36; j++ {
+			if j == 8 || j == 13 || j == 18 || j == 23 {
+				u[j] = '-'
+				continue
+			}
+			u[j] = "0123456789abcdef"[rng.Intn(16)]
+			hn++
+		}
+		iso := time.Unix(base, 0).UTC().Format("2006-01-02T15:04:05Z07:00")
+		isoms := time.Unix(base, int64(rng.Intn(1000))*1e6).UTC().Format("2006-01-02 15:04:05.000")
+		fmt.Fprintf(&b, "%s,%s,%s,%d\n", u, iso, isoms, rng.Intn(1<<20))
+	}
+	orig := b.Bytes()
+	u, ok := TryUnwrapCSV(orig, 8<<20)
+	if !ok {
+		t.Fatal("採用されなかった")
+	}
+	rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatalf("往復不一致: err=%v", err)
+	}
+	if u.Recipe.Codec[0] != colUUID {
+		t.Errorf("id 列は uuid 期待、実際 codec=%d", u.Recipe.Codec[0])
+	}
+	if u.Recipe.Codec[1] != colISO8601 {
+		t.Errorf("ts 列は iso 期待、実際 codec=%d", u.Recipe.Codec[1])
+	}
+	if u.Recipe.Codec[2] != colISO8601 {
+		t.Errorf("tsz 列(ミリ秒)は iso 期待、実際 codec=%d", u.Recipe.Codec[2])
+	}
+	t.Logf("codecs=%v (9=uuid 10=iso)", u.Recipe.Codec)
+
+	// エッジ: 大文字UUID・非UTCオフセット・不正日時は安全に非採用。
+	edge := []byte("x\n2024-13-99T99:99:99Z\nZZZ\n")
+	if u, ok := TryUnwrapCSV(edge, 1<<20); ok {
+		if rt, err := ReconstructCSV(u.Recipe, u.Chunked); err != nil || !bytes.Equal(rt, edge) {
+			t.Fatalf("iso エッジ 往復不一致: err=%v", err)
 		}
 	}
 }
