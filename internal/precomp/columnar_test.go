@@ -332,3 +332,49 @@ func TestColumnarTSVAndSemicolon(t *testing.T) {
 		}
 	}
 }
+
+// TestColumnarHexAndZPad は hex ID / ゼロ埋め連番の列コーデック(colHexPack /
+// colHexDelta / colZPadDlt)が選択され byte 一致で往復することを確認する。
+func TestColumnarHexAndZPad(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	var b bytes.Buffer
+	b.WriteString("seq,trace,counter,rand\n")
+	ctr := uint64(0x1000)
+	for i := 0; i < 3000; i++ {
+		ctr += uint64(1 + rng.Intn(3))
+		trace := make([]byte, 16)
+		for j := range trace {
+			trace[j] = "0123456789abcdef"[rng.Intn(16)]
+		}
+		fmt.Fprintf(&b, "%08d,%s,%012x,%d\n", i, trace, ctr, rng.Intn(1<<30))
+	}
+	orig := b.Bytes()
+	u, ok := TryUnwrapCSV(orig, 8<<20)
+	if !ok {
+		t.Fatal("採用されなかった")
+	}
+	rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+	if err != nil || !bytes.Equal(rt, orig) {
+		t.Fatalf("往復不一致: err=%v", err)
+	}
+	// seq(ゼロ埋め連番)=zpad、trace(乱数16hex)=hexpack、counter(単調hex)=hexdelta。
+	if u.Recipe.Codec[0] != colZPadDlt {
+		t.Errorf("seq 列は zpad 期待、実際 codec=%d", u.Recipe.Codec[0])
+	}
+	if u.Recipe.Codec[1] != colHexPack {
+		t.Errorf("trace 列は hexpack 期待、実際 codec=%d", u.Recipe.Codec[1])
+	}
+	if u.Recipe.Codec[2] != colHexDelta {
+		t.Errorf("counter 列は hexdelta 期待、実際 codec=%d", u.Recipe.Codec[2])
+	}
+	t.Logf("codecs=%v (6=hexpack 7=hexdelta 8=zpad)", u.Recipe.Codec)
+
+	// エッジ: 大文字hex・可変幅・幅超過は安全に非採用(=raw 等にフォールバック)。
+	edge := []byte("h\nDEADBEEF\ndeadbeef\n00ff\n")
+	if u, ok := TryUnwrapCSV(edge, 1<<20); ok {
+		rt, err := ReconstructCSV(u.Recipe, u.Chunked)
+		if err != nil || !bytes.Equal(rt, edge) {
+			t.Fatalf("hex エッジ 往復不一致: err=%v", err)
+		}
+	}
+}

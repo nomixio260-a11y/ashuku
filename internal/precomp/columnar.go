@@ -33,6 +33,9 @@ const (
 	colDictBin  uint8 = 3 // パレット + 固定幅 LE 二進 ID(区切り無し)
 	colDeltaDec uint8 = 4 // 固定小数(同一小数桁)のスケール整数隣接差分
 	colDelta2   uint8 = 5 // 正準 int の二階差分(間隔が漸増/大ジッタの時系列)
+	colHexPack  uint8 = 6 // 固定偶数幅・小文字hex を nibble パック(二進、区切り無し)
+	colHexDelta uint8 = 7 // 固定幅・小文字hex の整数(uint64)隣接差分(単調hexカウンタ)
+	colZPadDlt  uint8 = 8 // 固定幅・ゼロ埋め10進の整数隣接差分(ゼロ埋め連番)
 )
 
 // colDictMaxCard は dict を試すカーディナリティ上限(パレットが大きすぎると
@@ -61,6 +64,23 @@ func encodeColumns(grid [][][]byte, ncol, nrows int) (blob []byte, codecs []uint
 		if d, ok := colEncodeDelta2(grid, c, nrows); ok {
 			if pl := probeLen(d); pl < bestPL {
 				best, bestCodec, bestPL = d, colDelta2, pl
+			}
+		}
+		// hex ID / ゼロ埋め連番の列(トレース/リクエスト ID・ハッシュ・連番)。
+		// 乱数hex は nibble パック、単調hex/ゼロ埋め10進は整数 delta(RESEARCH §4.55)。
+		if d, ok := colEncodeHexPack(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colHexPack, pl
+			}
+		}
+		if d, ok := colEncodeHexDelta(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colHexDelta, pl
+			}
+		}
+		if d, ok := colEncodeZPadDelta(grid, c, nrows); ok {
+			if pl := probeLen(d); pl < bestPL {
+				best, bestCodec, bestPL = d, colZPadDlt, pl
 			}
 		}
 		// 固定小数(気温・価格・センサ値)の隣接差分。**隣接値が相関する(漸増)
@@ -160,6 +180,187 @@ func colEncodeDelta2(grid [][][]byte, c, nrows int) ([]byte, bool) {
 		b.WriteString(strconv.FormatInt(diff-prevDiff, 10)) // 二階差分
 		b.WriteByte('\n')
 		prevDiff = diff
+	}
+	return b.Bytes(), true
+}
+
+// isLowerHex は b が小文字16進([0-9a-f])のみからなるか。
+func isLowerHex(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func hexNibble(c byte) byte {
+	if c <= '9' {
+		return c - '0'
+	}
+	return c - 'a' + 10
+}
+
+const hexDigits = "0123456789abcdef"
+
+// padLeft は s を '0' 詰めで幅 w に左詰めする。幅超過はそのまま返す(byte 一致
+// ゲートが弾く)。
+func padLeft(s string, w int) []byte {
+	if len(s) >= w {
+		return []byte(s)
+	}
+	out := make([]byte, w)
+	pad := w - len(s)
+	for i := 0; i < pad; i++ {
+		out[i] = '0'
+	}
+	copy(out[pad:], s)
+	return out
+}
+
+// colEncodeHexPack は列のデータ行が全て同一の偶数幅・小文字hex(トレースID・
+// リクエストID・ハッシュ等)なら nibble パックして二進化する。ASCII 8bit/文字を
+// 4bit/文字に詰め、zstd が乱数hexで届かない 4bit エントロピー床まで縮める。
+func colEncodeHexPack(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	w := len(grid[1][c])
+	if w < 2 || w%2 != 0 || w > 4096 {
+		return nil, false
+	}
+	for r := 1; r < nrows; r++ {
+		if len(grid[r][c]) != w || !isLowerHex(grid[r][c]) {
+			return nil, false
+		}
+	}
+	var b bytes.Buffer
+	b.Write(grid[0][c]) // row0(ヘッダ)は逐語
+	b.WriteByte('\n')
+	b.WriteString(strconv.Itoa(w))
+	b.WriteByte('\n')
+	tmp := make([]byte, w/2)
+	for r := 1; r < nrows; r++ {
+		v := grid[r][c]
+		for i := 0; i < w/2; i++ {
+			tmp[i] = hexNibble(v[2*i])<<4 | hexNibble(v[2*i+1])
+		}
+		b.Write(tmp)
+	}
+	return b.Bytes(), true
+}
+
+// colDecodeHexPack は colEncodeHexPack の逆。区切り無しの二進なので汎用 split の
+// 前に専用復号する(colDictBin と同じ扱い)。
+func colDecodeHexPack(seg []byte, c, nrows int, grid [][][]byte) error {
+	nl := bytes.IndexByte(seg, '\n')
+	if nl < 0 {
+		return errors.New("hexpack: row0 行がない")
+	}
+	grid[0][c] = seg[:nl]
+	rest := seg[nl+1:]
+	nl2 := bytes.IndexByte(rest, '\n')
+	if nl2 < 0 {
+		return errors.New("hexpack: 幅行がない")
+	}
+	w, err := strconv.Atoi(string(rest[:nl2]))
+	if err != nil || w < 2 || w%2 != 0 || w > 4096 {
+		return errors.New("hexpack: 幅が不正")
+	}
+	packed := rest[nl2+1:]
+	if len(packed) != (nrows-1)*(w/2) {
+		return errors.New("hexpack: パック長不一致")
+	}
+	pos := 0
+	for r := 1; r < nrows; r++ {
+		out := make([]byte, w)
+		for i := 0; i < w/2; i++ {
+			bb := packed[pos+i]
+			out[2*i] = hexDigits[bb>>4]
+			out[2*i+1] = hexDigits[bb&0x0f]
+		}
+		pos += w / 2
+		grid[r][c] = out
+	}
+	return nil
+}
+
+// colEncodeHexDelta は固定幅・小文字hex を uint64 として隣接差分にする(単調な
+// hex カウンタ・連番トークン)。幅は 16(=64bit)まで。
+func colEncodeHexDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	w := len(grid[1][c])
+	if w < 1 || w > 16 {
+		return nil, false
+	}
+	vals := make([]int64, nrows)
+	for r := 1; r < nrows; r++ {
+		g := grid[r][c]
+		if len(g) != w || !isLowerHex(g) {
+			return nil, false
+		}
+		v, err := strconv.ParseUint(string(g), 16, 64)
+		if err != nil {
+			return nil, false
+		}
+		vals[r] = int64(v) // 環演算で対称(復号で uint64 に戻す)
+	}
+	var b bytes.Buffer
+	b.Write(grid[0][c])
+	b.WriteByte('\n')
+	b.WriteString(strconv.Itoa(w))
+	b.WriteByte('\n')
+	prev := int64(0)
+	for r := 1; r < nrows; r++ {
+		b.WriteString(strconv.FormatInt(vals[r]-prev, 10))
+		b.WriteByte('\n')
+		prev = vals[r]
+	}
+	return b.Bytes(), true
+}
+
+// colEncodeZPadDelta は固定幅・ゼロ埋め10進(先頭ゼロで parseCanonInt に弾かれる
+// 連番)を整数化して隣接差分にする。幅は 19(=int64)まで。
+func colEncodeZPadDelta(grid [][][]byte, c, nrows int) ([]byte, bool) {
+	if nrows < 2 {
+		return nil, false
+	}
+	w := len(grid[1][c])
+	if w < 1 || w > 19 {
+		return nil, false
+	}
+	vals := make([]int64, nrows)
+	for r := 1; r < nrows; r++ {
+		g := grid[r][c]
+		if len(g) != w {
+			return nil, false
+		}
+		for _, ch := range g {
+			if ch < '0' || ch > '9' {
+				return nil, false
+			}
+		}
+		v, err := strconv.ParseInt(string(g), 10, 64)
+		if err != nil {
+			return nil, false
+		}
+		vals[r] = v
+	}
+	var b bytes.Buffer
+	b.Write(grid[0][c])
+	b.WriteByte('\n')
+	b.WriteString(strconv.Itoa(w))
+	b.WriteByte('\n')
+	prev := int64(0)
+	for r := 1; r < nrows; r++ {
+		b.WriteString(strconv.FormatInt(vals[r]-prev, 10))
+		b.WriteByte('\n')
+		prev = vals[r]
 	}
 	return b.Bytes(), true
 }
@@ -461,10 +662,13 @@ func decodeColumns(blob []byte, codecs []uint8, colBytes []int, ncol, nrows int)
 
 // colDecode は 1 列セグメントを grid の列 c へ復元する。
 func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
-	// 二進 ID の dict は末尾に 0x0A を含みうるので、汎用の '\n' split より前に
-	// 専用復号する。
+	// 二進 ID の dict と nibble パック hex は末尾に 0x0A を含みうるので、汎用の
+	// '\n' split より前に専用復号する。
 	if codec == colDictBin {
 		return colDecodeDictBin(seg, c, nrows, grid)
+	}
+	if codec == colHexPack {
+		return colDecodeHexPack(seg, c, nrows, grid)
 	}
 	parts := bytes.Split(seg, []byte{'\n'})
 	if n := len(parts); n == 0 || len(parts[n-1]) != 0 {
@@ -515,6 +719,42 @@ func colDecode(seg []byte, codec uint8, c, nrows int, grid [][][]byte) error {
 			prevDiff += dd
 			prevVal += prevDiff
 			grid[r][c] = []byte(strconv.FormatInt(prevVal, 10))
+		}
+	case colHexDelta:
+		if len(parts) != nrows+1 { // row0 + 幅 + (nrows-1) 差分
+			return errors.New("hexdelta 列の要素数不一致")
+		}
+		grid[0][c] = parts[0]
+		w, err := strconv.Atoi(string(parts[1]))
+		if err != nil || w < 1 || w > 16 {
+			return errors.New("hexdelta 幅が不正")
+		}
+		prev := int64(0)
+		for r := 1; r < nrows; r++ {
+			d, err := strconv.ParseInt(string(parts[r+1]), 10, 64)
+			if err != nil {
+				return errors.New("hexdelta 値の解析に失敗")
+			}
+			prev += d
+			grid[r][c] = padLeft(strconv.FormatUint(uint64(prev), 16), w)
+		}
+	case colZPadDlt:
+		if len(parts) != nrows+1 { // row0 + 幅 + (nrows-1) 差分
+			return errors.New("zpad 列の要素数不一致")
+		}
+		grid[0][c] = parts[0]
+		w, err := strconv.Atoi(string(parts[1]))
+		if err != nil || w < 1 || w > 19 {
+			return errors.New("zpad 幅が不正")
+		}
+		prev := int64(0)
+		for r := 1; r < nrows; r++ {
+			d, err := strconv.ParseInt(string(parts[r+1]), 10, 64)
+			if err != nil {
+				return errors.New("zpad 値の解析に失敗")
+			}
+			prev += d
+			grid[r][c] = padLeft(strconv.FormatInt(prev, 10), w)
 		}
 	case colDeltaDec:
 		if len(parts) != nrows+1 { // 小数桁 + row0 + (nrows-1) 差分
