@@ -8,10 +8,15 @@ import (
 	"io"
 )
 
-// DefaultAverageSize はデフォルトの平均チャンクサイズ(1MiB)。
-// 小さくすると重複排除の粒度が細かくなり dedup 率が上がるが、
-// チャンク数(メタデータ量)が増える。
-const DefaultAverageSize = 1 << 20
+// DefaultAverageSize はデフォルトの平均チャンクサイズ(256KiB)。
+// 小さくすると重複排除の粒度が細かくなり dedup 率が上がるが、チャンク数
+// (メタデータ量)が増える。実測(多世代バックアップ)で 1MiB→256KiB は物理
+// −6.4%、さらに 64KiB で −15% だが 64KiB は チャンク数が約9倍になりメタデータ/
+// CPU 負荷が重い(64KiB 未満は per-chunk 文脈喪失で逆に悪化)。256KiB は dedup
+// 向上と 3 倍のチャンク数増のバランス点で、しかも smallChunkMax(512KiB)以下
+// なのでファイル横断のソリッド・リージョン化も効く。dedup を極大化したい運用は
+// Config.AvgChunkSize=64<<10 を明示指定できる(RESEARCH §4.54)。
+const DefaultAverageSize = 256 << 10
 
 // Chunk は分割された1チャンク。Data は次の Next 呼び出しまで有効。
 type Chunk struct {

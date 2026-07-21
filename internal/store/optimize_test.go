@@ -113,7 +113,14 @@ func TestOptimizeThenDeleteReleasesEverything(t *testing.T) {
 // 問題が、Optimize のゾンビ救出で解決されることを確認する。
 func TestZombieRescueAfterRetentionDelete(t *testing.T) {
 	t.Parallel()
-	s := newTestStore(t)
+	// 本テストは「1世代=1チャンク」を前提にチェーン収縮後のチャンク数を検証する。
+	// 既定チャンクサイズ(256KiB)だと 1MiB データが複数チャンクに割れて前提が
+	// 崩れるため、1MiB を明示指定してゾンビ救出ロジック自体を決定的に検証する。
+	s, err := Open(t.TempDir(), Config{AvgChunkSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
 
 	// 10世代のチェーンを作り、最新の1世代だけ残して古い9世代を削除
 	cur := randomData(t, 1<<20)

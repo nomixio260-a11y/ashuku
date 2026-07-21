@@ -77,7 +77,7 @@ type Config struct {
 	Compression string
 	// DisableDelta は類似チャンクへのデルタ圧縮を無効化する。
 	DisableDelta bool
-	// AvgChunkSize は平均チャンクサイズ(バイト)。0 ならデフォルト(1MiB)。
+	// AvgChunkSize は平均チャンクサイズ(バイト)。0 ならデフォルト(256KiB)。
 	// 初回オープン時にストアへ永続化され、以降の指定は無視される
 	// (途中で変えると既存データとの重複排除が効かなくなるため)。
 	AvgChunkSize int
