@@ -1180,6 +1180,24 @@ func (s *Store) fillPrepared(pc *preparedChunk) {
 // 新しく書いたファイル表現のパスは cleanup に積む(トランザクションが
 // 失敗したときに呼び出し側が消す。パック追記の取り残しは無害なゴミで、
 // コンパクションが回収する)。
+// realChainDepth は hash のデルタチェーン実長(ルートの非デルタチャンクまでの
+// 段数)を BaseHash を辿って数える。Depth フィールドは rebase で陳腐化しうるため、
+// 上限判定には辿り直した実長を使う。limit 段で早期打ち切りする(それ以上は
+// 「深すぎ」の判定に十分)。構造(BaseHash)は非循環なので必ず終端する。
+func realChainDepth(tx *bolt.Tx, hash string, limit int) int {
+	d := 0
+	h := hash
+	for d <= limit {
+		m, err := getChunkMeta(tx, h)
+		if err != nil || m == nil || m.Compression != compressionDelta || m.BaseHash == "" {
+			break // ルート(非デルタ)/消失に到達
+		}
+		d++
+		h = m.BaseHash
+	}
+	return d
+}
+
 func (s *Store) applyChunk(tx *bolt.Tx, pc *preparedChunk, cleanup *[]string) error {
 	// 並行アップロードが同じチャンクを先に登録した可能性を再確認。
 	meta, err := getChunkMeta(tx, pc.hash)
@@ -1204,10 +1222,16 @@ func (s *Store) applyChunk(tx *bolt.Tx, pc *preparedChunk, cleanup *[]string) er
 		if err != nil {
 			return err
 		}
-		if baseMeta == nil || baseMeta.Depth >= s.maxDepth {
-			baseHash = "" // ベース消失/深すぎ → 通常圧縮にフォールバック
+		// 深さ判定は保存 Depth ではなく BaseHash を辿った「実チェーン長」で行う。
+		// Depth フィールドは Optimize の rebase で子孫が陳腐化しうる(自分の Depth は
+		// 更新されても、それをベースにする子孫の Depth は据え置き)ため、陳腐化した
+		// 低い Depth を信じると新規デルタが maxDepth を超えるチェーンを伸ばしうる。
+		// 実長は構造(BaseHash)を辿るので Depth の陳腐化に影響されない。
+		rd := realChainDepth(tx, baseHash, s.maxDepth)
+		if baseMeta == nil || rd >= s.maxDepth {
+			baseHash = "" // ベース消失/実チェーンが深すぎ → 通常圧縮にフォールバック
 		} else {
-			depth = baseMeta.Depth + 1
+			depth = rd + 1
 			baseMeta.RefCount++
 			if err := putChunkMeta(tx, baseHash, baseMeta); err != nil {
 				return err
